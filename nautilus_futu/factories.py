@@ -14,6 +14,19 @@ from nautilus_futu.data import FutuLiveDataClient
 from nautilus_futu.execution import FutuLiveExecutionClient
 from nautilus_futu.providers import FutuInstrumentProvider
 
+# Module-level cache for shared PyFutuClient instances, keyed by (host, port).
+# Data + Exec clients connecting to the same OpenD share one TCP connection.
+_shared_clients: dict[tuple[str, int], Any] = {}
+
+
+def _get_shared_client(host: str, port: int) -> Any:
+    """Get or create a shared PyFutuClient for the given host:port."""
+    key = (host, port)
+    if key not in _shared_clients:
+        from nautilus_futu._rust import PyFutuClient
+        _shared_clients[key] = PyFutuClient()
+    return _shared_clients[key]
+
 
 class FutuLiveDataClientFactory(LiveDataClientFactory):
     """Factory for creating Futu live data clients."""
@@ -29,8 +42,7 @@ class FutuLiveDataClientFactory(LiveDataClientFactory):
     ) -> FutuLiveDataClient:
         """Create a new Futu live data client."""
         try:
-            from nautilus_futu._rust import PyFutuClient
-            client = PyFutuClient()
+            client = _get_shared_client(config.host, config.port)
         except ImportError:
             raise ImportError(
                 "Failed to import nautilus_futu._rust. "
@@ -67,8 +79,7 @@ class FutuLiveExecClientFactory(LiveExecClientFactory):
     ) -> FutuLiveExecutionClient:
         """Create a new Futu live execution client."""
         try:
-            from nautilus_futu._rust import PyFutuClient
-            client = PyFutuClient()
+            client = _get_shared_client(config.host, config.port)
         except ImportError:
             raise ImportError(
                 "Failed to import nautilus_futu._rust. "

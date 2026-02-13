@@ -30,6 +30,38 @@ class TestFutuDataClientConfig:
         assert config.client_id == "my_client"
         assert config.client_ver == 200
 
+    def test_default_rehab_type(self):
+        from nautilus_futu.config import FutuDataClientConfig
+
+        config = FutuDataClientConfig()
+        assert config.rehab_type == 1
+
+    def test_custom_rehab_type(self):
+        from nautilus_futu.config import FutuDataClientConfig
+
+        config = FutuDataClientConfig(rehab_type=2)
+        assert config.rehab_type == 2
+
+    def test_no_rehab(self):
+        from nautilus_futu.config import FutuDataClientConfig
+
+        config = FutuDataClientConfig(rehab_type=0)
+        assert config.rehab_type == 0
+
+    def test_default_reconnect(self):
+        from nautilus_futu.config import FutuDataClientConfig
+
+        config = FutuDataClientConfig()
+        assert config.reconnect is True
+        assert config.reconnect_interval == 5.0
+
+    def test_custom_reconnect(self):
+        from nautilus_futu.config import FutuDataClientConfig
+
+        config = FutuDataClientConfig(reconnect=False, reconnect_interval=10.0)
+        assert config.reconnect is False
+        assert config.reconnect_interval == 10.0
+
 
 class TestFutuExecClientConfig:
     """Tests for FutuExecClientConfig."""
@@ -55,3 +87,17 @@ class TestFutuExecClientConfig:
         assert config.trd_env == 1
         assert config.acc_id == 123456
         assert config.unlock_pwd_md5 == "abc123"
+
+    def test_default_reconnect(self):
+        from nautilus_futu.config import FutuExecClientConfig
+
+        config = FutuExecClientConfig()
+        assert config.reconnect is True
+        assert config.reconnect_interval == 5.0
+
+    def test_custom_reconnect(self):
+        from nautilus_futu.config import FutuExecClientConfig
+
+        config = FutuExecClientConfig(reconnect=False, reconnect_interval=2.0)
+        assert config.reconnect is False
+        assert config.reconnect_interval == 2.0

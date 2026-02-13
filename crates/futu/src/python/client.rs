@@ -14,6 +14,7 @@ use crate::client::FutuClient;
 pub struct PyFutuClient {
     runtime: Runtime,
     client: Option<FutuClient>,
+    push_tx: Option<mpsc::UnboundedSender<(u32, Vec<u8>)>>,
     push_rx: Option<Arc<Mutex<mpsc::UnboundedReceiver<(u32, Vec<u8>)>>>>,
     push_handles: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -27,6 +28,7 @@ impl PyFutuClient {
         Ok(Self {
             runtime,
             client: None,
+            push_tx: None,
             push_rx: None,
             push_handles: Vec::new(),
         })
@@ -72,6 +74,7 @@ impl PyFutuClient {
         for handle in self.push_handles.drain(..) {
             handle.abort();
         }
+        self.push_tx = None;
         self.push_rx = None;
 
         if let Some(mut client) = self.client.take() {
@@ -683,8 +686,14 @@ impl PyFutuClient {
         }).map_err(|e| PyRuntimeError::new_err(format!("Sub acc push failed: {}", e)))
     }
 
+    /// Check if the client is connected to Futu OpenD.
+    fn is_connected(&self) -> bool {
+        self.client.is_some()
+    }
+
     /// Start receiving push notifications for the given proto_ids.
-    /// Creates a merged channel and spawns forwarder tasks.
+    /// First call creates the merged channel; subsequent calls reuse it
+    /// and only add new forwarder tasks (append mode).
     fn start_push(
         &mut self,
         py: Python<'_>,
@@ -693,7 +702,15 @@ impl PyFutuClient {
         let client = self.client.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
 
-        let (tx, rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
+        // Reuse existing tx/rx if already created, otherwise create new pair
+        let tx = if let Some(ref tx) = self.push_tx {
+            tx.clone()
+        } else {
+            let (tx, rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
+            self.push_tx = Some(tx.clone());
+            self.push_rx = Some(Arc::new(Mutex::new(rx)));
+            tx
+        };
 
         // For each proto_id, register a push handler and spawn a forwarder task
         for proto_id in proto_ids {
@@ -714,7 +731,6 @@ impl PyFutuClient {
             self.push_handles.push(handle);
         }
 
-        self.push_rx = Some(Arc::new(Mutex::new(rx)));
         Ok(())
     }
 
@@ -757,5 +773,40 @@ impl PyFutuClient {
                 Ok(None)
             }
         }
+    }
+
+    /// Get global state from Futu OpenD (proto 1002).
+    /// Returns a dict with market states and connection info.
+    fn get_global_state(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let client = self.client.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+
+        let user_id = client.init_response()
+            .map(|r| r.login_user_id)
+            .unwrap_or(0);
+
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::client::init::get_global_state(client, user_id).await
+            }).map_err(|e| e.to_string())
+        }).map_err(|e| PyRuntimeError::new_err(format!("Get global state failed: {}", e)))?;
+
+        let dict = pyo3::types::PyDict::new_bound(py);
+        if let Some(s2c) = response.s2c {
+            dict.set_item("market_hk", s2c.market_hk)?;
+            dict.set_item("market_us", s2c.market_us)?;
+            dict.set_item("market_cn", s2c.market_cn)?;
+            dict.set_item("market_hk_future", s2c.market_hk_future)?;
+            dict.set_item("market_us_future", s2c.market_us_future)?;
+            dict.set_item("market_sg", s2c.market_sg)?;
+            dict.set_item("market_jp", s2c.market_jp)?;
+            dict.set_item("qot_logined", s2c.qot_logined)?;
+            dict.set_item("trd_logined", s2c.trd_logined)?;
+            dict.set_item("server_ver", s2c.server_ver)?;
+            dict.set_item("server_build_no", s2c.server_build_no)?;
+            dict.set_item("time", s2c.time)?;
+            dict.set_item("local_time", s2c.local_time)?;
+        }
+        Ok(dict.into_any().unbind())
     }
 }

@@ -83,6 +83,34 @@ pub async fn init_connect(conn: &FutuConnection) -> Result<InitConnectResponse, 
     Ok(result)
 }
 
+/// ProtoID for GetGlobalState
+const PROTO_ID_GET_GLOBAL_STATE: u32 = 1002;
+
+/// Query global state from Futu OpenD.
+pub async fn get_global_state(
+    client: &crate::client::FutuClient,
+    user_id: u64,
+) -> Result<crate::generated::get_global_state::Response, InitError> {
+    let c2s = crate::generated::get_global_state::C2s { user_id };
+    let request = crate::generated::get_global_state::Request { c2s };
+    let body = request.encode_to_vec();
+
+    let msg = client.request(PROTO_ID_GET_GLOBAL_STATE, &body).await
+        .map_err(InitError::Connection)?;
+
+    let response = crate::generated::get_global_state::Response::decode(msg.body.as_slice())
+        .map_err(|e| InitError::Decode(e.to_string()))?;
+
+    if response.ret_type != 0 {
+        return Err(InitError::ServerError {
+            ret_type: response.ret_type,
+            msg: response.ret_msg.clone().unwrap_or_default(),
+        });
+    }
+
+    Ok(response)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
     #[error("connection error: {0}")]
@@ -169,5 +197,105 @@ mod tests {
         assert_eq!(decoded.ret_msg, Some("invalid client".to_string()));
         assert_eq!(decoded.err_code, Some(1001));
         assert!(decoded.s2c.is_none());
+    }
+
+    #[test]
+    fn test_get_global_state_proto_id() {
+        assert_eq!(PROTO_ID_GET_GLOBAL_STATE, 1002);
+    }
+
+    #[test]
+    fn test_get_global_state_request_encode_decode() {
+        let c2s = crate::generated::get_global_state::C2s { user_id: 12345 };
+        let request = crate::generated::get_global_state::Request { c2s };
+        let encoded = request.encode_to_vec();
+        let decoded = crate::generated::get_global_state::Request::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.c2s.user_id, 12345);
+    }
+
+    #[test]
+    fn test_get_global_state_response_success() {
+        let s2c = crate::generated::get_global_state::S2c {
+            market_hk: 5,       // MarketState_Rest
+            market_us: 5,
+            market_cn: 5,
+            market_hk_future: Some(5),
+            market_us_future: Some(5),
+            market_sg: Some(5),
+            market_jp: Some(5),
+            qot_logined: true,
+            trd_logined: true,
+            server_ver: Some(500),
+            server_build_no: Some(1234),
+            time: Some(1704067200),
+            local_time: Some(1704067200.123),
+        };
+        let response = crate::generated::get_global_state::Response {
+            ret_type: 0,
+            ret_msg: Some("success".to_string()),
+            err_code: None,
+            s2c: Some(s2c),
+        };
+        let encoded = response.encode_to_vec();
+        let decoded = crate::generated::get_global_state::Response::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.ret_type, 0);
+        let s2c = decoded.s2c.unwrap();
+        assert_eq!(s2c.market_hk, 5);
+        assert_eq!(s2c.market_us, 5);
+        assert_eq!(s2c.market_cn, 5);
+        assert!(s2c.qot_logined);
+        assert!(s2c.trd_logined);
+        assert_eq!(s2c.server_ver, Some(500));
+        assert_eq!(s2c.time, Some(1704067200));
+    }
+
+    #[test]
+    fn test_get_global_state_response_error() {
+        let response = crate::generated::get_global_state::Response {
+            ret_type: -1,
+            ret_msg: Some("not connected".to_string()),
+            err_code: Some(2001),
+            s2c: None,
+        };
+        let encoded = response.encode_to_vec();
+        let decoded = crate::generated::get_global_state::Response::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.ret_type, -1);
+        assert!(decoded.s2c.is_none());
+    }
+
+    #[test]
+    fn test_get_global_state_roundtrip() {
+        // Full encode → decode roundtrip for all fields
+        let s2c = crate::generated::get_global_state::S2c {
+            market_hk: 3,
+            market_us: 6,
+            market_cn: 1,
+            market_hk_future: None,
+            market_us_future: None,
+            market_sg: Some(2),
+            market_jp: None,
+            qot_logined: false,
+            trd_logined: true,
+            server_ver: Some(321),
+            server_build_no: None,
+            time: Some(9999999),
+            local_time: None,
+        };
+        let response = crate::generated::get_global_state::Response {
+            ret_type: 0,
+            ret_msg: None,
+            err_code: None,
+            s2c: Some(s2c),
+        };
+        let encoded = response.encode_to_vec();
+        let decoded = crate::generated::get_global_state::Response::decode(encoded.as_slice()).unwrap();
+        let s = decoded.s2c.unwrap();
+        assert_eq!(s.market_hk, 3);
+        assert_eq!(s.market_us, 6);
+        assert_eq!(s.market_cn, 1);
+        assert_eq!(s.market_hk_future, None);
+        assert_eq!(s.market_sg, Some(2));
+        assert!(!s.qot_logined);
+        assert!(s.trd_logined);
     }
 }

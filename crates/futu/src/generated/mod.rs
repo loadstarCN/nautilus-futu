@@ -59,3 +59,5 @@ pub mod trd_update_order;
 pub mod trd_update_order_fill;
 #[allow(clippy::all)]
 pub mod trd_sub_acc_push;
+#[allow(clippy::all)]
+pub mod get_global_state;

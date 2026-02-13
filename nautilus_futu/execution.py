@@ -110,13 +110,18 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         """Connect to Futu OpenD for trading."""
         self._log.info("Connecting execution client to Futu OpenD...")
         try:
-            await asyncio.to_thread(
-                self._client.connect,
-                self._config.host,
-                self._config.port,
-                self._config.client_id,
-                self._config.client_ver,
-            )
+            # Skip connect if already connected (shared client)
+            if not self._client.is_connected():
+                await asyncio.to_thread(
+                    self._client.connect,
+                    self._config.host,
+                    self._config.port,
+                    self._config.client_id,
+                    self._config.client_ver,
+                )
+                self._log.info("Connected to Futu OpenD")
+            else:
+                self._log.info("Reusing existing Futu OpenD connection")
 
             # Get account list if acc_id not specified
             if self._acc_id == 0:
@@ -168,9 +173,24 @@ class FutuLiveExecutionClient(LiveExecutionClient):
     async def _run_push_loop(self) -> None:
         """Background loop polling for trade push messages."""
         self._log.debug("Execution push loop running")
+        consecutive_errors = 0
         try:
             while True:
-                msg = await asyncio.to_thread(self._client.poll_push, 100)
+                try:
+                    msg = await asyncio.to_thread(self._client.poll_push, 100)
+                    consecutive_errors = 0
+                except Exception as e:
+                    consecutive_errors += 1
+                    self._log.warning(
+                        f"Exec push poll error ({consecutive_errors}): {e}"
+                    )
+                    if consecutive_errors >= 5 and self._config.reconnect:
+                        await self._reconnect()
+                        consecutive_errors = 0
+                    else:
+                        await asyncio.sleep(0.5)
+                    continue
+
                 if msg is None:
                     await asyncio.sleep(0)
                     continue
@@ -187,6 +207,37 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                     self._log.error(f"Error handling exec push proto_id={proto_id}: {e}")
         except asyncio.CancelledError:
             self._log.debug("Execution push loop cancelled")
+
+    async def _reconnect(self) -> None:
+        """Disconnect and reconnect to Futu OpenD."""
+        self._log.warning(
+            f"Reconnecting in {self._config.reconnect_interval}s..."
+        )
+        try:
+            await asyncio.to_thread(self._client.disconnect)
+        except Exception:
+            pass
+        await asyncio.sleep(self._config.reconnect_interval)
+        try:
+            await asyncio.to_thread(
+                self._client.connect,
+                self._config.host,
+                self._config.port,
+                self._config.client_id,
+                self._config.client_ver,
+            )
+            # Re-subscribe trade push
+            await asyncio.to_thread(
+                self._client.sub_acc_push,
+                [self._acc_id],
+            )
+            await asyncio.to_thread(
+                self._client.start_push,
+                [2208, 2218],
+            )
+            self._log.info("Execution client reconnected to Futu OpenD")
+        except Exception as e:
+            self._log.error(f"Execution reconnection failed: {e}")
 
     def _handle_push_order(self, data: dict) -> None:
         """Handle order update push (proto 2208)."""

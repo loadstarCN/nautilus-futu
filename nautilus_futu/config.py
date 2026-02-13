@@ -22,6 +22,12 @@ class FutuDataClientConfig(LiveDataClientConfig, frozen=True):
         Path to RSA private key for encrypted connections.
     instrument_provider : InstrumentProviderConfig
         The instrument provider configuration.
+    rehab_type : int, default 1
+        Rehabilitation type for K-line data: 0=None, 1=Forward, 2=Backward.
+    reconnect : bool, default True
+        Whether to auto-reconnect on connection loss.
+    reconnect_interval : float, default 5.0
+        Seconds to wait between reconnection attempts.
     """
 
     host: str = "127.0.0.1"
@@ -30,6 +36,9 @@ class FutuDataClientConfig(LiveDataClientConfig, frozen=True):
     client_ver: int = 100
     rsa_key_path: str | None = None
     instrument_provider: InstrumentProviderConfig = InstrumentProviderConfig()
+    rehab_type: int = 1
+    reconnect: bool = True
+    reconnect_interval: float = 5.0
 
 
 class FutuExecClientConfig(LiveExecClientConfig, frozen=True):
@@ -57,6 +66,10 @@ class FutuExecClientConfig(LiveExecClientConfig, frozen=True):
         Trading market: 1=HK, 2=US, 3=CN, etc.
     unlock_pwd_md5 : str, default ""
         MD5 hash of trading unlock password (required for real trading).
+    reconnect : bool, default True
+        Whether to auto-reconnect on connection loss.
+    reconnect_interval : float, default 5.0
+        Seconds to wait between reconnection attempts.
     """
 
     host: str = "127.0.0.1"
@@ -69,3 +82,5 @@ class FutuExecClientConfig(LiveExecClientConfig, frozen=True):
     acc_id: int = 0
     trd_market: int = 1
     unlock_pwd_md5: str = ""
+    reconnect: bool = True
+    reconnect_interval: float = 5.0

@@ -78,14 +78,18 @@ class FutuLiveDataClient(LiveMarketDataClient):
         """Connect to Futu OpenD."""
         self._log.info("Connecting to Futu OpenD...")
         try:
-            await asyncio.to_thread(
-                self._client.connect,
-                self._config.host,
-                self._config.port,
-                self._config.client_id,
-                self._config.client_ver,
-            )
-            self._log.info("Connected to Futu OpenD")
+            # Skip connect if already connected (shared client)
+            if not self._client.is_connected():
+                await asyncio.to_thread(
+                    self._client.connect,
+                    self._config.host,
+                    self._config.port,
+                    self._config.client_id,
+                    self._config.client_ver,
+                )
+                self._log.info("Connected to Futu OpenD")
+            else:
+                self._log.info("Reusing existing Futu OpenD connection")
 
             # Register push handlers and start push loop
             # 3005=BasicQot, 3011=Ticker, 3013=OrderBook, 3007=KL
@@ -114,9 +118,24 @@ class FutuLiveDataClient(LiveMarketDataClient):
     async def _run_push_loop(self) -> None:
         """Background loop that polls for push messages and dispatches them."""
         self._log.debug("Push loop running")
+        consecutive_errors = 0
         try:
             while True:
-                msg = await asyncio.to_thread(self._client.poll_push, 100)
+                try:
+                    msg = await asyncio.to_thread(self._client.poll_push, 100)
+                    consecutive_errors = 0
+                except Exception as e:
+                    consecutive_errors += 1
+                    self._log.warning(
+                        f"Push poll error ({consecutive_errors}): {e}"
+                    )
+                    if consecutive_errors >= 5 and self._config.reconnect:
+                        await self._reconnect()
+                        consecutive_errors = 0
+                    else:
+                        await asyncio.sleep(0.5)
+                    continue
+
                 if msg is None:
                     await asyncio.sleep(0)  # yield to event loop
                     continue
@@ -137,6 +156,32 @@ class FutuLiveDataClient(LiveMarketDataClient):
                     self._log.error(f"Error handling push proto_id={proto_id}: {e}")
         except asyncio.CancelledError:
             self._log.debug("Push loop cancelled")
+
+    async def _reconnect(self) -> None:
+        """Disconnect and reconnect to Futu OpenD."""
+        self._log.warning(
+            f"Reconnecting in {self._config.reconnect_interval}s..."
+        )
+        try:
+            await asyncio.to_thread(self._client.disconnect)
+        except Exception:
+            pass
+        await asyncio.sleep(self._config.reconnect_interval)
+        try:
+            await asyncio.to_thread(
+                self._client.connect,
+                self._config.host,
+                self._config.port,
+                self._config.client_id,
+                self._config.client_ver,
+            )
+            await asyncio.to_thread(
+                self._client.start_push,
+                [3005, 3011, 3013, 3007],
+            )
+            self._log.info("Reconnected to Futu OpenD")
+        except Exception as e:
+            self._log.error(f"Reconnection failed: {e}")
 
     def _handle_push_basic_qot(self, data_list: list) -> None:
         """Handle basic quote push (proto 3005)."""
@@ -428,7 +473,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 self._client.get_history_kl,
                 market,
                 code,
-                1,  # rehab_type: 1 = forward adjustment (前复权)
+                self._config.rehab_type,
                 kl_type,
                 begin_str,
                 end_str,
