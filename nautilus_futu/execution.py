@@ -34,10 +34,13 @@ from nautilus_trader.model.orders import Order
 
 from nautilus_futu.common import instrument_id_to_futu_security
 from nautilus_futu.config import FutuExecClientConfig
-from nautilus_futu.constants import FUTU_VENUE
+from nautilus_futu.constants import FUTU_VENUE, VENUE_TO_FUTU_TRD_SEC_MARKET
 from nautilus_futu.parsing.orders import (
     nautilus_order_side_to_futu,
     nautilus_order_type_to_futu,
+    parse_futu_fill_to_report,
+    parse_futu_order_to_report,
+    parse_futu_position_to_report,
 )
 
 
@@ -109,8 +112,8 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                     self._acc_id = accounts[0]["acc_id"]
                     self._log.info(f"Using account ID: {self._acc_id}")
 
-            # Unlock trade if password provided and in real environment
-            if self._config.unlock_pwd_md5 and self._trd_env == 1:
+            # Unlock trade if password provided
+            if self._config.unlock_pwd_md5:
                 await asyncio.to_thread(
                     self._client.unlock_trade,
                     True,
@@ -142,6 +145,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
         price = float(order.price) if hasattr(order, "price") and order.price is not None else None
         qty = float(order.quantity)
+        sec_market = VENUE_TO_FUTU_TRD_SEC_MARKET.get(instrument_id.venue)
 
         try:
             result = await asyncio.to_thread(
@@ -154,6 +158,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 code,
                 qty,
                 price,
+                sec_market,
             )
 
             if result and "order_id" in result:
@@ -221,8 +226,58 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         client_order_id: ClientOrderId | None = None,
         venue_order_id: VenueOrderId | None = None,
     ) -> OrderStatusReport | None:
-        """Generate an order status report."""
-        return None  # TODO: Implement
+        """Generate an order status report for a specific order."""
+        try:
+            orders = await asyncio.to_thread(
+                self._client.get_order_list,
+                self._trd_env,
+                self._acc_id,
+                self._trd_market,
+            )
+        except Exception as e:
+            self._log.error(f"Failed to get order list: {e}")
+            return None
+
+        account_id = AccountId(f"FUTU-{self._acc_id}")
+
+        for order_dict in orders:
+            if venue_order_id is not None:
+                if str(order_dict["order_id"]) == venue_order_id.value:
+                    return parse_futu_order_to_report(order_dict, account_id)
+            # If no venue_order_id match found by remark/client_order_id,
+            # we cannot match by client_order_id since Futu doesn't store it directly
+
+        return None
+
+    async def generate_order_status_reports(
+        self,
+        instrument_id: InstrumentId | None = None,
+        start: Any = None,
+        end: Any = None,
+    ) -> list[OrderStatusReport]:
+        """Generate order status reports for all active orders."""
+        try:
+            orders = await asyncio.to_thread(
+                self._client.get_order_list,
+                self._trd_env,
+                self._acc_id,
+                self._trd_market,
+            )
+        except Exception as e:
+            self._log.error(f"Failed to get order list: {e}")
+            return []
+
+        account_id = AccountId(f"FUTU-{self._acc_id}")
+        reports = []
+        for order_dict in orders:
+            try:
+                report = parse_futu_order_to_report(order_dict, account_id)
+                reports.append(report)
+            except Exception as e:
+                self._log.warning(f"Failed to parse order {order_dict.get('order_id')}: {e}")
+
+        self._log.info(f"Generated {len(reports)} order status reports")
+        return reports
 
     async def generate_fill_reports(
         self,
@@ -232,7 +287,33 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         end: Any = None,
     ) -> list[FillReport]:
         """Generate fill reports."""
-        return []  # TODO: Implement
+        try:
+            fills = await asyncio.to_thread(
+                self._client.get_order_fill_list,
+                self._trd_env,
+                self._acc_id,
+                self._trd_market,
+            )
+        except Exception as e:
+            self._log.error(f"Failed to get fill list: {e}")
+            return []
+
+        account_id = AccountId(f"FUTU-{self._acc_id}")
+        reports = []
+        for fill_dict in fills:
+            try:
+                # Filter by venue_order_id if specified
+                if venue_order_id is not None:
+                    fill_order_id = fill_dict.get("order_id")
+                    if fill_order_id is not None and str(fill_order_id) != venue_order_id.value:
+                        continue
+                report = parse_futu_fill_to_report(fill_dict, account_id)
+                reports.append(report)
+            except Exception as e:
+                self._log.warning(f"Failed to parse fill {fill_dict.get('fill_id')}: {e}")
+
+        self._log.info(f"Generated {len(reports)} fill reports")
+        return reports
 
     async def generate_position_status_reports(
         self,
@@ -241,4 +322,63 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         end: Any = None,
     ) -> list[PositionStatusReport]:
         """Generate position status reports."""
-        return []  # TODO: Implement
+        try:
+            positions = await asyncio.to_thread(
+                self._client.get_position_list,
+                self._trd_env,
+                self._acc_id,
+                self._trd_market,
+            )
+        except Exception as e:
+            self._log.error(f"Failed to get position list: {e}")
+            return []
+
+        account_id = AccountId(f"FUTU-{self._acc_id}")
+        reports = []
+        for pos_dict in positions:
+            try:
+                report = parse_futu_position_to_report(pos_dict, account_id)
+                reports.append(report)
+            except Exception as e:
+                self._log.warning(f"Failed to parse position {pos_dict.get('code')}: {e}")
+
+        self._log.info(f"Generated {len(reports)} position status reports")
+        return reports
+
+    async def _cancel_all_orders(self, command: Any) -> None:
+        """Cancel all active orders."""
+        try:
+            orders = await asyncio.to_thread(
+                self._client.get_order_list,
+                self._trd_env,
+                self._acc_id,
+                self._trd_market,
+            )
+        except Exception as e:
+            self._log.error(f"Failed to get order list for cancel all: {e}")
+            return
+
+        # Active statuses: submitted(10), partially filled(11),
+        # waiting submit(2), submitting(3)
+        active_statuses = {2, 3, 10, 11}
+        cancelled = 0
+        for order_dict in orders:
+            if order_dict["order_status"] in active_statuses:
+                try:
+                    await asyncio.to_thread(
+                        self._client.modify_order,
+                        self._trd_env,
+                        self._acc_id,
+                        self._trd_market,
+                        order_dict["order_id"],
+                        2,  # ModifyOrderOp_Cancel
+                        None,
+                        None,
+                    )
+                    cancelled += 1
+                except Exception as e:
+                    self._log.warning(
+                        f"Failed to cancel order {order_dict['order_id']}: {e}"
+                    )
+
+        self._log.info(f"Cancelled {cancelled} orders")

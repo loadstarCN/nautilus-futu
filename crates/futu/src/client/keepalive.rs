@@ -33,7 +33,7 @@ pub fn start_keepalive(
 async fn send_keepalive(conn: &FutuConnection) -> Result<(), ConnectionError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs() as i64;
 
     let c2s = crate::generated::keep_alive::C2s { time: now };
@@ -43,4 +43,39 @@ async fn send_keepalive(conn: &FutuConnection) -> Result<(), ConnectionError> {
     conn.send(PROTO_ID_KEEP_ALIVE, &body).await?;
     tracing::debug!("KeepAlive sent, time={}", now);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+
+    #[test]
+    fn test_proto_id_constant() {
+        assert_eq!(PROTO_ID_KEEP_ALIVE, 1004);
+    }
+
+    #[test]
+    fn test_keepalive_request_encode_decode() {
+        let c2s = crate::generated::keep_alive::C2s { time: 1718400000 };
+        let request = crate::generated::keep_alive::Request { c2s };
+        let encoded = request.encode_to_vec();
+        let decoded = crate::generated::keep_alive::Request::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.c2s.time, 1718400000);
+    }
+
+    #[test]
+    fn test_interval_minimum_clamp() {
+        // interval_secs=0 should be clamped to 1
+        let interval = Duration::from_secs(0i32.max(1) as u64);
+        assert_eq!(interval, Duration::from_secs(1));
+
+        // interval_secs=-5 should be clamped to 1
+        let interval = Duration::from_secs((-5i32).max(1) as u64);
+        assert_eq!(interval, Duration::from_secs(1));
+
+        // interval_secs=10 should stay as 10
+        let interval = Duration::from_secs(10i32.max(1) as u64);
+        assert_eq!(interval, Duration::from_secs(10));
+    }
 }

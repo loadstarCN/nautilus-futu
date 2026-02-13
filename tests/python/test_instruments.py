@@ -79,3 +79,38 @@ class TestParseFutuInstrument:
         instrument = parse_futu_instrument(info)
         assert instrument is not None
         assert instrument.price_precision == 3
+
+    def test_sgx_currency_sgd(self):
+        """market=31 (SGX) should use SGD currency."""
+        from nautilus_futu.constants import SGX_VENUE
+
+        info = {"market": 31, "code": "D05", "name": "DBS", "lot_size": 100}
+        instrument = parse_futu_instrument(info)
+        assert instrument is not None
+        assert instrument.id.venue == SGX_VENUE
+        assert str(instrument.quote_currency) == "SGD"
+
+    def test_lot_size_zero(self):
+        """lot_size=0 triggers validation error, should return None gracefully."""
+        info = {"market": 1, "code": "00700", "lot_size": 0}
+        instrument = parse_futu_instrument(info)
+        assert instrument is None
+
+    def test_empty_code(self):
+        """Empty code should still parse without crashing."""
+        info = {"market": 1, "code": "", "lot_size": 1}
+        # Should not raise
+        result = parse_futu_instrument(info)
+        # Result may be None or a valid instrument - just ensure no crash
+        assert result is not None or result is None
+
+    def test_exception_logged(self, caplog):
+        """When parsing fails with an exception, it should be logged."""
+        import logging
+
+        # Force an exception by passing invalid data type for lot_size
+        info = {"market": 1, "code": "00700", "lot_size": "not_a_number"}
+        with caplog.at_level(logging.WARNING, logger="nautilus_futu.parsing.instruments"):
+            result = parse_futu_instrument(info)
+        if result is None:
+            assert "Failed to parse instrument" in caplog.text

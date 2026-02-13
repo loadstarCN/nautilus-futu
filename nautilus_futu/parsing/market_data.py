@@ -38,6 +38,10 @@ def bar_spec_to_futu_sub_type(spec: BarSpecification) -> int | None:
             60: FUTU_SUB_TYPE_KL_60MIN,
         }
         return mapping.get(spec.step)
+    elif spec.aggregation == BarAggregation.HOUR:
+        if spec.step == 1:
+            return FUTU_SUB_TYPE_KL_60MIN
+        return None
     elif spec.aggregation == BarAggregation.DAY:
         return FUTU_SUB_TYPE_KL_DAY
     return None
@@ -54,6 +58,10 @@ def bar_spec_to_futu_kl_type(spec: BarSpecification) -> int | None:
             60: FUTU_KL_TYPE_60MIN,
         }
         return mapping.get(spec.step)
+    elif spec.aggregation == BarAggregation.HOUR:
+        if spec.step == 1:
+            return FUTU_KL_TYPE_60MIN
+        return None
     elif spec.aggregation == BarAggregation.DAY:
         return FUTU_KL_TYPE_DAY
     return None

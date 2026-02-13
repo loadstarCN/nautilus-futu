@@ -124,3 +124,22 @@ class TestDatetimeParsing:
     def test_parse_futu_datetime_empty(self):
         result = parse_futu_datetime("")
         assert result == ""
+
+    def test_parse_futu_datetime_basic(self):
+        """Standard datetime format."""
+        result = parse_futu_datetime("2024-01-01 10:00:00")
+        assert result == "2024-01-01T10:00:00"
+
+    def test_parse_futu_datetime_date_only_unchanged(self):
+        """Date-only string (no space) should remain unchanged."""
+        result = parse_futu_datetime("2024-01-01")
+        assert result == "2024-01-01"
+
+    def test_instrument_id_unknown_venue_returns_market_0(self):
+        """Unknown Venue should return market=0."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+
+        instrument_id = InstrumentId(Symbol("XYZ"), Venue("UNKNOWN_EXCHANGE"))
+        market, code = instrument_id_to_futu_security(instrument_id)
+        assert market == 0
+        assert code == "XYZ"

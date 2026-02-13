@@ -198,9 +198,7 @@ class TestBarSpecConversionsExtended:
     def test_60min_bar_sub_type(self):
         """60-min uses HOUR aggregation in NautilusTrader."""
         spec = BarSpecification(1, BarAggregation.HOUR, PriceType.LAST)
-        # NautilusTrader uses HOUR instead of 60-MINUTE, so this maps to None
-        # since the mapping only handles MINUTE and DAY
-        assert bar_spec_to_futu_sub_type(spec) is None
+        assert bar_spec_to_futu_sub_type(spec) == FUTU_SUB_TYPE_KL_60MIN
 
     def test_5min_bar_kl_type(self):
         spec = BarSpecification(5, BarAggregation.MINUTE, PriceType.LAST)
@@ -217,7 +215,7 @@ class TestBarSpecConversionsExtended:
     def test_60min_bar_kl_type(self):
         """60-min uses HOUR aggregation in NautilusTrader."""
         spec = BarSpecification(1, BarAggregation.HOUR, PriceType.LAST)
-        assert bar_spec_to_futu_kl_type(spec) is None
+        assert bar_spec_to_futu_kl_type(spec) == FUTU_KL_TYPE_60MIN
 
     def test_unsupported_minute_step(self):
         """Step=3 minutes is not supported by Futu."""
@@ -233,3 +231,60 @@ class TestBarSpecConversionsExtended:
     def test_month_bar_not_supported_via_sub_type(self):
         spec = BarSpecification(1, BarAggregation.MONTH, PriceType.LAST)
         assert bar_spec_to_futu_sub_type(spec) is None
+
+    def test_hour_2_not_supported(self):
+        """HOUR with step=2 is not supported by Futu."""
+        spec = BarSpecification(2, BarAggregation.HOUR, PriceType.LAST)
+        assert bar_spec_to_futu_sub_type(spec) is None
+        assert bar_spec_to_futu_kl_type(spec) is None
+
+
+class TestParseBarsExtended:
+    """Extended tests for parse_futu_bars edge cases."""
+
+    @pytest.fixture
+    def bar_type(self):
+        instrument_id = InstrumentId(Symbol("00700"), HKEX_VENUE)
+        spec = BarSpecification(1, BarAggregation.DAY, PriceType.LAST)
+        return BarType(instrument_id, spec, AggregationSource.EXTERNAL)
+
+    def test_parse_bars_all_blank(self, bar_type):
+        """All blank bars should produce empty list."""
+        kl_data = [
+            {"open_price": 0, "high_price": 0, "low_price": 0, "close_price": 0, "volume": 0, "is_blank": True},
+            {"open_price": 0, "high_price": 0, "low_price": 0, "close_price": 0, "volume": 0, "is_blank": True},
+        ]
+        bars = parse_futu_bars(kl_data, bar_type)
+        assert len(bars) == 0
+
+    def test_parse_bars_mixed_blank(self, bar_type):
+        """Mixed blank and valid data should only include non-blank bars."""
+        kl_data = [
+            {"open_price": 100, "high_price": 110, "low_price": 95, "close_price": 105, "volume": 1000, "is_blank": True},
+            {"open_price": 200, "high_price": 210, "low_price": 195, "close_price": 205, "volume": 2000, "is_blank": False},
+            {"open_price": 300, "high_price": 310, "low_price": 295, "close_price": 305, "volume": 3000, "is_blank": True},
+            {"open_price": 400, "high_price": 410, "low_price": 395, "close_price": 405, "volume": 4000},
+        ]
+        bars = parse_futu_bars(kl_data, bar_type)
+        assert len(bars) == 2
+        assert str(bars[0].close) == "205"
+        assert str(bars[1].close) == "405"
+
+
+class TestTickEdgeCases:
+    """Edge case tests for tick parsing."""
+
+    def test_quote_tick_zero_price(self):
+        """cur_price=0 should not crash."""
+        instrument_id = InstrumentId(Symbol("TEST"), HKEX_VENUE)
+        data = {"cur_price": 0, "volume": 0}
+        tick = parse_futu_quote_tick(data, instrument_id, ts_init=0)
+        assert str(tick.bid_price) == "0"
+        assert str(tick.ask_price) == "0"
+
+    def test_trade_tick_zero_volume(self):
+        """volume=0 raises ValueError from NautilusTrader validation."""
+        instrument_id = InstrumentId(Symbol("TEST"), HKEX_VENUE)
+        data = {"price": 100.0, "volume": 0, "dir": 1, "sequence": 1}
+        with pytest.raises(ValueError, match="not a positive integer"):
+            parse_futu_trade_tick(data, instrument_id, ts_init=0)

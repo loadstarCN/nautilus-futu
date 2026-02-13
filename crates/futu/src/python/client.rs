@@ -325,4 +325,224 @@ impl PyFutuClient {
 
         Ok(())
     }
+
+    /// Get order list.
+    /// Returns list of dicts with order details.
+    fn get_order_list(
+        &self,
+        py: Python<'_>,
+        trd_env: i32,
+        acc_id: u64,
+        trd_market: i32,
+    ) -> PyResult<Vec<PyObject>> {
+        let client = self.client.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::trade::query::get_order_list(client, trd_env, acc_id, trd_market, None).await
+            }).map_err(|e| e.to_string())
+        }).map_err(|e| PyRuntimeError::new_err(format!("Get order list failed: {}", e)))?;
+
+        let mut result = Vec::new();
+        if let Some(s2c) = response.s2c {
+            for order in s2c.order_list {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                dict.set_item("trd_side", order.trd_side)?;
+                dict.set_item("order_type", order.order_type)?;
+                dict.set_item("order_status", order.order_status)?;
+                dict.set_item("order_id", order.order_id)?;
+                dict.set_item("order_id_ex", &order.order_id_ex)?;
+                dict.set_item("code", &order.code)?;
+                dict.set_item("name", &order.name)?;
+                dict.set_item("qty", order.qty)?;
+                dict.set_item("price", order.price)?;
+                dict.set_item("create_time", &order.create_time)?;
+                dict.set_item("update_time", &order.update_time)?;
+                dict.set_item("fill_qty", order.fill_qty)?;
+                dict.set_item("fill_avg_price", order.fill_avg_price)?;
+                dict.set_item("sec_market", order.sec_market)?;
+                dict.set_item("create_timestamp", order.create_timestamp)?;
+                dict.set_item("update_timestamp", order.update_timestamp)?;
+                dict.set_item("time_in_force", order.time_in_force)?;
+                dict.set_item("remark", &order.remark)?;
+                result.push(dict.into_any().unbind());
+            }
+        }
+        Ok(result)
+    }
+
+    /// Get order fill list.
+    /// Returns list of dicts with fill details.
+    fn get_order_fill_list(
+        &self,
+        py: Python<'_>,
+        trd_env: i32,
+        acc_id: u64,
+        trd_market: i32,
+    ) -> PyResult<Vec<PyObject>> {
+        let client = self.client.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::trade::query::get_order_fill_list(client, trd_env, acc_id, trd_market, None).await
+            }).map_err(|e| e.to_string())
+        }).map_err(|e| PyRuntimeError::new_err(format!("Get order fill list failed: {}", e)))?;
+
+        let mut result = Vec::new();
+        if let Some(s2c) = response.s2c {
+            for fill in s2c.order_fill_list {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                dict.set_item("trd_side", fill.trd_side)?;
+                dict.set_item("fill_id", fill.fill_id)?;
+                dict.set_item("fill_id_ex", &fill.fill_id_ex)?;
+                dict.set_item("order_id", fill.order_id)?;
+                dict.set_item("order_id_ex", fill.order_id_ex.as_deref())?;
+                dict.set_item("code", &fill.code)?;
+                dict.set_item("name", &fill.name)?;
+                dict.set_item("qty", fill.qty)?;
+                dict.set_item("price", fill.price)?;
+                dict.set_item("create_time", &fill.create_time)?;
+                dict.set_item("create_timestamp", fill.create_timestamp)?;
+                dict.set_item("update_timestamp", fill.update_timestamp)?;
+                dict.set_item("sec_market", fill.sec_market)?;
+                dict.set_item("status", fill.status)?;
+                result.push(dict.into_any().unbind());
+            }
+        }
+        Ok(result)
+    }
+
+    /// Get position list.
+    /// Returns list of dicts with position details.
+    fn get_position_list(
+        &self,
+        py: Python<'_>,
+        trd_env: i32,
+        acc_id: u64,
+        trd_market: i32,
+    ) -> PyResult<Vec<PyObject>> {
+        let client = self.client.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::trade::query::get_position_list(client, trd_env, acc_id, trd_market, None).await
+            }).map_err(|e| e.to_string())
+        }).map_err(|e| PyRuntimeError::new_err(format!("Get position list failed: {}", e)))?;
+
+        let mut result = Vec::new();
+        if let Some(s2c) = response.s2c {
+            for pos in s2c.position_list {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                dict.set_item("position_id", pos.position_id)?;
+                dict.set_item("position_side", pos.position_side)?;
+                dict.set_item("code", &pos.code)?;
+                dict.set_item("name", &pos.name)?;
+                dict.set_item("qty", pos.qty)?;
+                dict.set_item("can_sell_qty", pos.can_sell_qty)?;
+                dict.set_item("price", pos.price)?;
+                dict.set_item("cost_price", pos.cost_price)?;
+                dict.set_item("val", pos.val)?;
+                dict.set_item("pl_val", pos.pl_val)?;
+                dict.set_item("pl_ratio", pos.pl_ratio)?;
+                dict.set_item("sec_market", pos.sec_market)?;
+                dict.set_item("unrealized_pl", pos.unrealized_pl)?;
+                dict.set_item("realized_pl", pos.realized_pl)?;
+                dict.set_item("currency", pos.currency)?;
+                result.push(dict.into_any().unbind());
+            }
+        }
+        Ok(result)
+    }
+
+    /// Get account funds.
+    /// Returns a dict with fund details.
+    fn get_funds(
+        &self,
+        py: Python<'_>,
+        trd_env: i32,
+        acc_id: u64,
+        trd_market: i32,
+    ) -> PyResult<PyObject> {
+        let client = self.client.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::trade::query::get_funds(client, trd_env, acc_id, trd_market).await
+            }).map_err(|e| e.to_string())
+        }).map_err(|e| PyRuntimeError::new_err(format!("Get funds failed: {}", e)))?;
+
+        let dict = pyo3::types::PyDict::new_bound(py);
+        if let Some(s2c) = response.s2c {
+            if let Some(funds) = s2c.funds {
+                dict.set_item("power", funds.power)?;
+                dict.set_item("total_assets", funds.total_assets)?;
+                dict.set_item("cash", funds.cash)?;
+                dict.set_item("market_val", funds.market_val)?;
+                dict.set_item("frozen_cash", funds.frozen_cash)?;
+                dict.set_item("debt_cash", funds.debt_cash)?;
+                dict.set_item("avl_withdrawal_cash", funds.avl_withdrawal_cash)?;
+                dict.set_item("currency", funds.currency)?;
+                dict.set_item("available_funds", funds.available_funds)?;
+                dict.set_item("unrealized_pl", funds.unrealized_pl)?;
+                dict.set_item("realized_pl", funds.realized_pl)?;
+                dict.set_item("risk_level", funds.risk_level)?;
+                dict.set_item("initial_margin", funds.initial_margin)?;
+                dict.set_item("maintenance_margin", funds.maintenance_margin)?;
+                dict.set_item("max_withdrawal", funds.max_withdrawal)?;
+            }
+        }
+        Ok(dict.into_any().unbind())
+    }
+
+    /// Get security snapshot.
+    /// securities: list of (market, code) tuples
+    /// Returns list of dicts with snapshot data.
+    fn get_security_snapshot(
+        &self,
+        py: Python<'_>,
+        securities: Vec<(i32, String)>,
+    ) -> PyResult<Vec<PyObject>> {
+        let client = self.client.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::quote::snapshot::get_security_snapshot(client, securities).await
+            }).map_err(|e| e.to_string())
+        }).map_err(|e| PyRuntimeError::new_err(format!("Get snapshot failed: {}", e)))?;
+
+        let mut result = Vec::new();
+        if let Some(s2c) = response.s2c {
+            for snapshot in s2c.snapshot_list {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                let basic = &snapshot.basic;
+                let sec = &basic.security;
+                dict.set_item("market", sec.market)?;
+                dict.set_item("code", &sec.code)?;
+                dict.set_item("type", basic.r#type)?;
+                dict.set_item("is_suspend", basic.is_suspend)?;
+                dict.set_item("lot_size", basic.lot_size)?;
+                dict.set_item("cur_price", basic.cur_price)?;
+                dict.set_item("open_price", basic.open_price)?;
+                dict.set_item("high_price", basic.high_price)?;
+                dict.set_item("low_price", basic.low_price)?;
+                dict.set_item("last_close_price", basic.last_close_price)?;
+                dict.set_item("volume", basic.volume)?;
+                dict.set_item("turnover", basic.turnover)?;
+                dict.set_item("update_time", &basic.update_time)?;
+                dict.set_item("update_timestamp", basic.update_timestamp)?;
+                dict.set_item("ask_price", basic.ask_price)?;
+                dict.set_item("bid_price", basic.bid_price)?;
+                dict.set_item("ask_vol", basic.ask_vol)?;
+                dict.set_item("bid_vol", basic.bid_vol)?;
+                dict.set_item("price_spread", basic.price_spread)?;
+                result.push(dict.into_any().unbind());
+            }
+        }
+        Ok(result)
+    }
 }

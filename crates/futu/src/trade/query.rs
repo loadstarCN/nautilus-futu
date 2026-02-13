@@ -156,3 +156,104 @@ pub async fn get_funds(
 
     Ok(response)
 }
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    const PROTO_TRD_GET_ORDER_LIST: u32 = 2201;
+    const PROTO_TRD_GET_ORDER_FILL_LIST: u32 = 2211;
+    const PROTO_TRD_GET_POSITION_LIST: u32 = 2102;
+    const PROTO_TRD_GET_FUNDS: u32 = 2101;
+
+    #[test]
+    fn test_proto_id_constants() {
+        assert_eq!(PROTO_TRD_GET_ORDER_LIST, 2201);
+        assert_eq!(PROTO_TRD_GET_ORDER_FILL_LIST, 2211);
+        assert_eq!(PROTO_TRD_GET_POSITION_LIST, 2102);
+        assert_eq!(PROTO_TRD_GET_FUNDS, 2101);
+    }
+
+    #[test]
+    fn test_order_list_request_encode_decode() {
+        let c2s = crate::generated::trd_get_order_list::C2s {
+            header: crate::generated::trd_common::TrdHeader {
+                trd_env: 0,
+                acc_id: 12345,
+                trd_market: 1,
+            },
+            filter_conditions: Some(crate::generated::trd_common::TrdFilterConditions {
+                code_list: vec!["00700".to_string()],
+                id_list: vec![],
+                begin_time: Some("2024-01-01".to_string()),
+                end_time: Some("2024-12-31".to_string()),
+                order_id_ex_list: vec![],
+                filter_market: None,
+            }),
+            ..Default::default()
+        };
+        let request = crate::generated::trd_get_order_list::Request { c2s };
+        let encoded = request.encode_to_vec();
+        let decoded = crate::generated::trd_get_order_list::Request::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.c2s.header.acc_id, 12345);
+        let filter = decoded.c2s.filter_conditions.unwrap();
+        assert_eq!(filter.code_list, vec!["00700"]);
+        assert_eq!(filter.begin_time, Some("2024-01-01".to_string()));
+    }
+
+    #[test]
+    fn test_funds_request_encode_decode() {
+        let c2s = crate::generated::trd_get_funds::C2s {
+            header: crate::generated::trd_common::TrdHeader {
+                trd_env: 1,
+                acc_id: 67890,
+                trd_market: 2,
+            },
+            ..Default::default()
+        };
+        let request = crate::generated::trd_get_funds::Request { c2s };
+        let encoded = request.encode_to_vec();
+        let decoded = crate::generated::trd_get_funds::Request::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.c2s.header.trd_env, 1);
+        assert_eq!(decoded.c2s.header.acc_id, 67890);
+        assert_eq!(decoded.c2s.header.trd_market, 2);
+        assert!(decoded.c2s.refresh_cache.is_none());
+    }
+
+    #[test]
+    fn test_order_list_response_success() {
+        let response = crate::generated::trd_get_order_list::Response {
+            ret_type: 0,
+            ret_msg: None,
+            err_code: None,
+            s2c: Some(crate::generated::trd_get_order_list::S2c {
+                header: crate::generated::trd_common::TrdHeader {
+                    trd_env: 0,
+                    acc_id: 12345,
+                    trd_market: 1,
+                },
+                order_list: vec![],
+            }),
+        };
+        let encoded = response.encode_to_vec();
+        let decoded = crate::generated::trd_get_order_list::Response::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.ret_type, 0);
+        let s2c = decoded.s2c.unwrap();
+        assert!(s2c.order_list.is_empty());
+    }
+
+    #[test]
+    fn test_order_list_response_error() {
+        let response = crate::generated::trd_get_order_list::Response {
+            ret_type: -1,
+            ret_msg: Some("unauthorized".to_string()),
+            err_code: Some(403),
+            s2c: None,
+        };
+        let encoded = response.encode_to_vec();
+        let decoded = crate::generated::trd_get_order_list::Response::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.ret_type, -1);
+        assert_eq!(decoded.ret_msg.unwrap(), "unauthorized");
+        assert!(decoded.s2c.is_none());
+    }
+}

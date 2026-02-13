@@ -132,3 +132,161 @@ pub async fn modify_order(
 
     Ok(response)
 }
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    const PROTO_TRD_PLACE_ORDER: u32 = 2202;
+    const PROTO_TRD_MODIFY_ORDER: u32 = 2205;
+
+    #[test]
+    fn test_proto_id_constants() {
+        assert_eq!(PROTO_TRD_PLACE_ORDER, 2202);
+        assert_eq!(PROTO_TRD_MODIFY_ORDER, 2205);
+    }
+
+    #[test]
+    fn test_place_order_request_encode_decode() {
+        let c2s = crate::generated::trd_place_order::C2s {
+            packet_id: crate::generated::common::PacketId {
+                conn_id: 100,
+                serial_no: 1,
+            },
+            header: crate::generated::trd_common::TrdHeader {
+                trd_env: 0,
+                acc_id: 12345,
+                trd_market: 1,
+            },
+            trd_side: 1,
+            order_type: 1,
+            code: "00700".to_string(),
+            qty: 100.0,
+            price: Some(350.0),
+            sec_market: Some(1),
+            remark: Some("test order".to_string()),
+            time_in_force: Some(0),
+            fill_outside_rth: Some(false),
+            aux_price: Some(345.0),
+            trail_type: Some(1),
+            trail_value: Some(5.0),
+            trail_spread: Some(0.5),
+            ..Default::default()
+        };
+        let request = crate::generated::trd_place_order::Request { c2s };
+        let encoded = request.encode_to_vec();
+        let decoded = crate::generated::trd_place_order::Request::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.c2s.code, "00700");
+        assert_eq!(decoded.c2s.qty, 100.0);
+        assert_eq!(decoded.c2s.price, Some(350.0));
+        assert_eq!(decoded.c2s.sec_market, Some(1));
+        assert_eq!(decoded.c2s.header.acc_id, 12345);
+        assert_eq!(decoded.c2s.remark, Some("test order".to_string()));
+    }
+
+    #[test]
+    fn test_place_order_optional_fields() {
+        let c2s = crate::generated::trd_place_order::C2s {
+            packet_id: crate::generated::common::PacketId {
+                conn_id: 1,
+                serial_no: 1,
+            },
+            header: crate::generated::trd_common::TrdHeader {
+                trd_env: 0,
+                acc_id: 1,
+                trd_market: 1,
+            },
+            trd_side: 1,
+            order_type: 2,
+            code: "AAPL".to_string(),
+            qty: 10.0,
+            price: None,
+            adjust_price: None,
+            adjust_side_and_limit: None,
+            sec_market: None,
+            remark: None,
+            time_in_force: None,
+            fill_outside_rth: None,
+            aux_price: None,
+            trail_type: None,
+            trail_value: None,
+            trail_spread: None,
+            ..Default::default()
+        };
+        let request = crate::generated::trd_place_order::Request { c2s };
+        let encoded = request.encode_to_vec();
+        let decoded = crate::generated::trd_place_order::Request::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.c2s.code, "AAPL");
+        assert_eq!(decoded.c2s.order_type, 2);
+        assert!(decoded.c2s.price.is_none());
+        assert!(decoded.c2s.sec_market.is_none());
+        assert!(decoded.c2s.remark.is_none());
+    }
+
+    #[test]
+    fn test_modify_order_request_encode_decode() {
+        let c2s = crate::generated::trd_modify_order::C2s {
+            packet_id: crate::generated::common::PacketId {
+                conn_id: 200,
+                serial_no: 5,
+            },
+            header: crate::generated::trd_common::TrdHeader {
+                trd_env: 1,
+                acc_id: 99999,
+                trd_market: 2,
+            },
+            order_id: 123456789,
+            modify_order_op: 1,
+            qty: Some(50.0),
+            price: Some(175.5),
+            ..Default::default()
+        };
+        let request = crate::generated::trd_modify_order::Request { c2s };
+        let encoded = request.encode_to_vec();
+        let decoded = crate::generated::trd_modify_order::Request::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.c2s.order_id, 123456789);
+        assert_eq!(decoded.c2s.modify_order_op, 1);
+        assert_eq!(decoded.c2s.qty, Some(50.0));
+        assert_eq!(decoded.c2s.price, Some(175.5));
+        assert_eq!(decoded.c2s.header.trd_env, 1);
+    }
+
+    #[test]
+    fn test_place_order_response_success() {
+        let response = crate::generated::trd_place_order::Response {
+            ret_type: 0,
+            ret_msg: None,
+            err_code: None,
+            s2c: Some(crate::generated::trd_place_order::S2c {
+                header: crate::generated::trd_common::TrdHeader {
+                    trd_env: 0,
+                    acc_id: 12345,
+                    trd_market: 1,
+                },
+                order_id: Some(987654321),
+                order_id_ex: Some("ORD-987654321".to_string()),
+            }),
+        };
+        let encoded = response.encode_to_vec();
+        let decoded = crate::generated::trd_place_order::Response::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.ret_type, 0);
+        let s2c = decoded.s2c.unwrap();
+        assert_eq!(s2c.order_id, Some(987654321));
+        assert_eq!(s2c.order_id_ex, Some("ORD-987654321".to_string()));
+    }
+
+    #[test]
+    fn test_place_order_response_error() {
+        let response = crate::generated::trd_place_order::Response {
+            ret_type: -1,
+            ret_msg: Some("insufficient funds".to_string()),
+            err_code: Some(2001),
+            s2c: None,
+        };
+        let encoded = response.encode_to_vec();
+        let decoded = crate::generated::trd_place_order::Response::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.ret_type, -1);
+        assert_eq!(decoded.ret_msg.unwrap(), "insufficient funds");
+        assert!(decoded.s2c.is_none());
+    }
+}

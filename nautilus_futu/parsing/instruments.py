@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import Any
 
@@ -10,6 +11,8 @@ from nautilus_trader.model.instruments import Equity
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 
 from nautilus_futu.common import futu_security_to_instrument_id
+
+logger = logging.getLogger(__name__)
 
 
 def parse_futu_instrument(static_info: dict[str, Any]) -> Equity | None:
@@ -39,6 +42,8 @@ def parse_futu_instrument(static_info: dict[str, Any]) -> Equity | None:
             currency = Currency.from_str("USD")
         elif market in (21, 22):  # CN
             currency = Currency.from_str("CNY")
+        elif market == 31:  # SG
+            currency = Currency.from_str("SGD")
         else:
             currency = Currency.from_str("USD")
 
@@ -52,5 +57,6 @@ def parse_futu_instrument(static_info: dict[str, Any]) -> Equity | None:
             ts_event=0,
             ts_init=0,
         )
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to parse instrument: %s", e)
         return None

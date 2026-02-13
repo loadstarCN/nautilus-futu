@@ -11,6 +11,9 @@ pub struct FutuMessage {
     pub body: Vec<u8>,
 }
 
+/// Maximum allowed body size (100 MB) to prevent OOM from malicious/corrupted data.
+const MAX_BODY_SIZE: u32 = 100_000_000;
+
 /// Tokio codec for the Futu OpenD binary protocol.
 pub struct FutuCodec;
 
@@ -28,7 +31,12 @@ impl Decoder for FutuCodec {
         let body_len = {
             let mut peek = src.clone();
             match PacketHeader::decode(&mut peek) {
-                Ok(header) => header.body_len as usize,
+                Ok(header) => {
+                    if header.body_len > MAX_BODY_SIZE {
+                        return Err(CodecError::BodyTooLarge(header.body_len));
+                    }
+                    header.body_len as usize
+                }
                 Err(HeaderError::InsufficientData) => return Ok(None),
                 Err(e) => return Err(CodecError::Header(e)),
             }
@@ -74,6 +82,8 @@ pub enum CodecError {
     Header(#[from] HeaderError),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("body too large: {0} bytes (max {MAX_BODY_SIZE})")]
+    BodyTooLarge(u32),
 }
 
 #[cfg(test)]
@@ -186,5 +196,23 @@ mod tests {
         assert_eq!(decoded.proto_id, 3103);
         assert_eq!(decoded.serial_no, 99);
         assert_eq!(decoded.body, body);
+    }
+
+    #[test]
+    fn test_codec_body_too_large() {
+        let mut codec = FutuCodec;
+        // Craft a header with body_len exceeding MAX_BODY_SIZE
+        let fake_body = b"x";
+        let mut header = PacketHeader::new(1001, 1, fake_body);
+        header.body_len = MAX_BODY_SIZE + 1;
+
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        buf.extend_from_slice(fake_body);
+
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, CodecError::BodyTooLarge(_)));
     }
 }
