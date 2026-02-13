@@ -34,10 +34,11 @@ pub async fn place_order(
     };
 
     let conn_id = client.connection().conn_id().await;
+    let serial_no = client.connection().next_serial();
     let c2s = crate::generated::trd_place_order::C2s {
         packet_id: crate::generated::common::PacketId {
             conn_id,
-            serial_no: 0,
+            serial_no,
         },
         header,
         trd_side,
@@ -97,10 +98,11 @@ pub async fn modify_order(
     };
 
     let conn_id = client.connection().conn_id().await;
+    let serial_no = client.connection().next_serial();
     let c2s = crate::generated::trd_modify_order::C2s {
         packet_id: crate::generated::common::PacketId {
             conn_id,
-            serial_no: 0,
+            serial_no,
         },
         header,
         order_id,

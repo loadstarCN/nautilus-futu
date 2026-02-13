@@ -30,7 +30,7 @@ def main():
         accounts = client.get_acc_list()
         print(f"    {PASS} Got {len(accounts)} accounts:")
         for acc in accounts[:5]:
-            env_name = {0: "REAL", 1: "SIMULATE"}.get(acc["trd_env"], str(acc["trd_env"]))
+            env_name = {0: "SIMULATE", 1: "REAL"}.get(acc["trd_env"], str(acc["trd_env"]))
             markets = acc.get("trd_market_auth_list", [])
             print(f"      acc_id={acc['acc_id']}  env={env_name}  markets={markets}")
         if len(accounts) > 5:
@@ -44,13 +44,13 @@ def main():
     sim_acc = None
     for acc in accounts:
         markets = acc.get("trd_market_auth_list", [])
-        if acc["trd_env"] == 1 and 1 in markets:  # SIMULATE + HK
+        if acc["trd_env"] == 0 and 1 in markets:  # SIMULATE + HK
             sim_acc = acc
             break
     if not sim_acc:
         # Fallback: any simulate account
         for acc in accounts:
-            if acc["trd_env"] == 1:
+            if acc["trd_env"] == 0:
                 sim_acc = acc
                 break
 
@@ -144,7 +144,7 @@ def main():
             # Place a limit buy order for 00700.HK at a very low price
             # trd_market: 1=HK, trd_side: 1=Buy, order_type: 2=Limit
             order = client.place_order(
-                1,                      # trd_env: SIMULATE
+                0,                      # trd_env: SIMULATE
                 sim_acc["acc_id"],      # acc_id
                 1,                      # trd_market: HK
                 1,                      # trd_side: Buy
@@ -160,11 +160,11 @@ def main():
             # Cancel the order (modify_op: 4=Cancel)
             time.sleep(0.5)
             client.modify_order(
-                1,                      # trd_env: SIMULATE
+                0,                      # trd_env: SIMULATE
                 sim_acc["acc_id"],      # acc_id
                 1,                      # trd_market: HK
                 order_id,               # order_id
-                4,                      # modify_op: Cancel
+                2,                      # modify_op: Cancel
             )
             print(f"    {PASS} Order cancelled!")
             results.append(("Place+Cancel order", True))
