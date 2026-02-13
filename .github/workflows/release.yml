@@ -36,13 +36,15 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: |
+            3.12
+            3.13
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist -i python3.12 -i python3.13
           manylinux: auto
 
       - uses: actions/upload-artifact@v4
