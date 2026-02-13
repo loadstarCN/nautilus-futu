@@ -32,6 +32,9 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: pip install maturin pytest
-      - run: maturin develop
-      - run: pytest tests/python -v
+      - run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin pytest
+          maturin develop
+          pytest tests/python -v
