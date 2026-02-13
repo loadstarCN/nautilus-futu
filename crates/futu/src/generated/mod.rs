@@ -57,3 +57,5 @@ pub mod trd_get_funds;
 pub mod trd_update_order;
 #[allow(clippy::all)]
 pub mod trd_update_order_fill;
+#[allow(clippy::all)]
+pub mod trd_sub_acc_push;

@@ -5,8 +5,24 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from nautilus_trader.model.data import Bar, BarSpecification, BarType, QuoteTick, TradeTick
-from nautilus_trader.model.enums import AggregationSource, AggressorSide, BarAggregation, PriceType
+from nautilus_trader.model.data import (
+    Bar,
+    BarSpecification,
+    BarType,
+    BookOrder,
+    OrderBookDelta,
+    OrderBookDeltas,
+    QuoteTick,
+    TradeTick,
+)
+from nautilus_trader.model.enums import (
+    AggregationSource,
+    AggressorSide,
+    BarAggregation,
+    BookAction,
+    OrderSide,
+    PriceType,
+)
 from nautilus_trader.model.identifiers import InstrumentId, TradeId
 from nautilus_trader.model.objects import Price, Quantity
 
@@ -132,3 +148,83 @@ def parse_futu_bars(
         bars.append(bar)
 
     return bars
+
+
+# KLType -> BarSpecification reverse mapping
+_KL_TYPE_TO_BAR_SPEC: dict[int, BarSpecification] = {
+    FUTU_KL_TYPE_1MIN: BarSpecification(1, BarAggregation.MINUTE, PriceType.LAST),
+    FUTU_KL_TYPE_5MIN: BarSpecification(5, BarAggregation.MINUTE, PriceType.LAST),
+    FUTU_KL_TYPE_15MIN: BarSpecification(15, BarAggregation.MINUTE, PriceType.LAST),
+    FUTU_KL_TYPE_30MIN: BarSpecification(30, BarAggregation.MINUTE, PriceType.LAST),
+    FUTU_KL_TYPE_60MIN: BarSpecification(1, BarAggregation.HOUR, PriceType.LAST),
+    FUTU_KL_TYPE_DAY: BarSpecification(1, BarAggregation.DAY, PriceType.LAST),
+}
+
+
+def futu_kl_type_to_bar_spec(kl_type: int) -> BarSpecification | None:
+    """Convert Futu KLType to NautilusTrader BarSpecification."""
+    return _KL_TYPE_TO_BAR_SPEC.get(kl_type)
+
+
+def parse_push_order_book(
+    data: dict[str, Any],
+    instrument_id: InstrumentId,
+    ts_init: int,
+) -> OrderBookDeltas:
+    """Parse Futu push order book data to NautilusTrader OrderBookDeltas.
+
+    Uses full snapshot mode: CLEAR then ADD for each level.
+    """
+    deltas: list[OrderBookDelta] = []
+
+    # First delta: CLEAR the book
+    deltas.append(
+        OrderBookDelta.clear(
+            instrument_id=instrument_id,
+            ts_event=ts_init,
+            ts_init=ts_init,
+            sequence=0,
+        )
+    )
+
+    # Add bid levels
+    for bid in data.get("bids", []):
+        order = BookOrder(
+            side=OrderSide.BUY,
+            price=Price.from_str(str(bid["price"])),
+            size=Quantity.from_int(bid["volume"]),
+            order_id=0,
+        )
+        deltas.append(
+            OrderBookDelta(
+                instrument_id=instrument_id,
+                action=BookAction.ADD,
+                order=order,
+                ts_event=ts_init,
+                ts_init=ts_init,
+                flags=0,
+                sequence=0,
+            )
+        )
+
+    # Add ask levels
+    for ask in data.get("asks", []):
+        order = BookOrder(
+            side=OrderSide.SELL,
+            price=Price.from_str(str(ask["price"])),
+            size=Quantity.from_int(ask["volume"]),
+            order_id=0,
+        )
+        deltas.append(
+            OrderBookDelta(
+                instrument_id=instrument_id,
+                action=BookAction.ADD,
+                order=order,
+                ts_event=ts_init,
+                ts_init=ts_init,
+                flags=0,
+                sequence=0,
+            )
+        )
+
+    return OrderBookDeltas(instrument_id=instrument_id, deltas=deltas)

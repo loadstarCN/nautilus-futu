@@ -17,8 +17,10 @@ from nautilus_trader.execution.reports import (
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.enums import (
     AccountType,
+    LiquiditySide,
     OmsType,
     OrderSide,
+    OrderStatus,
     OrderType,
     TimeInForce,
 )
@@ -27,15 +29,25 @@ from nautilus_trader.model.identifiers import (
     ClientId,
     ClientOrderId,
     InstrumentId,
+    TradeId,
     VenueOrderId,
 )
-from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 from nautilus_trader.model.orders import Order
 
-from nautilus_futu.common import instrument_id_to_futu_security
+from nautilus_futu.common import (
+    futu_security_to_instrument_id,
+    instrument_id_to_futu_security,
+)
 from nautilus_futu.config import FutuExecClientConfig
 from nautilus_futu.constants import FUTU_VENUE, VENUE_TO_FUTU_TRD_SEC_MARKET
 from nautilus_futu.parsing.orders import (
+    _qot_market_to_currency,
+    _sec_market_to_qot_market,
+    futu_order_status_to_nautilus,
+    futu_order_type_to_nautilus,
+    futu_time_in_force_to_nautilus,
+    futu_trd_side_to_nautilus,
     nautilus_order_side_to_futu,
     nautilus_order_type_to_futu,
     parse_futu_fill_to_report,
@@ -92,6 +104,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         self._acc_id = config.acc_id
         self._trd_env = config.trd_env
         self._trd_market = config.trd_market
+        self._push_task: asyncio.Task | None = None
 
     async def _connect(self) -> None:
         """Connect to Futu OpenD for trading."""
@@ -121,6 +134,21 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 )
                 self._log.info("Trade unlocked")
 
+            # Subscribe to trade push notifications
+            await asyncio.to_thread(
+                self._client.sub_acc_push,
+                [self._acc_id],
+            )
+            self._log.info(f"Subscribed to trade push for acc_id={self._acc_id}")
+
+            # Start push loop for order (2208) and fill (2218) updates
+            await asyncio.to_thread(
+                self._client.start_push,
+                [2208, 2218],
+            )
+            self._push_task = self.create_task(self._run_push_loop())
+            self._log.info("Execution push loop started")
+
             self._log.info("Execution client connected to Futu OpenD")
         except Exception as e:
             self._log.error(f"Failed to connect execution client: {e}")
@@ -129,10 +157,141 @@ class FutuLiveExecutionClient(LiveExecutionClient):
     async def _disconnect(self) -> None:
         """Disconnect from Futu OpenD."""
         self._log.info("Disconnecting execution client...")
+        if self._push_task is not None:
+            self._push_task.cancel()
+            self._push_task = None
         try:
             await asyncio.to_thread(self._client.disconnect)
         except Exception as e:
             self._log.error(f"Error disconnecting execution client: {e}")
+
+    async def _run_push_loop(self) -> None:
+        """Background loop polling for trade push messages."""
+        self._log.debug("Execution push loop running")
+        try:
+            while True:
+                msg = await asyncio.to_thread(self._client.poll_push, 100)
+                if msg is None:
+                    await asyncio.sleep(0)
+                    continue
+
+                proto_id = msg["proto_id"]
+                data = msg["data"]
+
+                try:
+                    if proto_id == 2208:
+                        self._handle_push_order(data)
+                    elif proto_id == 2218:
+                        self._handle_push_fill(data)
+                except Exception as e:
+                    self._log.error(f"Error handling exec push proto_id={proto_id}: {e}")
+        except asyncio.CancelledError:
+            self._log.debug("Execution push loop cancelled")
+
+    def _handle_push_order(self, data: dict) -> None:
+        """Handle order update push (proto 2208)."""
+        order_data = data["order"]
+        order_status_int = order_data["order_status"]
+        nt_status = futu_order_status_to_nautilus(order_status_int)
+        venue_order_id = VenueOrderId(str(order_data["order_id"]))
+
+        # Try to find the matching client order in cache
+        order = self._cache.order(venue_order_id=venue_order_id)
+        if order is None:
+            self._log.debug(f"No cached order for venue_order_id={venue_order_id}")
+            return
+
+        client_order_id = order.client_order_id
+        account_id = AccountId(f"FUTU-{self._acc_id}")
+        sec_market = order_data.get("sec_market")
+        market = _sec_market_to_qot_market(sec_market)
+        instrument_id = futu_security_to_instrument_id(market, order_data["code"])
+        ts_event = int((order_data.get("update_timestamp") or 0) * 1e9)
+
+        if nt_status == OrderStatus.ACCEPTED:
+            self.generate_order_accepted(
+                strategy_id=order.strategy_id,
+                instrument_id=instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=venue_order_id,
+                ts_event=ts_event,
+            )
+        elif nt_status == OrderStatus.CANCELED:
+            self.generate_order_canceled(
+                strategy_id=order.strategy_id,
+                instrument_id=instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=venue_order_id,
+                ts_event=ts_event,
+            )
+        elif nt_status == OrderStatus.REJECTED:
+            reason = order_data.get("remark") or "Unknown"
+            self.generate_order_rejected(
+                strategy_id=order.strategy_id,
+                instrument_id=instrument_id,
+                client_order_id=client_order_id,
+                reason=str(reason),
+                ts_event=ts_event,
+            )
+        elif nt_status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+            fill_qty = order_data.get("fill_qty") or 0.0
+            fill_avg_price = order_data.get("fill_avg_price") or 0.0
+            if fill_qty > 0 and fill_avg_price > 0:
+                # Determine the last fill qty from order data
+                currency = _qot_market_to_currency(market)
+                self.generate_order_filled(
+                    strategy_id=order.strategy_id,
+                    instrument_id=instrument_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=venue_order_id,
+                    venue_position_id=None,
+                    trade_id=TradeId(f"{order_data['order_id']}-{ts_event}"),
+                    order_side=futu_trd_side_to_nautilus(order_data["trd_side"]),
+                    order_type=futu_order_type_to_nautilus(order_data["order_type"]),
+                    last_qty=Quantity.from_str(str(fill_qty)),
+                    last_px=Price.from_str(str(fill_avg_price)),
+                    quote_currency=currency,
+                    commission=Money(0, currency),
+                    liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
+                    ts_event=ts_event,
+                )
+
+    def _handle_push_fill(self, data: dict) -> None:
+        """Handle fill update push (proto 2218)."""
+        fill_data = data["fill"]
+        order_id = fill_data.get("order_id")
+        if order_id is None:
+            return
+
+        venue_order_id = VenueOrderId(str(order_id))
+        order = self._cache.order(venue_order_id=venue_order_id)
+        if order is None:
+            self._log.debug(f"No cached order for fill venue_order_id={venue_order_id}")
+            return
+
+        client_order_id = order.client_order_id
+        sec_market = fill_data.get("sec_market")
+        market = _sec_market_to_qot_market(sec_market)
+        instrument_id = futu_security_to_instrument_id(market, fill_data["code"])
+        ts_event = int((fill_data.get("create_timestamp") or 0) * 1e9)
+        currency = _qot_market_to_currency(market)
+
+        self.generate_order_filled(
+            strategy_id=order.strategy_id,
+            instrument_id=instrument_id,
+            client_order_id=client_order_id,
+            venue_order_id=venue_order_id,
+            venue_position_id=None,
+            trade_id=TradeId(str(fill_data["fill_id"])),
+            order_side=futu_trd_side_to_nautilus(fill_data["trd_side"]),
+            order_type=futu_order_type_to_nautilus(order.order_type),
+            last_qty=Quantity.from_str(str(fill_data["qty"])),
+            last_px=Price.from_str(str(fill_data["price"])),
+            quote_currency=currency,
+            commission=Money(0, currency),
+            liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
+            ts_event=ts_event,
+        )
 
     async def _submit_order(self, command: Any) -> None:
         """Submit a new order."""

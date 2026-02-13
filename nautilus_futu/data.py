@@ -12,7 +12,10 @@ from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import Bar, BarType, QuoteTick, TradeTick
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 
-from nautilus_futu.common import instrument_id_to_futu_security
+from nautilus_futu.common import (
+    futu_security_to_instrument_id,
+    instrument_id_to_futu_security,
+)
 from nautilus_futu.config import FutuDataClientConfig
 from nautilus_futu.constants import (
     FUTU_SUB_TYPE_BASIC,
@@ -69,6 +72,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
         self._subscribed_quote_ticks: set[InstrumentId] = set()
         self._subscribed_trade_ticks: set[InstrumentId] = set()
         self._subscribed_bars: set[BarType] = set()
+        self._push_task: asyncio.Task | None = None
 
     async def _connect(self) -> None:
         """Connect to Futu OpenD."""
@@ -82,6 +86,15 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 self._config.client_ver,
             )
             self._log.info("Connected to Futu OpenD")
+
+            # Register push handlers and start push loop
+            # 3005=BasicQot, 3011=Ticker, 3013=OrderBook, 3007=KL
+            await asyncio.to_thread(
+                self._client.start_push,
+                [3005, 3011, 3013, 3007],
+            )
+            self._push_task = self.create_task(self._run_push_loop())
+            self._log.info("Push loop started")
         except Exception as e:
             self._log.error(f"Failed to connect to Futu OpenD: {e}")
             raise
@@ -89,11 +102,106 @@ class FutuLiveDataClient(LiveMarketDataClient):
     async def _disconnect(self) -> None:
         """Disconnect from Futu OpenD."""
         self._log.info("Disconnecting from Futu OpenD...")
+        if self._push_task is not None:
+            self._push_task.cancel()
+            self._push_task = None
         try:
             await asyncio.to_thread(self._client.disconnect)
             self._log.info("Disconnected from Futu OpenD")
         except Exception as e:
             self._log.error(f"Error disconnecting: {e}")
+
+    async def _run_push_loop(self) -> None:
+        """Background loop that polls for push messages and dispatches them."""
+        self._log.debug("Push loop running")
+        try:
+            while True:
+                msg = await asyncio.to_thread(self._client.poll_push, 100)
+                if msg is None:
+                    await asyncio.sleep(0)  # yield to event loop
+                    continue
+
+                proto_id = msg["proto_id"]
+                data = msg["data"]
+
+                try:
+                    if proto_id == 3005:
+                        self._handle_push_basic_qot(data)
+                    elif proto_id == 3011:
+                        self._handle_push_ticker(data)
+                    elif proto_id == 3013:
+                        self._handle_push_order_book(data)
+                    elif proto_id == 3007:
+                        self._handle_push_kl(data)
+                except Exception as e:
+                    self._log.error(f"Error handling push proto_id={proto_id}: {e}")
+        except asyncio.CancelledError:
+            self._log.debug("Push loop cancelled")
+
+    def _handle_push_basic_qot(self, data_list: list) -> None:
+        """Handle basic quote push (proto 3005)."""
+        from nautilus_futu.parsing.market_data import parse_futu_quote_tick
+
+        ts_init = self._clock.timestamp_ns()
+        for data in data_list:
+            market = data["market"]
+            code = data["code"]
+            instrument_id = futu_security_to_instrument_id(market, code)
+            if instrument_id in self._subscribed_quote_ticks:
+                tick = parse_futu_quote_tick(data, instrument_id, ts_init)
+                self._handle_data(tick)
+
+    def _handle_push_ticker(self, data: dict) -> None:
+        """Handle ticker push (proto 3011)."""
+        from nautilus_futu.parsing.market_data import parse_futu_trade_tick
+
+        market = data["market"]
+        code = data["code"]
+        instrument_id = futu_security_to_instrument_id(market, code)
+        if instrument_id not in self._subscribed_trade_ticks:
+            return
+
+        ts_init = self._clock.timestamp_ns()
+        for ticker in data.get("tickers", []):
+            tick = parse_futu_trade_tick(ticker, instrument_id, ts_init)
+            self._handle_data(tick)
+
+    def _handle_push_order_book(self, data: dict) -> None:
+        """Handle order book push (proto 3013)."""
+        from nautilus_futu.parsing.market_data import parse_push_order_book
+
+        market = data["market"]
+        code = data["code"]
+        instrument_id = futu_security_to_instrument_id(market, code)
+
+        ts_init = self._clock.timestamp_ns()
+        deltas = parse_push_order_book(data, instrument_id, ts_init)
+        self._handle_data(deltas)
+
+    def _handle_push_kl(self, data: dict) -> None:
+        """Handle K-line push (proto 3007)."""
+        from nautilus_futu.parsing.market_data import (
+            futu_kl_type_to_bar_spec,
+            parse_futu_bars,
+        )
+
+        market = data["market"]
+        code = data["code"]
+        kl_type = data["kl_type"]
+        instrument_id = futu_security_to_instrument_id(market, code)
+
+        bar_spec = futu_kl_type_to_bar_spec(kl_type)
+        if bar_spec is None:
+            self._log.warning(f"Unknown KL type {kl_type} in push")
+            return
+
+        bar_type = BarType(instrument_id, bar_spec)
+        if bar_type not in self._subscribed_bars:
+            return
+
+        bars = parse_futu_bars(data.get("kl_list", []), bar_type)
+        for bar in bars:
+            self._handle_data(bar)
 
     async def _subscribe_quote_ticks(self, instrument_id: InstrumentId) -> None:
         """Subscribe to quote tick updates."""

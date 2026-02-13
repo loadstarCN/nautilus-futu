@@ -1,4 +1,5 @@
 pub mod client;
+pub mod push_decode;
 
 use pyo3::prelude::*;
 

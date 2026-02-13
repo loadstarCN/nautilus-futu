@@ -1,8 +1,10 @@
 #![allow(clippy::useless_conversion)]
 
+use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
 use tokio::runtime::Runtime;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::config::FutuConfig;
 use crate::client::FutuClient;
@@ -12,6 +14,8 @@ use crate::client::FutuClient;
 pub struct PyFutuClient {
     runtime: Runtime,
     client: Option<FutuClient>,
+    push_rx: Option<Arc<Mutex<mpsc::UnboundedReceiver<(u32, Vec<u8>)>>>>,
+    push_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 #[pymethods]
@@ -23,6 +27,8 @@ impl PyFutuClient {
         Ok(Self {
             runtime,
             client: None,
+            push_rx: None,
+            push_handles: Vec::new(),
         })
     }
 
@@ -62,6 +68,12 @@ impl PyFutuClient {
 
     /// Disconnect from Futu OpenD.
     fn disconnect(&mut self, py: Python<'_>) -> PyResult<()> {
+        // Abort push forwarder tasks
+        for handle in self.push_handles.drain(..) {
+            handle.abort();
+        }
+        self.push_rx = None;
+
         if let Some(mut client) = self.client.take() {
             py.allow_threads(|| {
                 self.runtime.block_on(async {
@@ -544,5 +556,98 @@ impl PyFutuClient {
             }
         }
         Ok(result)
+    }
+
+    /// Subscribe to trade account push notifications.
+    /// acc_ids: list of account IDs to subscribe
+    fn sub_acc_push(
+        &self,
+        py: Python<'_>,
+        acc_ids: Vec<u64>,
+    ) -> PyResult<()> {
+        let client = self.client.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::trade::push::sub_acc_push(client, acc_ids).await
+            }).map_err(|e| e.to_string())
+        }).map_err(|e| PyRuntimeError::new_err(format!("Sub acc push failed: {}", e)))
+    }
+
+    /// Start receiving push notifications for the given proto_ids.
+    /// Creates a merged channel and spawns forwarder tasks.
+    fn start_push(
+        &mut self,
+        py: Python<'_>,
+        proto_ids: Vec<u32>,
+    ) -> PyResult<()> {
+        let client = self.client.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+
+        let (tx, rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
+
+        // For each proto_id, register a push handler and spawn a forwarder task
+        for proto_id in proto_ids {
+            let mut push_rx = py.allow_threads(|| {
+                self.runtime.block_on(async {
+                    client.subscribe_push(proto_id).await
+                })
+            });
+
+            let tx_clone = tx.clone();
+            let handle = self.runtime.spawn(async move {
+                while let Some(msg) = push_rx.recv().await {
+                    if tx_clone.send((msg.proto_id, msg.body)).is_err() {
+                        break;
+                    }
+                }
+            });
+            self.push_handles.push(handle);
+        }
+
+        self.push_rx = Some(Arc::new(Mutex::new(rx)));
+        Ok(())
+    }
+
+    /// Poll for the next push message. Returns a dict or None on timeout.
+    /// timeout_ms: how long to wait for a message (in milliseconds)
+    #[pyo3(signature = (timeout_ms=100))]
+    fn poll_push(
+        &self,
+        py: Python<'_>,
+        timeout_ms: u64,
+    ) -> PyResult<Option<PyObject>> {
+        let rx = match &self.push_rx {
+            Some(rx) => Arc::clone(rx),
+            None => return Ok(None),
+        };
+
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+
+        let result = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let mut guard = rx.lock().await;
+                tokio::time::timeout(timeout, guard.recv()).await
+            })
+        });
+
+        match result {
+            Ok(Some((proto_id, body))) => {
+                let data = super::push_decode::decode_push_message(py, proto_id, &body)?;
+                let dict = pyo3::types::PyDict::new_bound(py);
+                dict.set_item("proto_id", proto_id)?;
+                dict.set_item("data", data)?;
+                Ok(Some(dict.into_any().unbind()))
+            }
+            Ok(None) => {
+                // Channel closed
+                Ok(None)
+            }
+            Err(_) => {
+                // Timeout — no message available
+                Ok(None)
+            }
+        }
     }
 }
