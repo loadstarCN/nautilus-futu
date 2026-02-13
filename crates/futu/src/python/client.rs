@@ -134,6 +134,114 @@ impl PyFutuClient {
                 dict.set_item("lot_size", basic.lot_size)?;
                 dict.set_item("sec_type", basic.sec_type)?;
                 dict.set_item("list_time", &basic.list_time)?;
+
+                // Extended fields
+                if let Some(exch_type) = basic.exch_type {
+                    dict.set_item("exch_type", exch_type)?;
+                }
+
+                // Option extended data (sec_type=7)
+                if let Some(ref opt) = info.option_ex_data {
+                    dict.set_item("option_type", opt.r#type)?;
+                    dict.set_item("option_owner_market", opt.owner.market)?;
+                    dict.set_item("option_owner_code", &opt.owner.code)?;
+                    dict.set_item("strike_price", opt.strike_price)?;
+                    dict.set_item("strike_time", &opt.strike_time)?;
+                    if let Some(ts) = opt.strike_timestamp {
+                        dict.set_item("strike_timestamp", ts)?;
+                    }
+                }
+
+                // Future extended data (sec_type=8)
+                if let Some(ref fut) = info.future_ex_data {
+                    dict.set_item("last_trade_time", &fut.last_trade_time)?;
+                    if let Some(ts) = fut.last_trade_timestamp {
+                        dict.set_item("last_trade_timestamp", ts)?;
+                    }
+                    dict.set_item("is_main_contract", fut.is_main_contract)?;
+                }
+
+                result.push(dict.into_any().unbind());
+            }
+        }
+        Ok(result)
+    }
+
+    /// Get order book for a single security.
+    /// Returns a dict with asks and bids lists.
+    #[pyo3(signature = (market, code, num=10))]
+    fn get_order_book(
+        &self,
+        py: Python<'_>,
+        market: i32,
+        code: String,
+        num: i32,
+    ) -> PyResult<PyObject> {
+        let client = self.client.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::quote::snapshot::get_order_book(client, market, code, num).await
+            }).map_err(|e| e.to_string())
+        }).map_err(|e| PyRuntimeError::new_err(format!("Get order book failed: {}", e)))?;
+
+        let dict = pyo3::types::PyDict::new_bound(py);
+        if let Some(s2c) = response.s2c {
+            let asks = pyo3::types::PyList::empty_bound(py);
+            for ob in &s2c.order_book_ask_list {
+                let d = pyo3::types::PyDict::new_bound(py);
+                d.set_item("price", ob.price)?;
+                d.set_item("volume", ob.volume)?;
+                d.set_item("order_count", ob.oreder_count)?;
+                asks.append(d)?;
+            }
+            dict.set_item("asks", asks)?;
+
+            let bids = pyo3::types::PyList::empty_bound(py);
+            for ob in &s2c.order_book_bid_list {
+                let d = pyo3::types::PyDict::new_bound(py);
+                d.set_item("price", ob.price)?;
+                d.set_item("volume", ob.volume)?;
+                d.set_item("order_count", ob.oreder_count)?;
+                bids.append(d)?;
+            }
+            dict.set_item("bids", bids)?;
+        }
+        Ok(dict.into_any().unbind())
+    }
+
+    /// Get ticker (trade ticks) for a single security.
+    /// Returns a list of ticker dicts.
+    #[pyo3(signature = (market, code, max_ret_num=100))]
+    fn get_ticker(
+        &self,
+        py: Python<'_>,
+        market: i32,
+        code: String,
+        max_ret_num: i32,
+    ) -> PyResult<Vec<PyObject>> {
+        let client = self.client.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::quote::snapshot::get_ticker(client, market, code, max_ret_num).await
+            }).map_err(|e| e.to_string())
+        }).map_err(|e| PyRuntimeError::new_err(format!("Get ticker failed: {}", e)))?;
+
+        let mut result = Vec::new();
+        if let Some(s2c) = response.s2c {
+            for t in &s2c.ticker_list {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                dict.set_item("price", t.price)?;
+                dict.set_item("volume", t.volume)?;
+                dict.set_item("dir", t.dir)?;
+                dict.set_item("sequence", t.sequence)?;
+                dict.set_item("turnover", t.turnover)?;
+                if let Some(ts) = t.timestamp {
+                    dict.set_item("time", ts)?;
+                }
                 result.push(dict.into_any().unbind());
             }
         }

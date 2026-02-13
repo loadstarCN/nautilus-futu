@@ -298,6 +298,110 @@ class FutuLiveDataClient(LiveMarketDataClient):
         except Exception as e:
             self._log.error(f"Failed to unsubscribe: {e}")
 
+    async def _unsubscribe_order_book_deltas(self, instrument_id: InstrumentId) -> None:
+        """Unsubscribe from order book updates."""
+        market, code = instrument_id_to_futu_security(instrument_id)
+        try:
+            await asyncio.to_thread(
+                self._client.subscribe,
+                [(market, code)],
+                [FUTU_SUB_TYPE_ORDER_BOOK],
+                False,
+            )
+        except Exception as e:
+            self._log.error(f"Failed to unsubscribe order book: {e}")
+
+    async def _unsubscribe_bars(self, bar_type: BarType) -> None:
+        """Unsubscribe from bar updates."""
+        from nautilus_futu.parsing.market_data import bar_spec_to_futu_sub_type
+
+        instrument_id = bar_type.instrument_id
+        market, code = instrument_id_to_futu_security(instrument_id)
+        sub_type = bar_spec_to_futu_sub_type(bar_type.spec)
+
+        if sub_type is not None:
+            try:
+                await asyncio.to_thread(
+                    self._client.subscribe,
+                    [(market, code)],
+                    [sub_type],
+                    False,
+                )
+                self._subscribed_bars.discard(bar_type)
+            except Exception as e:
+                self._log.error(f"Failed to unsubscribe bars for {bar_type}: {e}")
+
+    async def _request_instrument(
+        self, instrument_id: InstrumentId, correlation_id: Any, params: dict | None = None,
+    ) -> None:
+        """Request a single instrument definition."""
+        from nautilus_futu.parsing.instruments import parse_futu_instrument
+
+        market, code = instrument_id_to_futu_security(instrument_id)
+        try:
+            static_info_list = await asyncio.to_thread(
+                self._client.get_static_info, [(market, code)]
+            )
+            if static_info_list:
+                instrument = parse_futu_instrument(static_info_list[0])
+                if instrument is not None:
+                    self._handle_instrument(instrument, correlation_id)
+        except Exception as e:
+            self._log.error(f"Failed to request instrument {instrument_id}: {e}")
+
+    async def _request_quote_ticks(
+        self,
+        instrument_id: InstrumentId,
+        limit: int,
+        correlation_id: Any,
+        start: Any = None,
+        end: Any = None,
+        params: dict | None = None,
+    ) -> None:
+        """Request quote ticks (basic quote snapshot)."""
+        from nautilus_futu.parsing.market_data import parse_futu_quote_tick
+
+        market, code = instrument_id_to_futu_security(instrument_id)
+        try:
+            result = await asyncio.to_thread(
+                self._client.get_basic_qot, [(market, code)]
+            )
+            ts_init = self._clock.timestamp_ns()
+            ticks = []
+            for data in result:
+                tick = parse_futu_quote_tick(data, instrument_id, ts_init)
+                ticks.append(tick)
+            self._handle_quote_ticks(instrument_id, ticks, correlation_id)
+        except Exception as e:
+            self._log.error(f"Failed to request quote ticks for {instrument_id}: {e}")
+
+    async def _request_trade_ticks(
+        self,
+        instrument_id: InstrumentId,
+        limit: int,
+        correlation_id: Any,
+        start: Any = None,
+        end: Any = None,
+        params: dict | None = None,
+    ) -> None:
+        """Request trade ticks (ticker data)."""
+        from nautilus_futu.parsing.market_data import parse_futu_trade_tick
+
+        market, code = instrument_id_to_futu_security(instrument_id)
+        max_ret = limit if limit and limit > 0 else 100
+        try:
+            result = await asyncio.to_thread(
+                self._client.get_ticker, market, code, max_ret
+            )
+            ts_init = self._clock.timestamp_ns()
+            ticks = []
+            for ticker in result:
+                tick = parse_futu_trade_tick(ticker, instrument_id, ts_init)
+                ticks.append(tick)
+            self._handle_trade_ticks(instrument_id, ticks, correlation_id)
+        except Exception as e:
+            self._log.error(f"Failed to request trade ticks for {instrument_id}: {e}")
+
     async def _request_bars(self, request: RequestBars) -> None:
         """Request historical bars."""
         from nautilus_futu.parsing.market_data import bar_spec_to_futu_kl_type, parse_futu_bars

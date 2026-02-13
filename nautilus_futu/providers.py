@@ -8,8 +8,6 @@ from typing import Any
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.instruments import Equity
-
 from nautilus_futu.common import futu_security_to_instrument_id
 from nautilus_futu.parsing.instruments import parse_futu_instrument
 
