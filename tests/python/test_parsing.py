@@ -21,6 +21,7 @@ from nautilus_futu.constants import (
     FUTU_SUB_TYPE_KL_DAY,
     FUTU_TRD_SIDE_BUY,
     FUTU_TRD_SIDE_SELL,
+    FUTU_TRD_SIDE_SELL_SHORT,
 )
 
 
@@ -90,3 +91,35 @@ class TestBarTypeConversion:
         spec = BarSpecification(1, BarAggregation.TICK, PriceType.LAST)
         assert bar_spec_to_futu_sub_type(spec) is None
         assert bar_spec_to_futu_kl_type(spec) is None
+
+
+class TestOrderConversionEdgeCases:
+    """Edge case tests for order type conversion."""
+
+    def test_sell_short_maps_to_sell(self):
+        """Futu SELL_SHORT should map to Nautilus SELL."""
+        from nautilus_trader.model.enums import OrderSide
+
+        assert futu_trd_side_to_nautilus(FUTU_TRD_SIDE_SELL_SHORT) == OrderSide.SELL
+
+    def test_unsupported_order_side_raises(self):
+        from nautilus_trader.model.enums import OrderSide
+
+        with pytest.raises(ValueError, match="Unsupported order side"):
+            nautilus_order_side_to_futu(OrderSide.NO_ORDER_SIDE)
+
+    def test_unsupported_futu_side_raises(self):
+        with pytest.raises(ValueError, match="Unsupported Futu trade side"):
+            futu_trd_side_to_nautilus(99)
+
+    def test_unsupported_nautilus_order_type_raises(self):
+        from nautilus_trader.model.enums import OrderType
+
+        with pytest.raises(ValueError, match="Unsupported order type"):
+            nautilus_order_type_to_futu(OrderType.STOP_MARKET)
+
+    def test_unknown_futu_order_type_defaults_to_limit(self):
+        """Unknown Futu order type should default to LIMIT."""
+        from nautilus_trader.model.enums import OrderType
+
+        assert futu_order_type_to_nautilus(999) == OrderType.LIMIT

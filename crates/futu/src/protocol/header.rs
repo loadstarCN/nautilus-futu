@@ -128,4 +128,36 @@ mod tests {
             Err(HeaderError::InsufficientData)
         ));
     }
+
+    #[test]
+    fn test_header_zero_length_body() {
+        let body: &[u8] = b"";
+        let header = PacketHeader::new(3001, 5, body);
+        assert_eq!(header.body_len, 0);
+
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        let decoded = PacketHeader::decode(&mut buf).unwrap();
+        assert_eq!(decoded.body_len, 0);
+        assert!(decoded.verify_body(body));
+    }
+
+    #[test]
+    fn test_header_sha1_verification_fail() {
+        let body = b"original data";
+        let header = PacketHeader::new(1001, 1, body);
+        // Verify with different body should fail
+        assert!(!header.verify_body(b"tampered data"));
+    }
+
+    #[test]
+    fn test_header_various_proto_ids() {
+        for proto_id in [1001u32, 3001, 3103, u32::MAX] {
+            let header = PacketHeader::new(proto_id, 1, b"test");
+            let mut buf = BytesMut::new();
+            header.encode(&mut buf);
+            let decoded = PacketHeader::decode(&mut buf).unwrap();
+            assert_eq!(decoded.proto_id, proto_id);
+        }
+    }
 }

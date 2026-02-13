@@ -108,4 +108,64 @@ mod tests {
         assert!(cipher.decrypt(&[0u8; 15]).is_err());
         assert!(cipher.decrypt(&[]).is_err());
     }
+
+    #[test]
+    fn test_aes_ecb_single_byte() {
+        let key = [0xAAu8; 16];
+        let cipher = AesEcbCipher::new(&key);
+        let plaintext = &[0x42u8];
+        let encrypted = cipher.encrypt(plaintext);
+        assert_eq!(encrypted.len(), 16); // 1 byte + 15 padding = 16
+        let decrypted = cipher.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_aes_ecb_large_data() {
+        let key = [0xBBu8; 16];
+        let cipher = AesEcbCipher::new(&key);
+        let plaintext: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+        let encrypted = cipher.encrypt(&plaintext);
+        // 1000 bytes + 8 padding = 1008 (multiple of 16)
+        assert_eq!(encrypted.len(), 1008);
+        let decrypted = cipher.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_aes_ecb_deterministic() {
+        let key = [0xCCu8; 16];
+        let cipher = AesEcbCipher::new(&key);
+        let plaintext = b"deterministic test";
+        let enc1 = cipher.encrypt(plaintext);
+        let enc2 = cipher.encrypt(plaintext);
+        assert_eq!(enc1, enc2);
+    }
+
+    #[test]
+    fn test_aes_ecb_different_keys() {
+        let cipher1 = AesEcbCipher::new(&[0x11u8; 16]);
+        let cipher2 = AesEcbCipher::new(&[0x22u8; 16]);
+        let plaintext = b"same plaintext";
+        let enc1 = cipher1.encrypt(plaintext);
+        let enc2 = cipher2.encrypt(plaintext);
+        assert_ne!(enc1, enc2);
+    }
+
+    #[test]
+    fn test_aes_ecb_corrupted_padding() {
+        let key = [0xDDu8; 16];
+        let cipher = AesEcbCipher::new(&key);
+        // Construct a 16-byte block that, when decrypted, will have invalid padding.
+        // Encrypt known data, then corrupt the last byte of the ciphertext
+        // to produce garbage after decryption.
+        let mut ciphertext = cipher.encrypt(b"test");
+        // Flip a bit in the last block to corrupt padding after decryption
+        let last = ciphertext.len() - 1;
+        ciphertext[last] ^= 0xFF;
+        assert!(matches!(
+            cipher.decrypt(&ciphertext),
+            Err(EncryptionError::InvalidPadding)
+        ));
+    }
 }

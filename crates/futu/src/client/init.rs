@@ -96,3 +96,78 @@ pub enum InitError {
     #[error("missing S2C in response")]
     MissingS2C,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+
+    #[test]
+    fn test_proto_id_constant() {
+        assert_eq!(PROTO_ID_INIT_CONNECT, 1001);
+    }
+
+    #[test]
+    fn test_init_connect_request_encode_decode() {
+        let c2s = crate::generated::init_connect::C2s {
+            client_ver: 100,
+            client_id: "test_client".to_string(),
+            recv_notify: Some(true),
+            packet_enc_algo: Some(-1),
+            push_proto_fmt: Some(0),
+            programming_language: Some("Rust".to_string()),
+        };
+        let request = crate::generated::init_connect::Request { c2s };
+        let encoded = request.encode_to_vec();
+        let decoded = crate::generated::init_connect::Request::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.c2s.client_ver, 100);
+        assert_eq!(decoded.c2s.client_id, "test_client");
+        assert_eq!(decoded.c2s.recv_notify, Some(true));
+        assert_eq!(decoded.c2s.packet_enc_algo, Some(-1));
+        assert_eq!(decoded.c2s.programming_language, Some("Rust".to_string()));
+    }
+
+    #[test]
+    fn test_init_connect_response_success() {
+        let s2c = crate::generated::init_connect::S2c {
+            server_ver: 500,
+            login_user_id: 12345,
+            conn_id: 99,
+            conn_aes_key: "0123456789abcdef".to_string(),
+            keep_alive_interval: 10,
+            aes_cb_civ: None,
+            user_attribution: None,
+        };
+        let response = crate::generated::init_connect::Response {
+            ret_type: 0,
+            ret_msg: Some("success".to_string()),
+            err_code: None,
+            s2c: Some(s2c),
+        };
+        let encoded = response.encode_to_vec();
+        let decoded = crate::generated::init_connect::Response::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.ret_type, 0);
+        let s2c = decoded.s2c.unwrap();
+        assert_eq!(s2c.server_ver, 500);
+        assert_eq!(s2c.login_user_id, 12345);
+        assert_eq!(s2c.conn_id, 99);
+        assert_eq!(s2c.conn_aes_key, "0123456789abcdef");
+        assert_eq!(s2c.keep_alive_interval, 10);
+    }
+
+    #[test]
+    fn test_init_connect_response_error() {
+        let response = crate::generated::init_connect::Response {
+            ret_type: -1,
+            ret_msg: Some("invalid client".to_string()),
+            err_code: Some(1001),
+            s2c: None,
+        };
+        let encoded = response.encode_to_vec();
+        let decoded = crate::generated::init_connect::Response::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.ret_type, -1);
+        assert_eq!(decoded.ret_msg, Some("invalid client".to_string()));
+        assert_eq!(decoded.err_code, Some(1001));
+        assert!(decoded.s2c.is_none());
+    }
+}

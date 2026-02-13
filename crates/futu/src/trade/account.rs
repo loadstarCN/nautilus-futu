@@ -73,3 +73,47 @@ pub async fn unlock_trade(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+
+    #[test]
+    fn test_proto_id_constants() {
+        assert_eq!(PROTO_TRD_GET_ACC_LIST, 2001);
+        assert_eq!(PROTO_TRD_UNLOCK_TRADE, 2005);
+    }
+
+    #[test]
+    fn test_get_acc_list_request_encode_decode() {
+        let c2s = crate::generated::trd_get_acc_list::C2s {
+            user_id: 0,
+            ..Default::default()
+        };
+        let request = crate::generated::trd_get_acc_list::Request { c2s };
+        let encoded = request.encode_to_vec();
+        let decoded =
+            crate::generated::trd_get_acc_list::Request::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.c2s.user_id, 0);
+    }
+
+    #[test]
+    fn test_unlock_trade_request_encode_decode() {
+        let c2s = crate::generated::trd_unlock_trade::C2s {
+            unlock: true,
+            pwd_md5: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+            security_firm: Some(1),
+        };
+        let request = crate::generated::trd_unlock_trade::Request { c2s };
+        let encoded = request.encode_to_vec();
+        let decoded =
+            crate::generated::trd_unlock_trade::Request::decode(encoded.as_slice()).unwrap();
+        assert!(decoded.c2s.unlock);
+        assert_eq!(
+            decoded.c2s.pwd_md5,
+            Some("d41d8cd98f00b204e9800998ecf8427e".to_string())
+        );
+        assert_eq!(decoded.c2s.security_firm, Some(1));
+    }
+}

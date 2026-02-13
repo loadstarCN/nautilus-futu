@@ -123,4 +123,68 @@ mod tests {
         let mut buf = BytesMut::from(&partial[..]);
         assert!(codec.decode(&mut buf).unwrap().is_none());
     }
+
+    #[test]
+    fn test_codec_multiple_messages() {
+        let mut codec = FutuCodec;
+        let msg1 = FutuMessage {
+            proto_id: 1001,
+            serial_no: 1,
+            body: b"first".to_vec(),
+        };
+        let msg2 = FutuMessage {
+            proto_id: 3001,
+            serial_no: 2,
+            body: b"second".to_vec(),
+        };
+
+        let mut buf = BytesMut::new();
+        codec.encode(msg1, &mut buf).unwrap();
+        codec.encode(msg2, &mut buf).unwrap();
+
+        let d1 = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(d1.proto_id, 1001);
+        assert_eq!(d1.serial_no, 1);
+        assert_eq!(d1.body, b"first");
+
+        let d2 = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(d2.proto_id, 3001);
+        assert_eq!(d2.serial_no, 2);
+        assert_eq!(d2.body, b"second");
+    }
+
+    #[test]
+    fn test_codec_empty_body() {
+        let mut codec = FutuCodec;
+        let msg = FutuMessage {
+            proto_id: 1004,
+            serial_no: 10,
+            body: vec![],
+        };
+        let mut buf = BytesMut::new();
+        codec.encode(msg, &mut buf).unwrap();
+
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.proto_id, 1004);
+        assert_eq!(decoded.serial_no, 10);
+        assert!(decoded.body.is_empty());
+    }
+
+    #[test]
+    fn test_codec_large_body() {
+        let mut codec = FutuCodec;
+        let body: Vec<u8> = (0..10240).map(|i| (i % 256) as u8).collect();
+        let msg = FutuMessage {
+            proto_id: 3103,
+            serial_no: 99,
+            body: body.clone(),
+        };
+        let mut buf = BytesMut::new();
+        codec.encode(msg, &mut buf).unwrap();
+
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.proto_id, 3103);
+        assert_eq!(decoded.serial_no, 99);
+        assert_eq!(decoded.body, body);
+    }
 }

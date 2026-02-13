@@ -65,3 +65,86 @@ impl Dispatcher {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_msg(proto_id: u32, serial_no: u32, body: &[u8]) -> FutuMessage {
+        FutuMessage {
+            proto_id,
+            serial_no,
+            body: body.to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_response_dispatch() {
+        let dispatcher = Dispatcher::new();
+        let rx = dispatcher.register_request(100).await;
+        let msg = make_msg(1001, 100, b"response");
+        dispatcher.dispatch(msg).await;
+        let received = rx.await.unwrap();
+        assert_eq!(received.serial_no, 100);
+        assert_eq!(received.body, b"response");
+    }
+
+    #[tokio::test]
+    async fn test_request_unmatched() {
+        let dispatcher = Dispatcher::new();
+        // Dispatch a message with no registered handler — should not panic
+        let msg = make_msg(1001, 999, b"orphan");
+        dispatcher.dispatch(msg).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_dispatch() {
+        let dispatcher = Dispatcher::new();
+        let mut rx = dispatcher.register_push(3001).await;
+        let msg = make_msg(3001, 0, b"push data");
+        dispatcher.dispatch(msg).await;
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.proto_id, 3001);
+        assert_eq!(received.body, b"push data");
+    }
+
+    #[tokio::test]
+    async fn test_push_multiple_listeners() {
+        let dispatcher = Dispatcher::new();
+        let mut rx1 = dispatcher.register_push(3001).await;
+        let mut rx2 = dispatcher.register_push(3001).await;
+        let msg = make_msg(3001, 0, b"broadcast");
+        dispatcher.dispatch(msg).await;
+        let r1 = rx1.recv().await.unwrap();
+        let r2 = rx2.recv().await.unwrap();
+        assert_eq!(r1.body, b"broadcast");
+        assert_eq!(r2.body, b"broadcast");
+    }
+
+    #[tokio::test]
+    async fn test_serial_no_priority_over_proto_id() {
+        let dispatcher = Dispatcher::new();
+        // Register both a request handler (serial_no=50) and a push handler (proto_id=3001)
+        let rx_req = dispatcher.register_request(50).await;
+        let mut rx_push = dispatcher.register_push(3001).await;
+        // Message matches both serial_no=50 and proto_id=3001 → request path wins
+        let msg = make_msg(3001, 50, b"priority");
+        dispatcher.dispatch(msg).await;
+        let received = rx_req.await.unwrap();
+        assert_eq!(received.body, b"priority");
+        // Push handler should NOT have received anything
+        assert!(rx_push.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_request_oneshot_consumed() {
+        let dispatcher = Dispatcher::new();
+        let rx = dispatcher.register_request(77).await;
+        // First dispatch — consumed by the oneshot
+        dispatcher.dispatch(make_msg(1001, 77, b"first")).await;
+        let received = rx.await.unwrap();
+        assert_eq!(received.body, b"first");
+        // Second dispatch with same serial_no — no handler, should not panic
+        dispatcher.dispatch(make_msg(1001, 77, b"second")).await;
+    }
+}
