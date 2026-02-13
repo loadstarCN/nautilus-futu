@@ -25,12 +25,12 @@ jobs:
           # Windows x86_64
           - os: windows-latest
             target: x64
-          # macOS x86_64
-          - os: macos-13
-            target: x86_64
           # macOS Apple Silicon
-          - os: macos-14
+          - os: macos-latest
             target: aarch64
+          # macOS x86_64 (cross-compile)
+          - os: macos-latest
+            target: x86_64
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +42,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --release --out dist --find-interpreter
           manylinux: auto
 
       - uses: actions/upload-artifact@v4
