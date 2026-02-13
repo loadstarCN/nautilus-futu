@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from nautilus_trader.config import LiveDataClientConfig, LiveExecClientConfig
+from nautilus_trader.config import InstrumentProviderConfig, LiveDataClientConfig, LiveExecClientConfig
 
 
 class FutuDataClientConfig(LiveDataClientConfig, frozen=True):
@@ -20,6 +20,8 @@ class FutuDataClientConfig(LiveDataClientConfig, frozen=True):
         Client version number.
     rsa_key_path : str | None, default None
         Path to RSA private key for encrypted connections.
+    instrument_provider : InstrumentProviderConfig
+        The instrument provider configuration.
     """
 
     host: str = "127.0.0.1"
@@ -27,6 +29,7 @@ class FutuDataClientConfig(LiveDataClientConfig, frozen=True):
     client_id: str = "nautilus_futu"
     client_ver: int = 100
     rsa_key_path: str | None = None
+    instrument_provider: InstrumentProviderConfig = InstrumentProviderConfig()
 
 
 class FutuExecClientConfig(LiveExecClientConfig, frozen=True):
@@ -44,6 +47,8 @@ class FutuExecClientConfig(LiveExecClientConfig, frozen=True):
         Client version number.
     rsa_key_path : str | None, default None
         Path to RSA private key for encrypted connections.
+    instrument_provider : InstrumentProviderConfig
+        The instrument provider configuration.
     trd_env : int, default 0
         Trading environment: 0=Simulate, 1=Real.
     acc_id : int, default 0
@@ -59,6 +64,7 @@ class FutuExecClientConfig(LiveExecClientConfig, frozen=True):
     client_id: str = "nautilus_futu"
     client_ver: int = 100
     rsa_key_path: str | None = None
+    instrument_provider: InstrumentProviderConfig = InstrumentProviderConfig()
     trd_env: int = 0
     acc_id: int = 0
     trd_market: int = 1

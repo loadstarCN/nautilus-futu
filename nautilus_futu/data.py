@@ -6,8 +6,8 @@ import asyncio
 from typing import Any
 
 from nautilus_trader.cache.cache import Cache
-from nautilus_trader.common.clock import LiveClock
-from nautilus_trader.common.logging import Logger
+from nautilus_trader.common.component import LiveClock, MessageBus
+from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import Bar, BarType, QuoteTick, TradeTick
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
@@ -32,12 +32,14 @@ class FutuLiveDataClient(LiveMarketDataClient):
         The event loop for the client.
     client : Any
         The Futu Rust client instance.
+    msgbus : MessageBus
+        The message bus for the client.
     cache : Cache
         The cache for the client.
     clock : LiveClock
         The clock for the client.
-    logger : Logger
-        The logger for the client.
+    instrument_provider : FutuInstrumentProvider
+        The instrument provider.
     config : FutuDataClientConfig
         The data client configuration.
     """
@@ -46,9 +48,9 @@ class FutuLiveDataClient(LiveMarketDataClient):
         self,
         loop: asyncio.AbstractEventLoop,
         client: Any,
+        msgbus: MessageBus,
         cache: Cache,
         clock: LiveClock,
-        logger: Logger,
         instrument_provider: FutuInstrumentProvider,
         config: FutuDataClientConfig,
     ) -> None:
@@ -56,10 +58,10 @@ class FutuLiveDataClient(LiveMarketDataClient):
             loop=loop,
             client_id=ClientId("FUTU"),
             venue=FUTU_VENUE,
+            msgbus=msgbus,
             cache=cache,
             clock=clock,
-            logger=logger,
-            config=config,
+            instrument_provider=instrument_provider,
         )
         self._client = client
         self._instrument_provider = instrument_provider
@@ -188,17 +190,11 @@ class FutuLiveDataClient(LiveMarketDataClient):
         except Exception as e:
             self._log.error(f"Failed to unsubscribe: {e}")
 
-    async def _request_bars(
-        self,
-        bar_type: BarType,
-        limit: int,
-        correlation_id: Any,
-        start: Any = None,
-        end: Any = None,
-    ) -> None:
+    async def _request_bars(self, request: RequestBars) -> None:
         """Request historical bars."""
         from nautilus_futu.parsing.market_data import bar_spec_to_futu_kl_type, parse_futu_bars
 
+        bar_type = request.bar_type
         instrument_id = bar_type.instrument_id
         market, code = instrument_id_to_futu_security(instrument_id)
         kl_type = bar_spec_to_futu_kl_type(bar_type.spec)
@@ -207,20 +203,36 @@ class FutuLiveDataClient(LiveMarketDataClient):
             self._log.warning(f"Unsupported bar type for request: {bar_type.spec}")
             return
 
+        start = request.start
+        end = request.end
+        limit = request.limit or 100
+
+        # Futu expects "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" format
+        begin_str = start.strftime("%Y-%m-%d") if start else ""
+        end_str = end.strftime("%Y-%m-%d") if end else ""
+
         try:
             result = await asyncio.to_thread(
                 self._client.get_history_kl,
                 market,
                 code,
+                1,  # rehab_type: 1 = forward adjustment (前复权)
                 kl_type,
-                str(start) if start else "",
-                str(end) if end else "",
+                begin_str,
+                end_str,
                 limit,
             )
 
-            if result:
-                bars = parse_futu_bars(result, bar_type)
-                for bar in bars:
-                    self._handle_data(bar)
+            bars = parse_futu_bars(result, bar_type)
+            self._log.info(f"Received {len(bars)} bars from Futu for {bar_type}")
+
+            self._handle_bars(
+                bar_type,
+                bars,
+                request.id,
+                start,
+                end,
+                request.params,
+            )
         except Exception as e:
             self._log.error(f"Failed to request bars: {e}")

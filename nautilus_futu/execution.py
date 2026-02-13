@@ -7,8 +7,8 @@ from decimal import Decimal
 from typing import Any
 
 from nautilus_trader.cache.cache import Cache
-from nautilus_trader.common.clock import LiveClock
-from nautilus_trader.common.logging import Logger
+from nautilus_trader.common.component import LiveClock, MessageBus
+from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.execution.reports import (
     FillReport,
     OrderStatusReport,
@@ -50,12 +50,14 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         The event loop for the client.
     client : Any
         The Futu Rust client instance.
+    msgbus : MessageBus
+        The message bus for the client.
     cache : Cache
         The cache for the client.
     clock : LiveClock
         The clock for the client.
-    logger : Logger
-        The logger for the client.
+    instrument_provider : InstrumentProvider
+        The instrument provider.
     config : FutuExecClientConfig
         The execution client configuration.
     """
@@ -64,9 +66,10 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         self,
         loop: asyncio.AbstractEventLoop,
         client: Any,
+        msgbus: MessageBus,
         cache: Cache,
         clock: LiveClock,
-        logger: Logger,
+        instrument_provider: InstrumentProvider,
         config: FutuExecClientConfig,
     ) -> None:
         super().__init__(
@@ -74,12 +77,12 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             client_id=ClientId("FUTU"),
             venue=FUTU_VENUE,
             oms_type=OmsType.NETTING,
+            instrument_provider=instrument_provider,
             account_type=AccountType.CASH,
             base_currency=None,
+            msgbus=msgbus,
             cache=cache,
             clock=clock,
-            logger=logger,
-            config=config,
         )
         self._client = client
         self._config = config

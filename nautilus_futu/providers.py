@@ -6,11 +6,11 @@ import asyncio
 from typing import Any
 
 from nautilus_trader.common.providers import InstrumentProvider
+from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Equity
 
 from nautilus_futu.common import futu_security_to_instrument_id
-from nautilus_futu.config import FutuDataClientConfig
 from nautilus_futu.parsing.instruments import parse_futu_instrument
 
 
@@ -21,14 +21,13 @@ class FutuInstrumentProvider(InstrumentProvider):
     ----------
     client : Any
         The Futu Rust client instance.
-    config : FutuDataClientConfig
-        The data client configuration.
+    config : InstrumentProviderConfig | None
+        The instrument provider configuration.
     """
 
-    def __init__(self, client: Any, config: FutuDataClientConfig) -> None:
-        super().__init__()
+    def __init__(self, client: Any, config: InstrumentProviderConfig | None = None) -> None:
+        super().__init__(config=config)
         self._client = client
-        self._config = config
 
     async def load_all_async(self, filters: dict | None = None) -> None:
         """Load all instruments (not supported - use load_ids_async instead)."""

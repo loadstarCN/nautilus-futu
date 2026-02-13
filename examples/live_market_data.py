@@ -40,9 +40,9 @@ async def main():
 
     # Example: Using the low-level Rust client directly
     try:
-        from nautilus_futu._rust import FutuClient
+        from nautilus_futu._rust import PyFutuClient
 
-        client = FutuClient()
+        client = PyFutuClient()
         client.connect(config.host, config.port, config.client_id, config.client_ver)
         print("Connected to Futu OpenD!")
 
@@ -63,6 +63,7 @@ async def main():
         klines = client.get_history_kl(
             market=1,
             code="00700",
+            rehab_type=1,  # Forward adjustment (前复权)
             kl_type=2,  # Day
             begin_time="2024-01-01",
             end_time="2024-01-31",
