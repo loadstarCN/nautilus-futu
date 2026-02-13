@@ -20,7 +20,9 @@ pub async fn init_connect(conn: &FutuConnection) -> Result<InitConnectResponse, 
         client_ver: conn.config().client_ver,
         client_id: conn.config().client_id.clone(),
         recv_notify: Some(true),
-        packet_enc_algo: Some(0), // FTAES_ECB
+        // Encryption requires RSA keys configured in both FutuOpenD and client.
+        // -1 = PacketEncAlgo_None, 0 = FTAES_ECB
+        packet_enc_algo: Some(if conn.config().enable_encryption { 0 } else { -1 }),
         push_proto_fmt: Some(0), // Protobuf
         programming_language: Some("Rust".to_string()),
     };
@@ -57,12 +59,17 @@ pub async fn init_connect(conn: &FutuConnection) -> Result<InitConnectResponse, 
         keep_alive_interval: s2c.keep_alive_interval,
     };
 
-    // Set the AES key for subsequent communication
+    // Only set up AES encryption if packet_enc_algo was requested (not -1/None).
+    // Encryption requires RSA keys configured in FutuOpenD; without RSA keys,
+    // the server never encrypts regardless of this setting.
     let key_bytes = result.conn_aes_key.as_bytes();
-    if key_bytes.len() == 16 {
+    if conn.config().enable_encryption && key_bytes.len() == 16 {
         let mut key = [0u8; 16];
         key.copy_from_slice(key_bytes);
         conn.set_cipher(&key).await;
+        tracing::info!("AES-ECB encryption enabled");
+    } else if conn.config().enable_encryption {
+        tracing::warn!("Encryption requested but connAESKey is {} bytes (expected 16)", key_bytes.len());
     }
 
     // Store connection ID

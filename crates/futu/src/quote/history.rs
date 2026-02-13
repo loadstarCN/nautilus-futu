@@ -3,7 +3,7 @@ use crate::client::FutuClient;
 use super::subscribe::QuoteError;
 
 const PROTO_QOT_GET_KL: u32 = 3006;
-const PROTO_QOT_GET_HISTORY_KL: u32 = 3100;
+const PROTO_QOT_GET_HISTORY_KL: u32 = 3103;
 
 /// Get K-line (candlestick) data for a subscribed security.
 pub async fn get_kl(

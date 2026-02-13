@@ -30,12 +30,9 @@ pub struct S2c {
     /// K线数据
     #[prost(message, repeated, tag = "2")]
     pub kl_list: ::prost::alloc::vec::Vec<super::qot_common::KLine>,
-    /// 如请求不指定maxAckKLNum值，则不会返回该字段，该字段表示超过指定限制的下一K线时间字符串
-    #[prost(string, optional, tag = "3")]
-    pub next_kl_time: ::core::option::Option<::prost::alloc::string::String>,
-    /// 时间戳，如请求不指定maxAckKLNum值，则不会返回该字段，该字段表示超过指定限制的下一K线时间戳
-    #[prost(double, optional, tag = "4")]
-    pub next_kl_timestamp: ::core::option::Option<f64>,
+    /// 分页请求的key，用于翻页的凭证
+    #[prost(bytes = "vec", optional, tag = "3")]
+    pub next_req_key: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Request {

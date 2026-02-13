@@ -39,6 +39,7 @@ impl FutuClient {
     /// Perform the InitConnect handshake and start keepalive + recv loops.
     pub async fn init(&mut self) -> Result<&InitConnectResponse, init::InitError> {
         let resp = init::init_connect(&self.conn).await?;
+        tracing::info!("InitConnect success, keepalive_interval={}s", resp.keep_alive_interval);
 
         // Start keepalive
         let keepalive_handle = keepalive::start_keepalive(
@@ -51,6 +52,7 @@ impl FutuClient {
         let conn = Arc::clone(&self.conn);
         let dispatcher = Arc::clone(&self.dispatcher);
         let recv_handle = tokio::spawn(async move {
+            tracing::debug!("Recv loop started");
             loop {
                 match conn.recv().await {
                     Ok(msg) => {
@@ -75,8 +77,10 @@ impl FutuClient {
 
     /// Send a request and wait for the response.
     pub async fn request(&self, proto_id: u32, body: &[u8]) -> Result<FutuMessage, ConnectionError> {
-        let serial_no = self.conn.send(proto_id, body).await?;
+        // Register BEFORE sending to avoid race with recv loop
+        let serial_no = self.conn.next_serial();
         let rx = self.dispatcher.register_request(serial_no).await;
+        self.conn.send_with_serial(proto_id, body, serial_no).await?;
         rx.await.map_err(|_| ConnectionError::Disconnected)
     }
 

@@ -13,6 +13,8 @@ pub struct FutuConfig {
     pub client_ver: i32,
     /// Path to RSA private key file (optional, for encrypted connections)
     pub rsa_key_path: Option<PathBuf>,
+    /// Enable AES encryption (requires RSA keys configured in FutuOpenD)
+    pub enable_encryption: bool,
     /// Reconnect on disconnect
     pub reconnect: bool,
     /// Reconnect interval in seconds
@@ -27,6 +29,7 @@ impl Default for FutuConfig {
             client_id: "nautilus_futu".to_string(),
             client_ver: 100,
             rsa_key_path: None,
+            enable_encryption: false,
             reconnect: true,
             reconnect_interval_secs: 5,
         }

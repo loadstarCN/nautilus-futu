@@ -27,6 +27,7 @@ impl PyFutuClient {
     /// Connect to Futu OpenD gateway.
     fn connect(
         &mut self,
+        py: Python<'_>,
         host: &str,
         port: u16,
         client_id: &str,
@@ -40,23 +41,30 @@ impl PyFutuClient {
             ..Default::default()
         };
 
-        let mut client = self.runtime.block_on(async {
-            FutuClient::connect(config).await
-        }).map_err(|e| PyRuntimeError::new_err(format!("Connection failed: {}", e)))?;
+        // Release the GIL during blocking network operations
+        let client = py.allow_threads(|| {
+            let mut client = self.runtime.block_on(async {
+                FutuClient::connect(config).await
+            }).map_err(|e| e.to_string())?;
 
-        self.runtime.block_on(async {
-            client.init().await
-        }).map_err(|e| PyRuntimeError::new_err(format!("Init failed: {}", e)))?;
+            self.runtime.block_on(async {
+                client.init().await
+            }).map_err(|e| e.to_string())?;
+
+            Ok::<_, String>(client)
+        }).map_err(|e| PyRuntimeError::new_err(format!("Connection failed: {}", e)))?;
 
         self.client = Some(client);
         Ok(())
     }
 
     /// Disconnect from Futu OpenD.
-    fn disconnect(&mut self) -> PyResult<()> {
+    fn disconnect(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(mut client) = self.client.take() {
-            self.runtime.block_on(async {
-                client.disconnect().await;
+            py.allow_threads(|| {
+                self.runtime.block_on(async {
+                    client.disconnect().await;
+                });
             });
         }
         Ok(())
@@ -68,6 +76,7 @@ impl PyFutuClient {
     /// is_sub: True to subscribe, False to unsubscribe
     fn subscribe(
         &self,
+        py: Python<'_>,
         securities: Vec<(i32, String)>,
         sub_types: Vec<i32>,
         is_sub: bool,
@@ -75,8 +84,10 @@ impl PyFutuClient {
         let client = self.client.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
 
-        self.runtime.block_on(async {
-            crate::quote::subscribe::subscribe(client, securities, sub_types, is_sub).await
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::quote::subscribe::subscribe(client, securities, sub_types, is_sub).await
+            }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Subscribe failed: {}", e)))
     }
 
@@ -85,73 +96,76 @@ impl PyFutuClient {
     /// Returns list of dicts with static info.
     fn get_static_info(
         &self,
+        py: Python<'_>,
         securities: Vec<(i32, String)>,
     ) -> PyResult<Vec<PyObject>> {
         let client = self.client.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
 
-        let response = self.runtime.block_on(async {
-            crate::quote::snapshot::get_static_info(client, securities).await
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::quote::snapshot::get_static_info(client, securities).await
+            }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Get static info failed: {}", e)))?;
 
-        Python::with_gil(|py| {
-            let mut result = Vec::new();
-            if let Some(s2c) = response.s2c {
-                for info in s2c.static_info_list {
-                    let dict = pyo3::types::PyDict::new_bound(py);
-                    let basic = &info.basic;
-                    let sec = &basic.security;
-                    dict.set_item("market", sec.market)?;
-                    dict.set_item("code", &sec.code)?;
-                    dict.set_item("name", &basic.name)?;
-                    dict.set_item("lot_size", basic.lot_size)?;
-                    dict.set_item("sec_type", basic.sec_type)?;
-                    dict.set_item("list_time", &basic.list_time)?;
-                    result.push(dict.unbind().into());
-                }
+        let mut result = Vec::new();
+        if let Some(s2c) = response.s2c {
+            for info in s2c.static_info_list {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                let basic = &info.basic;
+                let sec = &basic.security;
+                dict.set_item("market", sec.market)?;
+                dict.set_item("code", &sec.code)?;
+                dict.set_item("name", &basic.name)?;
+                dict.set_item("lot_size", basic.lot_size)?;
+                dict.set_item("sec_type", basic.sec_type)?;
+                dict.set_item("list_time", &basic.list_time)?;
+                result.push(dict.unbind().into());
             }
-            Ok(result)
-        })
+        }
+        Ok(result)
     }
 
     /// Get basic quote data.
     fn get_basic_qot(
         &self,
+        py: Python<'_>,
         securities: Vec<(i32, String)>,
     ) -> PyResult<Vec<PyObject>> {
         let client = self.client.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
 
-        let response = self.runtime.block_on(async {
-            crate::quote::snapshot::get_basic_qot(client, securities).await
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::quote::snapshot::get_basic_qot(client, securities).await
+            }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Get basic qot failed: {}", e)))?;
 
-        Python::with_gil(|py| {
-            let mut result = Vec::new();
-            if let Some(s2c) = response.s2c {
-                for qot in s2c.basic_qot_list {
-                    let dict = pyo3::types::PyDict::new_bound(py);
-                    let sec = &qot.security;
-                    dict.set_item("market", sec.market)?;
-                    dict.set_item("code", &sec.code)?;
-                    dict.set_item("cur_price", qot.cur_price)?;
-                    dict.set_item("open_price", qot.open_price)?;
-                    dict.set_item("high_price", qot.high_price)?;
-                    dict.set_item("low_price", qot.low_price)?;
-                    dict.set_item("last_close_price", qot.last_close_price)?;
-                    dict.set_item("volume", qot.volume)?;
-                    dict.set_item("turnover", qot.turnover)?;
-                    result.push(dict.unbind().into());
-                }
+        let mut result = Vec::new();
+        if let Some(s2c) = response.s2c {
+            for qot in s2c.basic_qot_list {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                let sec = &qot.security;
+                dict.set_item("market", sec.market)?;
+                dict.set_item("code", &sec.code)?;
+                dict.set_item("cur_price", qot.cur_price)?;
+                dict.set_item("open_price", qot.open_price)?;
+                dict.set_item("high_price", qot.high_price)?;
+                dict.set_item("low_price", qot.low_price)?;
+                dict.set_item("last_close_price", qot.last_close_price)?;
+                dict.set_item("volume", qot.volume)?;
+                dict.set_item("turnover", qot.turnover)?;
+                result.push(dict.unbind().into());
             }
-            Ok(result)
-        })
+        }
+        Ok(result)
     }
 
     /// Get historical K-line data.
     #[pyo3(signature = (market, code, rehab_type, kl_type, begin_time, end_time, max_count=None))]
     fn get_history_kl(
         &self,
+        py: Python<'_>,
         market: i32,
         code: String,
         rehab_type: i32,
@@ -163,36 +177,36 @@ impl PyFutuClient {
         let client = self.client.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
 
-        let response = self.runtime.block_on(async {
-            crate::quote::history::get_history_kl(
-                client, market, code, rehab_type, kl_type,
-                begin_time, end_time, max_count,
-            ).await
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::quote::history::get_history_kl(
+                    client, market, code, rehab_type, kl_type,
+                    begin_time, end_time, max_count,
+                ).await
+            }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Get history KL failed: {}", e)))?;
 
-        Python::with_gil(|py| {
-            let mut result = Vec::new();
-            if let Some(s2c) = response.s2c {
-                for kl in s2c.kl_list {
-                    let dict = pyo3::types::PyDict::new_bound(py);
-                    dict.set_item("time", &kl.time)?;
-                    dict.set_item("is_blank", kl.is_blank)?;
-                    dict.set_item("open_price", kl.open_price)?;
-                    dict.set_item("high_price", kl.high_price)?;
-                    dict.set_item("low_price", kl.low_price)?;
-                    dict.set_item("close_price", kl.close_price)?;
-                    dict.set_item("volume", kl.volume)?;
-                    dict.set_item("turnover", kl.turnover)?;
-                    dict.set_item("timestamp", kl.timestamp)?;
-                    result.push(dict.unbind().into());
-                }
+        let mut result = Vec::new();
+        if let Some(s2c) = response.s2c {
+            for kl in s2c.kl_list {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                dict.set_item("time", &kl.time)?;
+                dict.set_item("is_blank", kl.is_blank)?;
+                dict.set_item("open_price", kl.open_price)?;
+                dict.set_item("high_price", kl.high_price)?;
+                dict.set_item("low_price", kl.low_price)?;
+                dict.set_item("close_price", kl.close_price)?;
+                dict.set_item("volume", kl.volume)?;
+                dict.set_item("turnover", kl.turnover)?;
+                dict.set_item("timestamp", kl.timestamp)?;
+                result.push(dict.unbind().into());
             }
-            Ok(result)
-        })
+        }
+        Ok(result)
     }
 
     /// Get account list.
-    fn get_acc_list(&self) -> PyResult<Vec<PyObject>> {
+    fn get_acc_list(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
         let client = self.client.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
 
@@ -200,35 +214,38 @@ impl PyFutuClient {
             .map(|r| r.login_user_id)
             .unwrap_or(0);
 
-        let response = self.runtime.block_on(async {
-            crate::trade::account::get_acc_list(client, user_id).await
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::trade::account::get_acc_list(client, user_id).await
+            }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Get acc list failed: {}", e)))?;
 
-        Python::with_gil(|py| {
-            let mut result = Vec::new();
-            if let Some(s2c) = response.s2c {
-                for acc in s2c.acc_list {
-                    let dict = pyo3::types::PyDict::new_bound(py);
-                    dict.set_item("acc_id", acc.acc_id)?;
-                    dict.set_item("trd_env", acc.trd_env)?;
-                    result.push(dict.unbind().into());
-                }
+        let mut result = Vec::new();
+        if let Some(s2c) = response.s2c {
+            for acc in s2c.acc_list {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                dict.set_item("acc_id", acc.acc_id)?;
+                dict.set_item("trd_env", acc.trd_env)?;
+                result.push(dict.unbind().into());
             }
-            Ok(result)
-        })
+        }
+        Ok(result)
     }
 
     /// Unlock trading.
     fn unlock_trade(
         &self,
+        py: Python<'_>,
         unlock: bool,
         pwd_md5: String,
     ) -> PyResult<()> {
         let client = self.client.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
 
-        self.runtime.block_on(async {
-            crate::trade::account::unlock_trade(client, unlock, pwd_md5, None).await
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::trade::account::unlock_trade(client, unlock, pwd_md5, None).await
+            }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Unlock trade failed: {}", e)))
     }
 
@@ -236,6 +253,7 @@ impl PyFutuClient {
     #[pyo3(signature = (trd_env, acc_id, trd_market, trd_side, order_type, code, qty, price=None))]
     fn place_order(
         &self,
+        py: Python<'_>,
         trd_env: i32,
         acc_id: u64,
         trd_market: i32,
@@ -248,28 +266,29 @@ impl PyFutuClient {
         let client = self.client.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
 
-        let response = self.runtime.block_on(async {
-            crate::trade::order::place_order(
-                client, trd_env, acc_id, trd_market,
-                trd_side, order_type, code, qty, price,
-                None, None, None, None, None, None, None, None, None,
-            ).await
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::trade::order::place_order(
+                    client, trd_env, acc_id, trd_market,
+                    trd_side, order_type, code, qty, price,
+                    None, None, None, None, None, None, None, None, None,
+                ).await
+            }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Place order failed: {}", e)))?;
 
-        Python::with_gil(|py| {
-            let dict = pyo3::types::PyDict::new_bound(py);
-            if let Some(s2c) = response.s2c {
-                dict.set_item("order_id", s2c.order_id)?;
-                dict.set_item("order_id_ex", s2c.order_id_ex)?;
-            }
-            Ok(dict.unbind().into())
-        })
+        let dict = pyo3::types::PyDict::new_bound(py);
+        if let Some(s2c) = response.s2c {
+            dict.set_item("order_id", s2c.order_id)?;
+            dict.set_item("order_id_ex", s2c.order_id_ex)?;
+        }
+        Ok(dict.unbind().into())
     }
 
     /// Modify an order.
     #[pyo3(signature = (trd_env, acc_id, trd_market, order_id, modify_op, qty=None, price=None))]
     fn modify_order(
         &self,
+        py: Python<'_>,
         trd_env: i32,
         acc_id: u64,
         trd_market: i32,
@@ -281,11 +300,13 @@ impl PyFutuClient {
         let client = self.client.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
 
-        self.runtime.block_on(async {
-            crate::trade::order::modify_order(
-                client, trd_env, acc_id, trd_market,
-                order_id, modify_op, qty, price, None,
-            ).await
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::trade::order::modify_order(
+                    client, trd_env, acc_id, trd_market,
+                    order_id, modify_op, qty, price, None,
+                ).await
+            }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Modify order failed: {}", e)))?;
 
         Ok(())
