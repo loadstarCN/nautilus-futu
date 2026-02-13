@@ -229,6 +229,10 @@ impl PyFutuClient {
                 let dict = pyo3::types::PyDict::new_bound(py);
                 dict.set_item("acc_id", acc.acc_id)?;
                 dict.set_item("trd_env", acc.trd_env)?;
+                dict.set_item("trd_market_auth_list", &acc.trd_market_auth_list)?;
+                dict.set_item("acc_type", acc.acc_type)?;
+                dict.set_item("security_firm", acc.security_firm)?;
+                dict.set_item("sim_acc_type", acc.sim_acc_type)?;
                 result.push(dict.into_any().unbind());
             }
         }
@@ -236,25 +240,29 @@ impl PyFutuClient {
     }
 
     /// Unlock trading.
+    /// security_firm: 1=FutuSecurities, 2=FutuInc, 3=FutuSG, etc.
+    #[pyo3(signature = (unlock, pwd_md5, security_firm=1))]
     fn unlock_trade(
         &self,
         py: Python<'_>,
         unlock: bool,
         pwd_md5: String,
+        security_firm: i32,
     ) -> PyResult<()> {
         let client = self.client.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
 
         py.allow_threads(|| {
             self.runtime.block_on(async {
-                crate::trade::account::unlock_trade(client, unlock, pwd_md5, None).await
+                crate::trade::account::unlock_trade(client, unlock, pwd_md5, Some(security_firm)).await
             }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Unlock trade failed: {}", e)))
     }
 
     /// Place an order.
+    /// sec_market: 1=HK, 2=US, 3=CN_SH, 4=CN_SZ, etc.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (trd_env, acc_id, trd_market, trd_side, order_type, code, qty, price=None))]
+    #[pyo3(signature = (trd_env, acc_id, trd_market, trd_side, order_type, code, qty, price=None, sec_market=None))]
     fn place_order(
         &self,
         py: Python<'_>,
@@ -266,6 +274,7 @@ impl PyFutuClient {
         code: String,
         qty: f64,
         price: Option<f64>,
+        sec_market: Option<i32>,
     ) -> PyResult<PyObject> {
         let client = self.client.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
@@ -275,7 +284,7 @@ impl PyFutuClient {
                 crate::trade::order::place_order(
                     client, trd_env, acc_id, trd_market,
                     trd_side, order_type, code, qty, price,
-                    None, None, None, None, None, None, None, None, None,
+                    None, sec_market, None, None, None, None, None, None, None,
                 ).await
             }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Place order failed: {}", e)))?;

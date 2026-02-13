@@ -33,9 +33,10 @@ pub async fn place_order(
         trd_market,
     };
 
+    let conn_id = client.connection().conn_id().await;
     let c2s = crate::generated::trd_place_order::C2s {
         packet_id: crate::generated::common::PacketId {
-            conn_id: 0,
+            conn_id,
             serial_no: 0,
         },
         header,
@@ -95,9 +96,10 @@ pub async fn modify_order(
         trd_market,
     };
 
+    let conn_id = client.connection().conn_id().await;
     let c2s = crate::generated::trd_modify_order::C2s {
         packet_id: crate::generated::common::PacketId {
-            conn_id: 0,
+            conn_id,
             serial_no: 0,
         },
         header,
