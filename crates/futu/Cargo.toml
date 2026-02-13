@@ -1,0 +1,27 @@
+[package]
+name = "nautilus-futu"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nautilus_futu"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+prost = "0.13"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+rsa = "0.9"
+aes = "0.8"
+sha1 = "0.10"
+pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.22", features = ["tokio-runtime"] }
+tracing = "0.1"
+thiserror = "2"
+futures = "0.3"
+parking_lot = "0.12"
+cipher = "0.4"
+
+[build-dependencies]
+prost-build = "0.13"
