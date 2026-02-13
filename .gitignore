@@ -32,6 +32,9 @@ nul
 
 # Claude Code
 .claude/
+CLAUDE.md
+TASKS.md
+TODO.md
 
 # Maturin
 *.d
