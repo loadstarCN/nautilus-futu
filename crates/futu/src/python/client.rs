@@ -1,3 +1,5 @@
+#![allow(clippy::useless_conversion)]
+
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
 use tokio::runtime::Runtime;
@@ -120,7 +122,7 @@ impl PyFutuClient {
                 dict.set_item("lot_size", basic.lot_size)?;
                 dict.set_item("sec_type", basic.sec_type)?;
                 dict.set_item("list_time", &basic.list_time)?;
-                result.push(dict.unbind().into());
+                result.push(dict.into_any().unbind());
             }
         }
         Ok(result)
@@ -155,13 +157,14 @@ impl PyFutuClient {
                 dict.set_item("last_close_price", qot.last_close_price)?;
                 dict.set_item("volume", qot.volume)?;
                 dict.set_item("turnover", qot.turnover)?;
-                result.push(dict.unbind().into());
+                result.push(dict.into_any().unbind());
             }
         }
         Ok(result)
     }
 
     /// Get historical K-line data.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (market, code, rehab_type, kl_type, begin_time, end_time, max_count=None))]
     fn get_history_kl(
         &self,
@@ -199,7 +202,7 @@ impl PyFutuClient {
                 dict.set_item("volume", kl.volume)?;
                 dict.set_item("turnover", kl.turnover)?;
                 dict.set_item("timestamp", kl.timestamp)?;
-                result.push(dict.unbind().into());
+                result.push(dict.into_any().unbind());
             }
         }
         Ok(result)
@@ -226,7 +229,7 @@ impl PyFutuClient {
                 let dict = pyo3::types::PyDict::new_bound(py);
                 dict.set_item("acc_id", acc.acc_id)?;
                 dict.set_item("trd_env", acc.trd_env)?;
-                result.push(dict.unbind().into());
+                result.push(dict.into_any().unbind());
             }
         }
         Ok(result)
@@ -250,6 +253,7 @@ impl PyFutuClient {
     }
 
     /// Place an order.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (trd_env, acc_id, trd_market, trd_side, order_type, code, qty, price=None))]
     fn place_order(
         &self,
@@ -281,10 +285,11 @@ impl PyFutuClient {
             dict.set_item("order_id", s2c.order_id)?;
             dict.set_item("order_id_ex", s2c.order_id_ex)?;
         }
-        Ok(dict.unbind().into())
+        Ok(dict.into_any().unbind())
     }
 
     /// Modify an order.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (trd_env, acc_id, trd_market, order_id, modify_op, qty=None, price=None))]
     fn modify_order(
         &self,

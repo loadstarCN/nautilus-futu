@@ -12,6 +12,12 @@ pub struct Dispatcher {
     push_handlers: Mutex<HashMap<u32, Vec<mpsc::UnboundedSender<FutuMessage>>>>,
 }
 
+impl Default for Dispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Dispatcher {
     pub fn new() -> Self {
         Self {

@@ -41,6 +41,7 @@ pub async fn get_kl(
 }
 
 /// Get historical K-line data.
+#[allow(clippy::too_many_arguments)]
 pub async fn get_history_kl(
     client: &FutuClient,
     market: i32,

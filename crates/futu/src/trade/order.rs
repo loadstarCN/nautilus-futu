@@ -6,6 +6,7 @@ const PROTO_TRD_PLACE_ORDER: u32 = 2202;
 const PROTO_TRD_MODIFY_ORDER: u32 = 2205;
 
 /// Place a new order.
+#[allow(clippy::too_many_arguments)]
 pub async fn place_order(
     client: &FutuClient,
     trd_env: i32,
@@ -76,6 +77,7 @@ pub async fn place_order(
 }
 
 /// Modify an existing order.
+#[allow(clippy::too_many_arguments)]
 pub async fn modify_order(
     client: &FutuClient,
     trd_env: i32,
