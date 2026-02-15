@@ -166,6 +166,10 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         self._log.info("Disconnecting execution client...")
         if self._push_task is not None:
             self._push_task.cancel()
+            try:
+                await self._push_task
+            except asyncio.CancelledError:
+                pass
             self._push_task = None
         try:
             await asyncio.to_thread(self._client.disconnect)
@@ -380,6 +384,13 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 )
         except Exception as e:
             self._log.error(f"Failed to submit order: {e}")
+            self.generate_order_rejected(
+                strategy_id=order.strategy_id,
+                instrument_id=instrument_id,
+                client_order_id=order.client_order_id,
+                reason=str(e),
+                ts_event=self._clock.timestamp_ns(),
+            )
 
     async def _modify_order(self, command: Any) -> None:
         """Modify an existing order."""

@@ -5,7 +5,6 @@ import pytest
 from nautilus_futu.common import (
     futu_security_to_instrument_id,
     instrument_id_to_futu_security,
-    parse_futu_datetime,
 )
 from nautilus_futu.constants import FUTU_VENUE, HKEX_VENUE, NYSE_VENUE, SSE_VENUE
 
@@ -109,31 +108,8 @@ class TestSymbolConversionExtended:
         assert code == "XYZ"
 
 
-class TestDatetimeParsing:
-    """Tests for datetime parsing."""
-
-    def test_parse_futu_datetime(self):
-        result = parse_futu_datetime("2024-01-15 09:30:00")
-        assert result == "2024-01-15T09:30:00"
-
-    def test_parse_futu_datetime_date_only(self):
-        """Date-only string has no space, so should return as-is."""
-        result = parse_futu_datetime("2024-01-15")
-        assert result == "2024-01-15"
-
-    def test_parse_futu_datetime_empty(self):
-        result = parse_futu_datetime("")
-        assert result == ""
-
-    def test_parse_futu_datetime_basic(self):
-        """Standard datetime format."""
-        result = parse_futu_datetime("2024-01-01 10:00:00")
-        assert result == "2024-01-01T10:00:00"
-
-    def test_parse_futu_datetime_date_only_unchanged(self):
-        """Date-only string (no space) should remain unchanged."""
-        result = parse_futu_datetime("2024-01-01")
-        assert result == "2024-01-01"
+class TestInstrumentIdEdgeCases:
+    """Edge case tests for instrument ID conversion."""
 
     def test_instrument_id_unknown_venue_returns_market_0(self):
         """Unknown Venue should return market=0."""

@@ -72,7 +72,8 @@ impl FutuClient {
         self.recv_handle = Some(recv_handle);
 
         self.init_response = Some(resp);
-        Ok(self.init_response.as_ref().unwrap())
+        // SAFETY: init_response was set to Some on the line above
+        Ok(self.init_response.as_ref().expect("init_response was just set"))
     }
 
     /// Send a request and wait for the response.

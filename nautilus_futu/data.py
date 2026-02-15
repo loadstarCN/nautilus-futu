@@ -9,7 +9,7 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.live.data_client import LiveMarketDataClient
-from nautilus_trader.model.data import Bar, BarType, QuoteTick, TradeTick
+from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 
 from nautilus_futu.common import (
@@ -77,6 +77,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
         self._connect_lock = connect_lock or asyncio.Lock()
         self._subscribed_quote_ticks: set[InstrumentId] = set()
         self._subscribed_trade_ticks: set[InstrumentId] = set()
+        self._subscribed_order_books: set[InstrumentId] = set()
         self._subscribed_bars: set[BarType] = set()
         self._push_task: asyncio.Task | None = None
 
@@ -113,6 +114,10 @@ class FutuLiveDataClient(LiveMarketDataClient):
         self._log.info("Disconnecting from Futu OpenD...")
         if self._push_task is not None:
             self._push_task.cancel()
+            try:
+                await self._push_task
+            except asyncio.CancelledError:
+                pass
             self._push_task = None
         try:
             await asyncio.to_thread(self._client.disconnect)
@@ -223,6 +228,8 @@ class FutuLiveDataClient(LiveMarketDataClient):
         market = data["market"]
         code = data["code"]
         instrument_id = futu_security_to_instrument_id(market, code)
+        if instrument_id not in self._subscribed_order_books:
+            return
 
         ts_init = self._clock.timestamp_ns()
         deltas = parse_push_order_book(data, instrument_id, ts_init)
@@ -293,6 +300,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 [FUTU_SUB_TYPE_ORDER_BOOK],
                 True,
             )
+            self._subscribed_order_books.add(instrument_id)
             self._log.info(f"Subscribed to order book for {instrument_id}")
         except Exception as e:
             self._log.error(f"Failed to subscribe order book for {instrument_id}: {e}")
@@ -358,6 +366,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 [FUTU_SUB_TYPE_ORDER_BOOK],
                 False,
             )
+            self._subscribed_order_books.discard(instrument_id)
         except Exception as e:
             self._log.error(f"Failed to unsubscribe order book: {e}")
 

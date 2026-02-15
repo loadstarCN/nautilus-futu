@@ -42,11 +42,3 @@ def instrument_id_to_futu_security(instrument_id: InstrumentId) -> tuple[int, st
     market = VENUE_TO_FUTU_MARKET.get(venue, 0)
     code = instrument_id.symbol.value
     return market, code
-
-
-def parse_futu_datetime(time_str: str) -> str:
-    """Parse Futu datetime string to ISO format.
-
-    Futu uses "YYYY-MM-DD HH:MM:SS" format.
-    """
-    return time_str.replace(" ", "T")
