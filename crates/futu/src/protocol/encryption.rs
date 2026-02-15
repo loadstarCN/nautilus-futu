@@ -33,7 +33,7 @@ impl AesEcbCipher {
 
     /// Decrypt data and remove PKCS7 padding.
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-        if data.is_empty() || !data.len().is_multiple_of(16) {
+        if data.is_empty() || data.len() % 16 != 0 {
             return Err(EncryptionError::InvalidCiphertext);
         }
 

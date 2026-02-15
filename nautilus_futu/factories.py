@@ -18,6 +18,9 @@ from nautilus_futu.providers import FutuInstrumentProvider
 # Data + Exec clients connecting to the same OpenD share one TCP connection.
 _shared_clients: dict[tuple[str, int], Any] = {}
 
+# Module-level locks to serialize _connect() calls on the same shared client.
+_shared_locks: dict[tuple[str, int], asyncio.Lock] = {}
+
 
 def _get_shared_client(host: str, port: int) -> Any:
     """Get or create a shared PyFutuClient for the given host:port."""
@@ -26,6 +29,14 @@ def _get_shared_client(host: str, port: int) -> Any:
         from nautilus_futu._rust import PyFutuClient
         _shared_clients[key] = PyFutuClient()
     return _shared_clients[key]
+
+
+def _get_shared_lock(host: str, port: int) -> asyncio.Lock:
+    """Get or create a shared asyncio.Lock for the given host:port."""
+    key = (host, port)
+    if key not in _shared_locks:
+        _shared_locks[key] = asyncio.Lock()
+    return _shared_locks[key]
 
 
 class FutuLiveDataClientFactory(LiveDataClientFactory):
@@ -49,6 +60,8 @@ class FutuLiveDataClientFactory(LiveDataClientFactory):
                 "Make sure the Rust extension is built with 'maturin develop'."
             )
 
+        connect_lock = _get_shared_lock(config.host, config.port)
+
         provider = FutuInstrumentProvider(
             client=client,
             config=config.instrument_provider,
@@ -62,6 +75,7 @@ class FutuLiveDataClientFactory(LiveDataClientFactory):
             clock=clock,
             instrument_provider=provider,
             config=config,
+            connect_lock=connect_lock,
         )
 
 
@@ -86,6 +100,8 @@ class FutuLiveExecClientFactory(LiveExecClientFactory):
                 "Make sure the Rust extension is built with 'maturin develop'."
             )
 
+        connect_lock = _get_shared_lock(config.host, config.port)
+
         provider = FutuInstrumentProvider(
             client=client,
             config=config.instrument_provider,
@@ -99,4 +115,5 @@ class FutuLiveExecClientFactory(LiveExecClientFactory):
             clock=clock,
             instrument_provider=provider,
             config=config,
+            connect_lock=connect_lock,
         )

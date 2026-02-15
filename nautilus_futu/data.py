@@ -56,6 +56,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
         clock: LiveClock,
         instrument_provider: FutuInstrumentProvider,
         config: FutuDataClientConfig,
+        connect_lock: asyncio.Lock | None = None,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -69,6 +70,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
         self._client = client
         self._instrument_provider = instrument_provider
         self._config = config
+        self._connect_lock = connect_lock or asyncio.Lock()
         self._subscribed_quote_ticks: set[InstrumentId] = set()
         self._subscribed_trade_ticks: set[InstrumentId] = set()
         self._subscribed_bars: set[BarType] = set()
@@ -78,18 +80,19 @@ class FutuLiveDataClient(LiveMarketDataClient):
         """Connect to Futu OpenD."""
         self._log.info("Connecting to Futu OpenD...")
         try:
-            # Skip connect if already connected (shared client)
-            if not self._client.is_connected():
-                await asyncio.to_thread(
-                    self._client.connect,
-                    self._config.host,
-                    self._config.port,
-                    self._config.client_id,
-                    self._config.client_ver,
-                )
-                self._log.info("Connected to Futu OpenD")
-            else:
-                self._log.info("Reusing existing Futu OpenD connection")
+            async with self._connect_lock:
+                # Skip connect if already connected (shared client)
+                if not self._client.is_connected():
+                    await asyncio.to_thread(
+                        self._client.connect,
+                        self._config.host,
+                        self._config.port,
+                        self._config.client_id,
+                        self._config.client_ver,
+                    )
+                    self._log.info("Connected to Futu OpenD")
+                else:
+                    self._log.info("Reusing existing Futu OpenD connection")
 
             # Register push handlers and start push loop
             # 3005=BasicQot, 3011=Ticker, 3013=OrderBook, 3007=KL

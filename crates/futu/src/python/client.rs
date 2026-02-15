@@ -3,20 +3,42 @@
 use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
+use parking_lot::Mutex as SyncMutex;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::config::FutuConfig;
 use crate::client::FutuClient;
 
+type PushMessage = (u32, Vec<u8>);
+type PushSender = mpsc::UnboundedSender<PushMessage>;
+type PushReceiver = Arc<Mutex<mpsc::UnboundedReceiver<PushMessage>>>;
+
 /// Python-facing Futu client.
+///
+/// All `#[pymethods]` take `&self` (not `&mut self`) to avoid PyO3's internal
+/// RefCell exclusive borrow.  Mutable state is guarded by `SyncMutex` and the
+/// lock is never held across `py.allow_threads()` boundaries.
 #[pyclass]
 pub struct PyFutuClient {
     runtime: Runtime,
-    client: Option<FutuClient>,
-    push_tx: Option<mpsc::UnboundedSender<(u32, Vec<u8>)>>,
-    push_rx: Option<Arc<Mutex<mpsc::UnboundedReceiver<(u32, Vec<u8>)>>>>,
-    push_handles: Vec<tokio::task::JoinHandle<()>>,
+    client: SyncMutex<Option<Arc<FutuClient>>>,
+    push_tx: SyncMutex<Option<PushSender>>,
+    push_rx: SyncMutex<Option<PushReceiver>>,
+    push_handles: SyncMutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl PyFutuClient {
+    /// Lock `self.client`, clone the `Arc`, and return it.
+    /// The `SyncMutex` guard is dropped immediately so it is never held
+    /// across `py.allow_threads()` boundaries.
+    fn get_client(&self) -> PyResult<Arc<FutuClient>> {
+        self.client
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))
+    }
 }
 
 #[pymethods]
@@ -27,16 +49,16 @@ impl PyFutuClient {
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?;
         Ok(Self {
             runtime,
-            client: None,
-            push_tx: None,
-            push_rx: None,
-            push_handles: Vec::new(),
+            client: SyncMutex::new(None),
+            push_tx: SyncMutex::new(None),
+            push_rx: SyncMutex::new(None),
+            push_handles: SyncMutex::new(Vec::new()),
         })
     }
 
     /// Connect to Futu OpenD gateway.
     fn connect(
-        &mut self,
+        &self,
         py: Python<'_>,
         host: &str,
         port: u16,
@@ -51,7 +73,8 @@ impl PyFutuClient {
             ..Default::default()
         };
 
-        // Release the GIL during blocking network operations
+        // Release the GIL during blocking network operations.
+        // No SyncMutex is held here — only `self.runtime` (immutable) is accessed.
         let client = py.allow_threads(|| {
             let mut client = self.runtime.block_on(async {
                 FutuClient::connect(config).await
@@ -64,26 +87,24 @@ impl PyFutuClient {
             Ok::<_, String>(client)
         }).map_err(|e| PyRuntimeError::new_err(format!("Connection failed: {}", e)))?;
 
-        self.client = Some(client);
+        // Brief lock to store the connected client
+        *self.client.lock() = Some(Arc::new(client));
         Ok(())
     }
 
     /// Disconnect from Futu OpenD.
-    fn disconnect(&mut self, py: Python<'_>) -> PyResult<()> {
+    fn disconnect(&self, _py: Python<'_>) -> PyResult<()> {
         // Abort push forwarder tasks
-        for handle in self.push_handles.drain(..) {
+        for handle in self.push_handles.lock().drain(..) {
             handle.abort();
         }
-        self.push_tx = None;
-        self.push_rx = None;
+        *self.push_tx.lock() = None;
+        *self.push_rx.lock() = None;
 
-        if let Some(mut client) = self.client.take() {
-            py.allow_threads(|| {
-                self.runtime.block_on(async {
-                    client.disconnect().await;
-                });
-            });
-        }
+        // Take the Arc out — when the last Arc reference is dropped,
+        // FutuClient::drop() aborts keepalive and recv handles.
+        let _client = self.client.lock().take();
+        tracing::info!("Disconnected from Futu OpenD");
         Ok(())
     }
 
@@ -98,8 +119,8 @@ impl PyFutuClient {
         sub_types: Vec<i32>,
         is_sub: bool,
     ) -> PyResult<()> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -116,8 +137,8 @@ impl PyFutuClient {
         py: Python<'_>,
         securities: Vec<(i32, String)>,
     ) -> PyResult<Vec<PyObject>> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -180,8 +201,8 @@ impl PyFutuClient {
         code: String,
         num: i32,
     ) -> PyResult<PyObject> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -224,8 +245,8 @@ impl PyFutuClient {
         code: String,
         max_ret_num: i32,
     ) -> PyResult<Vec<PyObject>> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -257,8 +278,8 @@ impl PyFutuClient {
         py: Python<'_>,
         securities: Vec<(i32, String)>,
     ) -> PyResult<Vec<PyObject>> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -300,8 +321,8 @@ impl PyFutuClient {
         end_time: String,
         max_count: Option<i32>,
     ) -> PyResult<Vec<PyObject>> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -333,8 +354,8 @@ impl PyFutuClient {
 
     /// Get account list.
     fn get_acc_list(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let user_id = client.init_response()
             .map(|r| r.login_user_id)
@@ -372,8 +393,8 @@ impl PyFutuClient {
         pwd_md5: String,
         security_firm: i32,
     ) -> PyResult<()> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -399,8 +420,8 @@ impl PyFutuClient {
         price: Option<f64>,
         sec_market: Option<i32>,
     ) -> PyResult<PyObject> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -434,8 +455,8 @@ impl PyFutuClient {
         qty: Option<f64>,
         price: Option<f64>,
     ) -> PyResult<()> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -458,8 +479,8 @@ impl PyFutuClient {
         acc_id: u64,
         trd_market: i32,
     ) -> PyResult<Vec<PyObject>> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -504,8 +525,8 @@ impl PyFutuClient {
         acc_id: u64,
         trd_market: i32,
     ) -> PyResult<Vec<PyObject>> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -546,8 +567,8 @@ impl PyFutuClient {
         acc_id: u64,
         trd_market: i32,
     ) -> PyResult<Vec<PyObject>> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -589,8 +610,8 @@ impl PyFutuClient {
         acc_id: u64,
         trd_market: i32,
     ) -> PyResult<PyObject> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -629,8 +650,8 @@ impl PyFutuClient {
         py: Python<'_>,
         securities: Vec<(i32, String)>,
     ) -> PyResult<Vec<PyObject>> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -676,8 +697,8 @@ impl PyFutuClient {
         py: Python<'_>,
         acc_ids: Vec<u64>,
     ) -> PyResult<()> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -688,28 +709,31 @@ impl PyFutuClient {
 
     /// Check if the client is connected to Futu OpenD.
     fn is_connected(&self) -> bool {
-        self.client.is_some()
+        self.client.lock().is_some()
     }
 
     /// Start receiving push notifications for the given proto_ids.
     /// First call creates the merged channel; subsequent calls reuse it
     /// and only add new forwarder tasks (append mode).
     fn start_push(
-        &mut self,
+        &self,
         py: Python<'_>,
         proto_ids: Vec<u32>,
     ) -> PyResult<()> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         // Reuse existing tx/rx if already created, otherwise create new pair
-        let tx = if let Some(ref tx) = self.push_tx {
-            tx.clone()
-        } else {
-            let (tx, rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
-            self.push_tx = Some(tx.clone());
-            self.push_rx = Some(Arc::new(Mutex::new(rx)));
-            tx
+        let tx = {
+            let mut tx_guard = self.push_tx.lock();
+            if let Some(ref tx) = *tx_guard {
+                tx.clone()
+            } else {
+                let (tx, rx) = mpsc::unbounded_channel::<PushMessage>();
+                *tx_guard = Some(tx.clone());
+                *self.push_rx.lock() = Some(Arc::new(Mutex::new(rx)));
+                tx
+            }
         };
 
         // For each proto_id, register a push handler and spawn a forwarder task
@@ -728,7 +752,7 @@ impl PyFutuClient {
                     }
                 }
             });
-            self.push_handles.push(handle);
+            self.push_handles.lock().push(handle);
         }
 
         Ok(())
@@ -742,7 +766,7 @@ impl PyFutuClient {
         py: Python<'_>,
         timeout_ms: u64,
     ) -> PyResult<Option<PyObject>> {
-        let rx = match &self.push_rx {
+        let rx = match self.push_rx.lock().as_ref() {
             Some(rx) => Arc::clone(rx),
             None => return Ok(None),
         };
@@ -778,8 +802,8 @@ impl PyFutuClient {
     /// Get global state from Futu OpenD (proto 1002).
     /// Returns a dict with market states and connection info.
     fn get_global_state(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let client = self.client.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not connected"))?;
+        let client = self.get_client()?;
+        let client = &*client;
 
         let user_id = client.init_response()
             .map(|r| r.login_user_id)

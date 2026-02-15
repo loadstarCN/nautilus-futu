@@ -129,8 +129,17 @@ nautilus-futu/
 # 安装 Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
+# 创建并激活虚拟环境
+python -m venv .venv
+# Linux / macOS
+source .venv/bin/activate
+# Windows
+.venv\Scripts\activate
+
+# 安装开发依赖
+pip install -r requirements-dev.txt
+
 # 开发模式构建（自动编译 Rust 并安装 Python 包）
-pip install maturin
 maturin develop
 
 # 运行 Rust 测试

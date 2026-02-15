@@ -92,7 +92,7 @@ impl FutuConnection {
                 let mut cipher = self.cipher.lock().await;
                 if let Some(ref aes) = *cipher {
                     if !msg.body.is_empty() {
-                        if msg.body.len().is_multiple_of(16) {
+                        if msg.body.len() % 16 == 0 {
                             msg.body = aes.decrypt(&msg.body)
                                 .map_err(|e| ConnectionError::Decryption(e.to_string()))?;
                         } else {

@@ -86,6 +86,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         clock: LiveClock,
         instrument_provider: InstrumentProvider,
         config: FutuExecClientConfig,
+        connect_lock: asyncio.Lock | None = None,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -101,6 +102,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         )
         self._client = client
         self._config = config
+        self._connect_lock = connect_lock or asyncio.Lock()
         self._acc_id = config.acc_id
         self._trd_env = config.trd_env
         self._trd_market = config.trd_market
@@ -110,18 +112,19 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         """Connect to Futu OpenD for trading."""
         self._log.info("Connecting execution client to Futu OpenD...")
         try:
-            # Skip connect if already connected (shared client)
-            if not self._client.is_connected():
-                await asyncio.to_thread(
-                    self._client.connect,
-                    self._config.host,
-                    self._config.port,
-                    self._config.client_id,
-                    self._config.client_ver,
-                )
-                self._log.info("Connected to Futu OpenD")
-            else:
-                self._log.info("Reusing existing Futu OpenD connection")
+            async with self._connect_lock:
+                # Skip connect if already connected (shared client)
+                if not self._client.is_connected():
+                    await asyncio.to_thread(
+                        self._client.connect,
+                        self._config.host,
+                        self._config.port,
+                        self._config.client_id,
+                        self._config.client_ver,
+                    )
+                    self._log.info("Connected to Futu OpenD")
+                else:
+                    self._log.info("Reusing existing Futu OpenD connection")
 
             # Get account list if acc_id not specified
             if self._acc_id == 0:
