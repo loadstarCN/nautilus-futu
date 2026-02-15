@@ -819,11 +819,12 @@ impl PyFutuClient {
         if let Some(s2c) = response.s2c {
             dict.set_item("market_hk", s2c.market_hk)?;
             dict.set_item("market_us", s2c.market_us)?;
-            dict.set_item("market_cn", s2c.market_cn)?;
+            dict.set_item("market_sh", s2c.market_sh)?;
+            dict.set_item("market_sz", s2c.market_sz)?;
             dict.set_item("market_hk_future", s2c.market_hk_future)?;
             dict.set_item("market_us_future", s2c.market_us_future)?;
-            dict.set_item("market_sg", s2c.market_sg)?;
-            dict.set_item("market_jp", s2c.market_jp)?;
+            dict.set_item("market_sg_future", s2c.market_sg_future)?;
+            dict.set_item("market_jp_future", s2c.market_jp_future)?;
             dict.set_item("qot_logined", s2c.qot_logined)?;
             dict.set_item("trd_logined", s2c.trd_logined)?;
             dict.set_item("server_ver", s2c.server_ver)?;

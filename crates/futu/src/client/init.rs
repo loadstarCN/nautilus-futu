@@ -218,17 +218,18 @@ mod tests {
         let s2c = crate::generated::get_global_state::S2c {
             market_hk: 5,       // MarketState_Rest
             market_us: 5,
-            market_cn: 5,
-            market_hk_future: Some(5),
-            market_us_future: Some(5),
-            market_sg: Some(5),
-            market_jp: Some(5),
+            market_sh: 5,
+            market_sz: 5,
+            market_hk_future: 5,
             qot_logined: true,
             trd_logined: true,
-            server_ver: Some(500),
-            server_build_no: Some(1234),
-            time: Some(1704067200),
+            server_ver: 500,
+            server_build_no: 1234,
+            time: 1704067200,
             local_time: Some(1704067200.123),
+            market_us_future: Some(5),
+            market_sg_future: Some(5),
+            market_jp_future: Some(5),
         };
         let response = crate::generated::get_global_state::Response {
             ret_type: 0,
@@ -242,11 +243,12 @@ mod tests {
         let s2c = decoded.s2c.unwrap();
         assert_eq!(s2c.market_hk, 5);
         assert_eq!(s2c.market_us, 5);
-        assert_eq!(s2c.market_cn, 5);
+        assert_eq!(s2c.market_sh, 5);
+        assert_eq!(s2c.market_sz, 5);
         assert!(s2c.qot_logined);
         assert!(s2c.trd_logined);
-        assert_eq!(s2c.server_ver, Some(500));
-        assert_eq!(s2c.time, Some(1704067200));
+        assert_eq!(s2c.server_ver, 500);
+        assert_eq!(s2c.time, 1704067200);
     }
 
     #[test]
@@ -269,17 +271,18 @@ mod tests {
         let s2c = crate::generated::get_global_state::S2c {
             market_hk: 3,
             market_us: 6,
-            market_cn: 1,
-            market_hk_future: None,
-            market_us_future: None,
-            market_sg: Some(2),
-            market_jp: None,
+            market_sh: 1,
+            market_sz: 2,
+            market_hk_future: 4,
             qot_logined: false,
             trd_logined: true,
-            server_ver: Some(321),
-            server_build_no: None,
-            time: Some(9999999),
+            server_ver: 321,
+            server_build_no: 100,
+            time: 9999999,
             local_time: None,
+            market_us_future: None,
+            market_sg_future: Some(2),
+            market_jp_future: None,
         };
         let response = crate::generated::get_global_state::Response {
             ret_type: 0,
@@ -292,9 +295,10 @@ mod tests {
         let s = decoded.s2c.unwrap();
         assert_eq!(s.market_hk, 3);
         assert_eq!(s.market_us, 6);
-        assert_eq!(s.market_cn, 1);
-        assert_eq!(s.market_hk_future, None);
-        assert_eq!(s.market_sg, Some(2));
+        assert_eq!(s.market_sh, 1);
+        assert_eq!(s.market_sz, 2);
+        assert_eq!(s.market_hk_future, 4);
+        assert_eq!(s.market_sg_future, Some(2));
         assert!(!s.qot_logined);
         assert!(s.trd_logined);
     }

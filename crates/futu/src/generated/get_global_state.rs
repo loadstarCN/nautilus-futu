@@ -1,5 +1,6 @@
 // Hand-written prost structs for GetGlobalState (proto 1002).
-// Futu API: https://openapi.futunn.com/futu-api-doc/tcp/intro.html
+// Field tags match official Futu OpenD proto definition:
+// https://github.com/FutunnOpen/py-futu-api/blob/master/futu/common/pb/GetGlobalState.proto
 
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct C2s {
@@ -14,27 +15,33 @@ pub struct S2c {
     #[prost(int32, required, tag = "2")]
     pub market_us: i32,
     #[prost(int32, required, tag = "3")]
-    pub market_cn: i32,
-    #[prost(int32, optional, tag = "4")]
-    pub market_hk_future: ::core::option::Option<i32>,
-    #[prost(int32, optional, tag = "5")]
-    pub market_us_future: ::core::option::Option<i32>,
-    #[prost(int32, optional, tag = "6")]
-    pub market_sg: ::core::option::Option<i32>,
-    #[prost(int32, optional, tag = "7")]
-    pub market_jp: ::core::option::Option<i32>,
-    #[prost(bool, required, tag = "8")]
+    pub market_sh: i32,
+    #[prost(int32, required, tag = "4")]
+    pub market_sz: i32,
+    #[prost(int32, required, tag = "5")]
+    pub market_hk_future: i32,
+    #[prost(bool, required, tag = "6")]
     pub qot_logined: bool,
-    #[prost(bool, required, tag = "9")]
+    #[prost(bool, required, tag = "7")]
     pub trd_logined: bool,
-    #[prost(int32, optional, tag = "10")]
-    pub server_ver: ::core::option::Option<i32>,
-    #[prost(int32, optional, tag = "11")]
-    pub server_build_no: ::core::option::Option<i32>,
-    #[prost(int64, optional, tag = "12")]
-    pub time: ::core::option::Option<i64>,
-    #[prost(double, optional, tag = "13")]
+    #[prost(int32, required, tag = "8")]
+    pub server_ver: i32,
+    #[prost(int32, required, tag = "9")]
+    pub server_build_no: i32,
+    #[prost(int64, required, tag = "10")]
+    pub time: i64,
+    #[prost(double, optional, tag = "11")]
     pub local_time: ::core::option::Option<f64>,
+    // tag 12: programStatus (Common.ProgramStatus message) — skipped
+    // tag 13: qotSvrIpAddr (string) — skipped
+    // tag 14: trdSvrIpAddr (string) — skipped
+    #[prost(int32, optional, tag = "15")]
+    pub market_us_future: ::core::option::Option<i32>,
+    // tag 16: connID (uint64) — skipped
+    #[prost(int32, optional, tag = "17")]
+    pub market_sg_future: ::core::option::Option<i32>,
+    #[prost(int32, optional, tag = "18")]
+    pub market_jp_future: ::core::option::Option<i32>,
 }
 
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]

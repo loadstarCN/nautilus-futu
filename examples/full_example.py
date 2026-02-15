@@ -79,11 +79,12 @@ def demo_rust_client():
     #     9=PreMarketEnd(盘前结束), 10=AfterHoursBegin(盘后开始),
     #     11=AfterHoursEnd(盘后结束)
     print(f"  美股市场状态: {state.get('market_us')}")
-    print(f"  A股市场状态: {state.get('market_cn')}")
+    print(f"  沪股市场状态: {state.get('market_sh')}")
+    print(f"  深股市场状态: {state.get('market_sz')}")
     print(f"  港股期货状态: {state.get('market_hk_future')}")
     print(f"  美股期货状态: {state.get('market_us_future')}")
-    print(f"  新加坡市场:   {state.get('market_sg')}")
-    print(f"  日本市场:     {state.get('market_jp')}")
+    print(f"  新加坡期货:   {state.get('market_sg_future')}")
+    print(f"  日本期货:     {state.get('market_jp_future')}")
     print(f"  行情已登录:   {state.get('qot_logined')}")
     print(f"  交易已登录:   {state.get('trd_logined')}")
     print(f"  服务器版本:   {state.get('server_ver')}")
@@ -252,7 +253,24 @@ def demo_rust_client():
         client.disconnect()
         return
 
-    acc_id = accounts[0]["acc_id"]
+    # 选择模拟盘账户（trd_env=0），优先支持港股（trd_market=1）
+    sim_acc = None
+    for acc in accounts:
+        markets = acc.get("trd_market_auth_list", [])
+        if acc["trd_env"] == 0 and 1 in markets:
+            sim_acc = acc
+            break
+    if not sim_acc:
+        for acc in accounts:
+            if acc["trd_env"] == 0:
+                sim_acc = acc
+                break
+    if not sim_acc:
+        print("  无模拟盘账户，跳过交易演示")
+        client.disconnect()
+        return
+
+    acc_id = sim_acc["acc_id"]
     trd_env = 0       # 0=模拟盘（安全！）
     trd_market = 1    # 1=港股, 2=美股, 3=A股
 
@@ -305,16 +323,20 @@ def demo_rust_client():
         #   11=部分成交, 12=全部成交, 15=部分撤单, 16=全部撤单
 
     # 查询成交 (TrdGetOrderFillList, Proto 2211)
-    fills = client.get_order_fill_list(
-        trd_env=trd_env, acc_id=acc_id, trd_market=trd_market,
-    )
-    print(f"\n  === 成交 ({len(fills)} 条) ===")
-    for fill in fills[:5]:
-        print(f"  fill_id={fill['fill_id']}, {fill['code']}: "
-              f"side={fill['trd_side']}, qty={fill['qty']}, price={fill['price']}")
+    # 注意：模拟盘可能不支持成交查询
+    try:
+        fills = client.get_order_fill_list(
+            trd_env=trd_env, acc_id=acc_id, trd_market=trd_market,
+        )
+        print(f"\n  === 成交 ({len(fills)} 条) ===")
+        for fill in fills[:5]:
+            print(f"  fill_id={fill['fill_id']}, {fill['code']}: "
+                  f"side={fill['trd_side']}, qty={fill['qty']}, price={fill['price']}")
+    except Exception as e:
+        print(f"\n  === 成交: {e} ===")
 
     # 下单 (TrdPlaceOrder, Proto 2202)
-    # ⚠️ 以下使用模拟盘！请勿在真实盘中无确认地运行。
+    # [注意] 以下使用模拟盘！请勿在真实盘中无确认地运行。
     print(f"\n  === 下单（模拟盘）===")
     result = client.place_order(
         trd_env=0,          # 0=模拟盘（重要！）
@@ -360,8 +382,11 @@ def demo_rust_client():
     # 1.11 取消订阅 & 断开连接
     # ------------------------------------------------------------------
     # 取消订阅
-    client.subscribe([(1, "00700")], [1, 2, 4], False)
-    print("\n已取消订阅")
+    try:
+        client.subscribe([(1, "00700")], [1, 2, 4], False)
+        print("\n已取消订阅")
+    except Exception as e:
+        print(f"\n取消订阅: {e}")
 
     # 断开连接
     # disconnect() 会自动：
@@ -669,7 +694,7 @@ class FutuExampleStrategy(Strategy):
         )
 
         # --- 交易示例 ---
-        # ⚠️ 以下仅为演示，请勿直接用于实盘
+        # [注意] 以下仅为演示，请勿直接用于实盘
 
         # 下限价买单
         limit_order = self.order_factory.limit(
@@ -797,12 +822,12 @@ def print_reference_tables():
 ║  1 = 港股    2 = 美股    3 = A股    4 = 港股期权               ║
 ║                                                              ║
 ║  === Venue 映射 ===                                           ║
-║  HKEX    ↔ QotMarket 1/2  ↔ TrdSecMarket 1                  ║
-║  NYSE    ↔ QotMarket 11   ↔ TrdSecMarket 2                  ║
-║  NASDAQ  ↔ QotMarket 11   ↔ TrdSecMarket 2                  ║
-║  SSE     ↔ QotMarket 21   ↔ TrdSecMarket 31                 ║
-║  SZSE    ↔ QotMarket 22   ↔ TrdSecMarket 32                 ║
-║  SGX     ↔ QotMarket 31   ↔ TrdSecMarket 41                 ║
+║  HKEX    <-> QotMarket 1/2  <-> TrdSecMarket 1                  ║
+║  NYSE    <-> QotMarket 11   <-> TrdSecMarket 2                  ║
+║  NASDAQ  <-> QotMarket 11   <-> TrdSecMarket 2                  ║
+║  SSE     <-> QotMarket 21   <-> TrdSecMarket 31                 ║
+║  SZSE    <-> QotMarket 22   <-> TrdSecMarket 32                 ║
+║  SGX     <-> QotMarket 31   <-> TrdSecMarket 41                 ║
 ║                                                              ║
 ║  === SubType（订阅类型）===                                    ║
 ║  1  = Basic (报价)       2  = OrderBook (盘口)                ║
