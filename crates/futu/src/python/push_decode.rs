@@ -92,7 +92,7 @@ fn decode_order_book(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
         let d = PyDict::new_bound(py);
         d.set_item("price", ob.price)?;
         d.set_item("volume", ob.volume)?;
-        d.set_item("order_count", ob.oreder_count)?;
+        d.set_item("order_count", ob.order_count)?;
         asks.append(d)?;
     }
     dict.set_item("asks", asks)?;
@@ -102,7 +102,7 @@ fn decode_order_book(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
         let d = PyDict::new_bound(py);
         d.set_item("price", ob.price)?;
         d.set_item("volume", ob.volume)?;
-        d.set_item("order_count", ob.oreder_count)?;
+        d.set_item("order_count", ob.order_count)?;
         bids.append(d)?;
     }
     dict.set_item("bids", bids)?;
@@ -293,13 +293,13 @@ mod tests {
             order_book_ask_list: vec![crate::generated::qot_common::OrderBook {
                 price: 346.0,
                 volume: 500,
-                oreder_count: 10,
+                order_count: 10,
                 detail_list: vec![],
             }],
             order_book_bid_list: vec![crate::generated::qot_common::OrderBook {
                 price: 345.0,
                 volume: 1000,
-                oreder_count: 20,
+                order_count: 20,
                 detail_list: vec![],
             }],
             svr_recv_time_bid: None,

@@ -341,7 +341,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             venue_position_id=None,
             trade_id=TradeId(str(fill_data["fill_id"])),
             order_side=futu_trd_side_to_nautilus(fill_data["trd_side"]),
-            order_type=futu_order_type_to_nautilus(order.order_type),
+            order_type=order.order_type,
             last_qty=Quantity.from_str(str(fill_data["qty"])),
             last_px=Price.from_str(str(fill_data["price"])),
             quote_currency=currency,

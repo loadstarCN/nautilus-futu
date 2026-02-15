@@ -288,13 +288,13 @@ mod tests {
                 order_book_ask_list: vec![crate::generated::qot_common::OrderBook {
                     price: 346.0,
                     volume: 500,
-                    oreder_count: 10,
+                    order_count: 10,
                     detail_list: vec![],
                 }],
                 order_book_bid_list: vec![crate::generated::qot_common::OrderBook {
                     price: 345.0,
                     volume: 1000,
-                    oreder_count: 20,
+                    order_count: 20,
                     detail_list: vec![],
                 }],
                 svr_recv_time_bid: None,

@@ -55,9 +55,11 @@ impl Dispatcher {
         drop(pending);
 
         // Otherwise treat as a push notification
-        let handlers = self.push_handlers.lock().await;
-        if let Some(senders) = handlers.get(&msg.proto_id) {
-            for sender in senders {
+        let mut handlers = self.push_handlers.lock().await;
+        if let Some(senders) = handlers.get_mut(&msg.proto_id) {
+            // Remove closed channels, then send to remaining
+            senders.retain(|s| !s.is_closed());
+            for sender in senders.iter() {
                 let _ = sender.send(msg.clone());
             }
         } else {

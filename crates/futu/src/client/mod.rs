@@ -37,7 +37,12 @@ impl FutuClient {
     }
 
     /// Perform the InitConnect handshake and start keepalive + recv loops.
+    /// Safe to call multiple times — returns the existing response if already initialized.
     pub async fn init(&mut self) -> Result<&InitConnectResponse, init::InitError> {
+        if let Some(ref resp) = self.init_response {
+            return Ok(resp);
+        }
+
         let resp = init::init_connect(&self.conn).await?;
         tracing::info!("InitConnect success, keepalive_interval={}s", resp.keep_alive_interval);
 

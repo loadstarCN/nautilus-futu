@@ -19,12 +19,20 @@ pub fn start_keepalive(
     tokio::spawn(async move {
         let mut ticker = time::interval(interval);
         ticker.tick().await; // Skip the first immediate tick
+        let mut consecutive_failures: u32 = 0;
+        const MAX_FAILURES: u32 = 3;
 
         loop {
             ticker.tick().await;
             if let Err(e) = send_keepalive(&conn).await {
-                tracing::error!("KeepAlive failed: {}", e);
-                break;
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_FAILURES {
+                    tracing::error!("KeepAlive failed {} consecutive times, stopping: {}", MAX_FAILURES, e);
+                    break;
+                }
+                tracing::warn!("KeepAlive failed (attempt {}/{}): {}", consecutive_failures, MAX_FAILURES, e);
+            } else {
+                consecutive_failures = 0;
             }
         }
     })
@@ -66,16 +74,13 @@ mod tests {
 
     #[test]
     fn test_interval_minimum_clamp() {
-        // interval_secs=0 should be clamped to 1
-        let interval = Duration::from_secs(0i32.max(1) as u64);
-        assert_eq!(interval, Duration::from_secs(1));
+        // Test the clamping logic used in start_keepalive
+        fn clamp_interval(secs: i32) -> Duration {
+            Duration::from_secs(secs.max(1) as u64)
+        }
 
-        // interval_secs=-5 should be clamped to 1
-        let interval = Duration::from_secs((-5i32).max(1) as u64);
-        assert_eq!(interval, Duration::from_secs(1));
-
-        // interval_secs=10 should stay as 10
-        let interval = Duration::from_secs(10i32.max(1) as u64);
-        assert_eq!(interval, Duration::from_secs(10));
+        assert_eq!(clamp_interval(0), Duration::from_secs(1));
+        assert_eq!(clamp_interval(-5), Duration::from_secs(1));
+        assert_eq!(clamp_interval(10), Duration::from_secs(10));
     }
 }

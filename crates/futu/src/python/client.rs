@@ -217,7 +217,7 @@ impl PyFutuClient {
                 let d = pyo3::types::PyDict::new_bound(py);
                 d.set_item("price", ob.price)?;
                 d.set_item("volume", ob.volume)?;
-                d.set_item("order_count", ob.oreder_count)?;
+                d.set_item("order_count", ob.order_count)?;
                 asks.append(d)?;
             }
             dict.set_item("asks", asks)?;
@@ -227,7 +227,7 @@ impl PyFutuClient {
                 let d = pyo3::types::PyDict::new_bound(py);
                 d.set_item("price", ob.price)?;
                 d.set_item("volume", ob.volume)?;
-                d.set_item("order_count", ob.oreder_count)?;
+                d.set_item("order_count", ob.order_count)?;
                 bids.append(d)?;
             }
             dict.set_item("bids", bids)?;
@@ -301,6 +301,7 @@ impl PyFutuClient {
                 dict.set_item("last_close_price", qot.last_close_price)?;
                 dict.set_item("volume", qot.volume)?;
                 dict.set_item("turnover", qot.turnover)?;
+                dict.set_item("update_timestamp", qot.update_timestamp)?;
                 result.push(dict.into_any().unbind());
             }
         }

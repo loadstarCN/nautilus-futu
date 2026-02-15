@@ -449,7 +449,7 @@ pub struct OrderBook {
     pub volume: i64,
     /// 委托订单个数
     #[prost(int32, required, tag = "3")]
-    pub oreder_count: i32,
+    pub order_count: i32,
     /// 订单信息，SF行情特有
     #[prost(message, repeated, tag = "4")]
     pub detail_list: ::prost::alloc::vec::Vec<OrderBookDetail>,
