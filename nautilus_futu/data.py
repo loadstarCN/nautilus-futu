@@ -99,6 +99,8 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 else:
                     self._log.info("Reusing existing Futu OpenD connection")
 
+            await self._instrument_provider.initialize()
+
             await asyncio.to_thread(
                 self._client.start_push,
                 [FUTU_PROTO_BASIC_QOT, FUTU_PROTO_TICKER, FUTU_PROTO_ORDER_BOOK, FUTU_PROTO_KL],
