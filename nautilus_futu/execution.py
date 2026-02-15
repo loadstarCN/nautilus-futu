@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from decimal import Decimal
 from typing import Any
 
 from nautilus_trader.cache.cache import Cache
@@ -19,10 +18,7 @@ from nautilus_trader.model.enums import (
     AccountType,
     LiquiditySide,
     OmsType,
-    OrderSide,
     OrderStatus,
-    OrderType,
-    TimeInForce,
 )
 from nautilus_trader.model.identifiers import (
     AccountId,
@@ -40,13 +36,17 @@ from nautilus_futu.common import (
     instrument_id_to_futu_security,
 )
 from nautilus_futu.config import FutuExecClientConfig
-from nautilus_futu.constants import FUTU_VENUE, VENUE_TO_FUTU_TRD_SEC_MARKET
+from nautilus_futu.constants import (
+    FUTU_PROTO_TRD_FILL,
+    FUTU_PROTO_TRD_ORDER,
+    FUTU_VENUE,
+    VENUE_TO_FUTU_TRD_SEC_MARKET,
+)
 from nautilus_futu.parsing.orders import (
     _qot_market_to_currency,
     _sec_market_to_qot_market,
     futu_order_status_to_nautilus,
     futu_order_type_to_nautilus,
-    futu_time_in_force_to_nautilus,
     futu_trd_side_to_nautilus,
     nautilus_order_side_to_futu,
     nautilus_order_type_to_futu,
@@ -149,10 +149,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             )
             self._log.info(f"Subscribed to trade push for acc_id={self._acc_id}")
 
-            # Start push loop for order (2208) and fill (2218) updates
             await asyncio.to_thread(
                 self._client.start_push,
-                [2208, 2218],
+                [FUTU_PROTO_TRD_ORDER, FUTU_PROTO_TRD_FILL],
             )
             self._push_task = self.create_task(self._run_push_loop())
             self._log.info("Execution push loop started")
@@ -202,9 +201,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 data = msg["data"]
 
                 try:
-                    if proto_id == 2208:
+                    if proto_id == FUTU_PROTO_TRD_ORDER:
                         self._handle_push_order(data)
-                    elif proto_id == 2218:
+                    elif proto_id == FUTU_PROTO_TRD_FILL:
                         self._handle_push_fill(data)
                 except Exception as e:
                     self._log.error(f"Error handling exec push proto_id={proto_id}: {e}")
@@ -218,8 +217,8 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         )
         try:
             await asyncio.to_thread(self._client.disconnect)
-        except Exception:
-            pass
+        except Exception as e:
+            self._log.warning(f"Error during disconnect before reconnect: {e}")
         await asyncio.sleep(self._config.reconnect_interval)
         try:
             await asyncio.to_thread(
@@ -236,7 +235,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             )
             await asyncio.to_thread(
                 self._client.start_push,
-                [2208, 2218],
+                [FUTU_PROTO_TRD_ORDER, FUTU_PROTO_TRD_FILL],
             )
             self._log.info("Execution client reconnected to Futu OpenD")
         except Exception as e:

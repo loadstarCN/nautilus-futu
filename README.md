@@ -19,7 +19,7 @@ Futu OpenD adapter for [NautilusTrader](https://github.com/nautechsystems/nautil
 
 ## 前置条件
 
-- Python >= 3.10
+- Python >= 3.12
 - [Futu OpenD](https://openapi.futunn.com/futu-api-doc/opend/opend-cmd.html) 网关运行中（默认 `127.0.0.1:11111`）
 - Rust 工具链（从源码安装时需要）
 

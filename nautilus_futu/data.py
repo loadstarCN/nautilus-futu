@@ -18,6 +18,10 @@ from nautilus_futu.common import (
 )
 from nautilus_futu.config import FutuDataClientConfig
 from nautilus_futu.constants import (
+    FUTU_PROTO_BASIC_QOT,
+    FUTU_PROTO_KL,
+    FUTU_PROTO_ORDER_BOOK,
+    FUTU_PROTO_TICKER,
     FUTU_SUB_TYPE_BASIC,
     FUTU_SUB_TYPE_ORDER_BOOK,
     FUTU_SUB_TYPE_TICKER,
@@ -94,11 +98,9 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 else:
                     self._log.info("Reusing existing Futu OpenD connection")
 
-            # Register push handlers and start push loop
-            # 3005=BasicQot, 3011=Ticker, 3013=OrderBook, 3007=KL
             await asyncio.to_thread(
                 self._client.start_push,
-                [3005, 3011, 3013, 3007],
+                [FUTU_PROTO_BASIC_QOT, FUTU_PROTO_TICKER, FUTU_PROTO_ORDER_BOOK, FUTU_PROTO_KL],
             )
             self._push_task = self.create_task(self._run_push_loop())
             self._log.info("Push loop started")
@@ -147,13 +149,13 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 data = msg["data"]
 
                 try:
-                    if proto_id == 3005:
+                    if proto_id == FUTU_PROTO_BASIC_QOT:
                         self._handle_push_basic_qot(data)
-                    elif proto_id == 3011:
+                    elif proto_id == FUTU_PROTO_TICKER:
                         self._handle_push_ticker(data)
-                    elif proto_id == 3013:
+                    elif proto_id == FUTU_PROTO_ORDER_BOOK:
                         self._handle_push_order_book(data)
-                    elif proto_id == 3007:
+                    elif proto_id == FUTU_PROTO_KL:
                         self._handle_push_kl(data)
                 except Exception as e:
                     self._log.error(f"Error handling push proto_id={proto_id}: {e}")
@@ -167,8 +169,8 @@ class FutuLiveDataClient(LiveMarketDataClient):
         )
         try:
             await asyncio.to_thread(self._client.disconnect)
-        except Exception:
-            pass
+        except Exception as e:
+            self._log.warning(f"Error during disconnect before reconnect: {e}")
         await asyncio.sleep(self._config.reconnect_interval)
         try:
             await asyncio.to_thread(
@@ -180,7 +182,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
             )
             await asyncio.to_thread(
                 self._client.start_push,
-                [3005, 3011, 3013, 3007],
+                [FUTU_PROTO_BASIC_QOT, FUTU_PROTO_TICKER, FUTU_PROTO_ORDER_BOOK, FUTU_PROTO_KL],
             )
             self._log.info("Reconnected to Futu OpenD")
         except Exception as e:

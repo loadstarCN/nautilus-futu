@@ -44,7 +44,7 @@ impl AesEcbCipher {
         }
 
         // Remove PKCS7 padding
-        let padding_len = *result.last().unwrap() as usize;
+        let padding_len = *result.last().ok_or(EncryptionError::InvalidPadding)? as usize;
         if padding_len == 0 || padding_len > 16 {
             return Err(EncryptionError::InvalidPadding);
         }
