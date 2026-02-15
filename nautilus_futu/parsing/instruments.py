@@ -12,6 +12,10 @@ from nautilus_trader.model.enums import AssetClass, OptionKind
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 
 from nautilus_futu.common import futu_security_to_instrument_id
+from nautilus_futu.constants import (
+    FUTU_OPTION_TYPE_CALL,
+    FUTU_QOT_MARKET_TO_CURRENCY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,16 +30,7 @@ _SEC_TYPE_FUTURE = 8
 
 def _determine_currency(market: int) -> Currency:
     """Determine currency based on Futu market code."""
-    if market in (1, 2):  # HK
-        return Currency.from_str("HKD")
-    elif market == 11:  # US
-        return Currency.from_str("USD")
-    elif market in (21, 22):  # CN
-        return Currency.from_str("CNY")
-    elif market == 31:  # SG
-        return Currency.from_str("SGD")
-    else:
-        return Currency.from_str("USD")
+    return Currency.from_str(FUTU_QOT_MARKET_TO_CURRENCY.get(market, "USD"))
 
 
 def parse_futu_instrument(
@@ -110,11 +105,10 @@ def _parse_futu_option(
     lot_size = static_info.get("lot_size", 1)
 
     # Option-specific fields from get_static_info extended data
-    futu_option_type = static_info.get("option_type", 1)  # 1=CALL, 2=PUT
-    option_kind = OptionKind.CALL if futu_option_type == 1 else OptionKind.PUT
+    futu_option_type = static_info.get("option_type", FUTU_OPTION_TYPE_CALL)
+    option_kind = OptionKind.CALL if futu_option_type == FUTU_OPTION_TYPE_CALL else OptionKind.PUT
 
     strike_price_val = static_info.get("strike_price", 0.0)
-    strike_time = static_info.get("strike_time", "")
     strike_timestamp = static_info.get("strike_timestamp", 0.0)
 
     # Underlying from option_owner fields

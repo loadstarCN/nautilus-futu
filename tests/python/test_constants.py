@@ -12,10 +12,23 @@ from nautilus_futu.constants import (
     SSE_VENUE,
     SZSE_VENUE,
     SGX_VENUE,
+    FUTU_QOT_MARKET_HK,
+    FUTU_QOT_MARKET_HK_FUTURE,
+    FUTU_QOT_MARKET_US,
+    FUTU_QOT_MARKET_CNSH,
+    FUTU_QOT_MARKET_CNSZ,
+    FUTU_QOT_MARKET_SG,
+    FUTU_QOT_MARKET_TO_CURRENCY,
     FUTU_TRD_MARKET_HK,
     FUTU_TRD_MARKET_US,
     FUTU_TRD_MARKET_CN,
     FUTU_TRD_MARKET_HKCC,
+    FUTU_TRD_SEC_MARKET_HK,
+    FUTU_TRD_SEC_MARKET_US,
+    FUTU_TRD_SEC_MARKET_CN_SH,
+    FUTU_TRD_SEC_MARKET_CN_SZ,
+    FUTU_TRD_SEC_MARKET_SG,
+    FUTU_TRD_SEC_MARKET_TO_QOT_MARKET,
     FUTU_SUB_TYPE_BASIC,
     FUTU_SUB_TYPE_ORDER_BOOK,
     FUTU_SUB_TYPE_TICKER,
@@ -44,6 +57,16 @@ from nautilus_futu.constants import (
     FUTU_TRD_SIDE_BUY_BACK,
     FUTU_TRD_ENV_SIMULATE,
     FUTU_TRD_ENV_REAL,
+    FUTU_TICKER_DIR_BID,
+    FUTU_TICKER_DIR_ASK,
+    FUTU_OPTION_TYPE_CALL,
+    FUTU_OPTION_TYPE_PUT,
+    FUTU_PROTO_BASIC_QOT,
+    FUTU_PROTO_KL,
+    FUTU_PROTO_TICKER,
+    FUTU_PROTO_ORDER_BOOK,
+    FUTU_PROTO_TRD_ORDER,
+    FUTU_PROTO_TRD_FILL,
 )
 
 
@@ -152,3 +175,88 @@ class TestOrderConstants:
     def test_trd_envs(self):
         assert FUTU_TRD_ENV_SIMULATE == 0
         assert FUTU_TRD_ENV_REAL == 1
+
+
+class TestQotMarketConstants:
+    """Verify QotMarket constants and currency mapping."""
+
+    def test_values(self):
+        assert FUTU_QOT_MARKET_HK == 1
+        assert FUTU_QOT_MARKET_HK_FUTURE == 2
+        assert FUTU_QOT_MARKET_US == 11
+        assert FUTU_QOT_MARKET_CNSH == 21
+        assert FUTU_QOT_MARKET_CNSZ == 22
+        assert FUTU_QOT_MARKET_SG == 31
+
+    def test_currency_mapping_known_markets(self):
+        assert FUTU_QOT_MARKET_TO_CURRENCY[FUTU_QOT_MARKET_HK] == "HKD"
+        assert FUTU_QOT_MARKET_TO_CURRENCY[FUTU_QOT_MARKET_HK_FUTURE] == "HKD"
+        assert FUTU_QOT_MARKET_TO_CURRENCY[FUTU_QOT_MARKET_US] == "USD"
+        assert FUTU_QOT_MARKET_TO_CURRENCY[FUTU_QOT_MARKET_CNSH] == "CNY"
+        assert FUTU_QOT_MARKET_TO_CURRENCY[FUTU_QOT_MARKET_CNSZ] == "CNY"
+        assert FUTU_QOT_MARKET_TO_CURRENCY[FUTU_QOT_MARKET_SG] == "SGD"
+
+    def test_currency_mapping_covers_all_markets(self):
+        """All QotMarket values used in FUTU_MARKET_TO_VENUE should have a currency."""
+        for market in FUTU_MARKET_TO_VENUE:
+            assert market in FUTU_QOT_MARKET_TO_CURRENCY
+
+
+class TestTrdSecMarketMapping:
+    """Verify TrdSecMarket -> QotMarket mapping."""
+
+    def test_known_mappings(self):
+        assert FUTU_TRD_SEC_MARKET_TO_QOT_MARKET[FUTU_TRD_SEC_MARKET_HK] == FUTU_QOT_MARKET_HK
+        assert FUTU_TRD_SEC_MARKET_TO_QOT_MARKET[FUTU_TRD_SEC_MARKET_US] == FUTU_QOT_MARKET_US
+        assert FUTU_TRD_SEC_MARKET_TO_QOT_MARKET[FUTU_TRD_SEC_MARKET_CN_SH] == FUTU_QOT_MARKET_CNSH
+        assert FUTU_TRD_SEC_MARKET_TO_QOT_MARKET[FUTU_TRD_SEC_MARKET_CN_SZ] == FUTU_QOT_MARKET_CNSZ
+        assert FUTU_TRD_SEC_MARKET_TO_QOT_MARKET[FUTU_TRD_SEC_MARKET_SG] == FUTU_QOT_MARKET_SG
+
+    def test_all_sec_markets_map_to_valid_qot_market(self):
+        """Every TrdSecMarket should map to a QotMarket in FUTU_MARKET_TO_VENUE."""
+        for sec_market, qot_market in FUTU_TRD_SEC_MARKET_TO_QOT_MARKET.items():
+            assert qot_market in FUTU_MARKET_TO_VENUE, (
+                f"TrdSecMarket {sec_market} maps to QotMarket {qot_market} "
+                f"which has no venue mapping"
+            )
+
+
+class TestTickerDirectionConstants:
+    """Verify ticker direction constants."""
+
+    def test_values(self):
+        assert FUTU_TICKER_DIR_BID == 1
+        assert FUTU_TICKER_DIR_ASK == 2
+
+    def test_distinct(self):
+        assert FUTU_TICKER_DIR_BID != FUTU_TICKER_DIR_ASK
+
+
+class TestOptionTypeConstants:
+    """Verify option type constants."""
+
+    def test_values(self):
+        assert FUTU_OPTION_TYPE_CALL == 1
+        assert FUTU_OPTION_TYPE_PUT == 2
+
+    def test_distinct(self):
+        assert FUTU_OPTION_TYPE_CALL != FUTU_OPTION_TYPE_PUT
+
+
+class TestProtocolIdConstants:
+    """Verify push protocol ID constants."""
+
+    def test_values(self):
+        assert FUTU_PROTO_BASIC_QOT == 3005
+        assert FUTU_PROTO_KL == 3007
+        assert FUTU_PROTO_TICKER == 3011
+        assert FUTU_PROTO_ORDER_BOOK == 3013
+        assert FUTU_PROTO_TRD_ORDER == 2208
+        assert FUTU_PROTO_TRD_FILL == 2218
+
+    def test_all_unique(self):
+        values = [
+            FUTU_PROTO_BASIC_QOT, FUTU_PROTO_KL, FUTU_PROTO_TICKER,
+            FUTU_PROTO_ORDER_BOOK, FUTU_PROTO_TRD_ORDER, FUTU_PROTO_TRD_FILL,
+        ]
+        assert len(values) == len(set(values))

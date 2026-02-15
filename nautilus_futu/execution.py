@@ -43,8 +43,6 @@ from nautilus_futu.constants import (
     VENUE_TO_FUTU_TRD_SEC_MARKET,
 )
 from nautilus_futu.parsing.orders import (
-    _qot_market_to_currency,
-    _sec_market_to_qot_market,
     futu_order_status_to_nautilus,
     futu_order_type_to_nautilus,
     futu_trd_side_to_nautilus,
@@ -53,6 +51,8 @@ from nautilus_futu.parsing.orders import (
     parse_futu_fill_to_report,
     parse_futu_order_to_report,
     parse_futu_position_to_report,
+    qot_market_to_currency,
+    sec_market_to_qot_market,
 )
 
 
@@ -257,7 +257,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         client_order_id = order.client_order_id
         account_id = AccountId(f"FUTU-{self._acc_id}")
         sec_market = order_data.get("sec_market")
-        market = _sec_market_to_qot_market(sec_market)
+        market = sec_market_to_qot_market(sec_market)
         instrument_id = futu_security_to_instrument_id(market, order_data["code"])
         ts_event = int((order_data.get("update_timestamp") or 0) * 1e9)
 
@@ -291,7 +291,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             fill_avg_price = order_data.get("fill_avg_price") or 0.0
             if fill_qty > 0 and fill_avg_price > 0:
                 # Determine the last fill qty from order data
-                currency = _qot_market_to_currency(market)
+                currency = qot_market_to_currency(market)
                 self.generate_order_filled(
                     strategy_id=order.strategy_id,
                     instrument_id=instrument_id,
@@ -324,10 +324,10 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
         client_order_id = order.client_order_id
         sec_market = fill_data.get("sec_market")
-        market = _sec_market_to_qot_market(sec_market)
+        market = sec_market_to_qot_market(sec_market)
         instrument_id = futu_security_to_instrument_id(market, fill_data["code"])
         ts_event = int((fill_data.get("create_timestamp") or 0) * 1e9)
-        currency = _qot_market_to_currency(market)
+        currency = qot_market_to_currency(market)
 
         self.generate_order_filled(
             strategy_id=order.strategy_id,

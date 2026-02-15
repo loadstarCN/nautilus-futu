@@ -40,6 +40,8 @@ from nautilus_futu.constants import (
     FUTU_SUB_TYPE_KL_30MIN,
     FUTU_SUB_TYPE_KL_60MIN,
     FUTU_SUB_TYPE_KL_DAY,
+    FUTU_TICKER_DIR_ASK,
+    FUTU_TICKER_DIR_BID,
 )
 
 
@@ -107,9 +109,9 @@ def parse_futu_trade_tick(
 ) -> TradeTick:
     """Parse Futu ticker to NautilusTrader TradeTick."""
     direction = data.get("dir", 0)
-    if direction == 1:  # Bid
+    if direction == FUTU_TICKER_DIR_BID:
         aggressor_side = AggressorSide.BUYER
-    elif direction == 2:  # Ask
+    elif direction == FUTU_TICKER_DIR_ASK:
         aggressor_side = AggressorSide.SELLER
     else:
         aggressor_side = AggressorSide.NO_AGGRESSOR

@@ -12,6 +12,8 @@ from nautilus_futu.parsing.orders import (
     parse_futu_fill_to_report,
     parse_futu_order_to_report,
     parse_futu_position_to_report,
+    sec_market_to_qot_market,
+    qot_market_to_currency,
 )
 from nautilus_futu.parsing.market_data import (
     bar_spec_to_futu_kl_type,
@@ -22,11 +24,16 @@ from nautilus_futu.constants import (
     FUTU_KL_TYPE_DAY,
     FUTU_ORDER_TYPE_MARKET,
     FUTU_ORDER_TYPE_NORMAL,
+    FUTU_QOT_MARKET_HK,
+    FUTU_QOT_MARKET_US,
     FUTU_SUB_TYPE_KL_1MIN,
     FUTU_SUB_TYPE_KL_DAY,
     FUTU_TRD_SIDE_BUY,
     FUTU_TRD_SIDE_SELL,
     FUTU_TRD_SIDE_SELL_SHORT,
+    FUTU_TRD_SEC_MARKET_HK,
+    FUTU_TRD_SEC_MARKET_US,
+    FUTU_TRD_SEC_MARKET_CN_SH,
 )
 
 
@@ -361,3 +368,40 @@ class TestParsePositionToReport:
         pos = self._make_position_dict(qty=0.0)
         report = parse_futu_position_to_report(pos, AccountId("FUTU-1"))
         assert report.position_side == PositionSide.FLAT
+
+
+class TestSecMarketToQotMarket:
+    """Tests for sec_market_to_qot_market helper."""
+
+    def test_hk_mapping(self):
+        assert sec_market_to_qot_market(FUTU_TRD_SEC_MARKET_HK) == FUTU_QOT_MARKET_HK
+
+    def test_us_mapping(self):
+        assert sec_market_to_qot_market(FUTU_TRD_SEC_MARKET_US) == FUTU_QOT_MARKET_US
+
+    def test_cn_sh_mapping(self):
+        from nautilus_futu.constants import FUTU_QOT_MARKET_CNSH
+        assert sec_market_to_qot_market(FUTU_TRD_SEC_MARKET_CN_SH) == FUTU_QOT_MARKET_CNSH
+
+    def test_none_returns_zero(self):
+        assert sec_market_to_qot_market(None) == 0
+
+    def test_unknown_returns_zero(self):
+        assert sec_market_to_qot_market(9999) == 0
+
+
+class TestQotMarketToCurrency:
+    """Tests for qot_market_to_currency helper."""
+
+    def test_hk_returns_hkd(self):
+        currency = qot_market_to_currency(FUTU_QOT_MARKET_HK)
+        assert str(currency) == "HKD"
+
+    def test_us_returns_usd(self):
+        currency = qot_market_to_currency(FUTU_QOT_MARKET_US)
+        assert str(currency) == "USD"
+
+    def test_unknown_market_returns_usd(self):
+        """Unknown market codes should fall back to USD."""
+        currency = qot_market_to_currency(9999)
+        assert str(currency) == "USD"

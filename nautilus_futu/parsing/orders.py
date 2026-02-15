@@ -30,7 +30,8 @@ from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 
 from nautilus_futu.common import futu_security_to_instrument_id
 from nautilus_futu.constants import (
-    FUTU_MARKET_TO_VENUE,
+    FUTU_QOT_MARKET_TO_CURRENCY,
+    FUTU_TRD_SEC_MARKET_TO_QOT_MARKET,
     FUTU_ORDER_STATUS_CANCELLED_ALL,
     FUTU_ORDER_STATUS_CANCELLED_PART,
     FUTU_ORDER_STATUS_CANCELLING_ALL,
@@ -146,7 +147,6 @@ def futu_time_in_force_to_nautilus(tif: int | None) -> TimeInForce:
 def parse_futu_order_to_report(
     order: dict[str, Any],
     account_id: AccountId,
-    sec_market_to_instrument_id: dict[str, InstrumentId] | None = None,
 ) -> OrderStatusReport:
     """Parse a Futu order dict to NautilusTrader OrderStatusReport.
 
@@ -156,8 +156,6 @@ def parse_futu_order_to_report(
         Order dictionary from PyFutuClient.get_order_list().
     account_id : AccountId
         The account ID.
-    sec_market_to_instrument_id : dict, optional
-        Cache for resolving instrument IDs.
 
     Returns
     -------
@@ -165,8 +163,7 @@ def parse_futu_order_to_report(
     """
     code = order["code"]
     sec_market = order.get("sec_market")
-    # Derive market from sec_market: 1→1(HK), 2→11(US), 31→21(SH), 32→22(SZ), 41→31(SG)
-    market = _sec_market_to_qot_market(sec_market)
+    market = sec_market_to_qot_market(sec_market)
     instrument_id = futu_security_to_instrument_id(market, code)
 
     order_side = futu_trd_side_to_nautilus(order["trd_side"])
@@ -220,7 +217,7 @@ def parse_futu_fill_to_report(
     """
     code = fill["code"]
     sec_market = fill.get("sec_market")
-    market = _sec_market_to_qot_market(sec_market)
+    market = sec_market_to_qot_market(sec_market)
     instrument_id = futu_security_to_instrument_id(market, code)
 
     order_side = futu_trd_side_to_nautilus(fill["trd_side"])
@@ -228,7 +225,7 @@ def parse_futu_fill_to_report(
     ts_event = int((fill.get("create_timestamp") or 0) * 1e9)
 
     # Derive currency from market for commission
-    currency = _qot_market_to_currency(market)
+    currency = qot_market_to_currency(market)
     commission = Money(0, currency)
 
     return FillReport(
@@ -266,7 +263,7 @@ def parse_futu_position_to_report(
     """
     code = position["code"]
     sec_market = position.get("sec_market")
-    market = _sec_market_to_qot_market(sec_market)
+    market = sec_market_to_qot_market(sec_market)
     instrument_id = futu_security_to_instrument_id(market, code)
 
     qty = position["qty"]
@@ -289,28 +286,13 @@ def parse_futu_position_to_report(
     )
 
 
-def _sec_market_to_qot_market(sec_market: int | None) -> int:
+def sec_market_to_qot_market(sec_market: int | None) -> int:
     """Map Futu TrdSecMarket to QotMarket for instrument_id resolution."""
     if sec_market is None:
         return 0
-    mapping = {
-        1: 1,    # HK -> QotMarket_HK_Security
-        2: 11,   # US -> QotMarket_US_Security
-        31: 21,  # CN_SH -> QotMarket_CNSH_Security
-        32: 22,  # CN_SZ -> QotMarket_CNSZ_Security
-        41: 31,  # SG -> QotMarket_SG_Security
-    }
-    return mapping.get(sec_market, 0)
+    return FUTU_TRD_SEC_MARKET_TO_QOT_MARKET.get(sec_market, 0)
 
 
-def _qot_market_to_currency(market: int) -> Currency:
+def qot_market_to_currency(market: int) -> Currency:
     """Map QotMarket to default currency for commission."""
-    mapping = {
-        1: "HKD",   # HK
-        2: "HKD",   # HK Future
-        11: "USD",   # US
-        21: "CNY",   # CN_SH
-        22: "CNY",   # CN_SZ
-        31: "SGD",   # SG
-    }
-    return Currency.from_str(mapping.get(market, "USD"))
+    return Currency.from_str(FUTU_QOT_MARKET_TO_CURRENCY.get(market, "USD"))
