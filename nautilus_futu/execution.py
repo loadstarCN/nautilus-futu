@@ -37,6 +37,10 @@ from nautilus_futu.common import (
 )
 from nautilus_futu.config import FutuExecClientConfig
 from nautilus_futu.constants import (
+    FUTU_ORDER_STATUS_FILLED_PART,
+    FUTU_ORDER_STATUS_SUBMITTED,
+    FUTU_ORDER_STATUS_SUBMITTING,
+    FUTU_ORDER_STATUS_WAITING_SUBMIT,
     FUTU_PROTO_TRD_FILL,
     FUTU_PROTO_TRD_ORDER,
     FUTU_VENUE,
@@ -132,6 +136,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 if accounts:
                     self._acc_id = accounts[0]["acc_id"]
                     self._log.info(f"Using account ID: {self._acc_id}")
+
+            # Set the framework-level account_id for reconciliation
+            self._set_account_id(AccountId(f"FUTU-{self._acc_id}"))
 
             # Unlock trade if password provided
             if self._config.unlock_pwd_md5:
@@ -581,9 +588,12 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             self._log.error(f"Failed to get order list for cancel all: {e}")
             return
 
-        # Active statuses: submitted(10), partially filled(11),
-        # waiting submit(2), submitting(3)
-        active_statuses = {2, 3, 10, 11}
+        active_statuses = {
+            FUTU_ORDER_STATUS_WAITING_SUBMIT,
+            FUTU_ORDER_STATUS_SUBMITTING,
+            FUTU_ORDER_STATUS_SUBMITTED,
+            FUTU_ORDER_STATUS_FILLED_PART,
+        }
         cancelled = 0
         for order_dict in orders:
             if order_dict["order_status"] in active_statuses:

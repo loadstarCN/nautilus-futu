@@ -155,46 +155,60 @@ class TestOrderConversionEdgeCases:
 
 
 class TestOrderStatusConversion:
-    """Tests for Futu OrderStatus to NautilusTrader OrderStatus conversion."""
+    """Tests for Futu OrderStatus to NautilusTrader OrderStatus conversion.
+
+    Values must match official Trd_Common.proto OrderStatus enum.
+    """
 
     def test_unsubmitted_to_initialized(self):
         from nautilus_trader.model.enums import OrderStatus
-        assert futu_order_status_to_nautilus(0) == OrderStatus.INITIALIZED
+        assert futu_order_status_to_nautilus(0) == OrderStatus.INITIALIZED   # Unsubmitted
+        assert futu_order_status_to_nautilus(-1) == OrderStatus.INITIALIZED  # Unknown
 
-    def test_submitted_to_accepted(self):
+    def test_waiting_submit_to_submitted(self):
         from nautilus_trader.model.enums import OrderStatus
-        assert futu_order_status_to_nautilus(10) == OrderStatus.ACCEPTED
-
-    def test_filled_part_to_partially_filled(self):
-        from nautilus_trader.model.enums import OrderStatus
-        assert futu_order_status_to_nautilus(11) == OrderStatus.PARTIALLY_FILLED
-
-    def test_filled_all_to_filled(self):
-        from nautilus_trader.model.enums import OrderStatus
-        assert futu_order_status_to_nautilus(12) == OrderStatus.FILLED
-
-    def test_cancelled_all_to_canceled(self):
-        from nautilus_trader.model.enums import OrderStatus
-        assert futu_order_status_to_nautilus(16) == OrderStatus.CANCELED
-
-    def test_failed_to_rejected(self):
-        from nautilus_trader.model.enums import OrderStatus
-        assert futu_order_status_to_nautilus(17) == OrderStatus.REJECTED
+        assert futu_order_status_to_nautilus(1) == OrderStatus.SUBMITTED  # WaitingSubmit
+        assert futu_order_status_to_nautilus(2) == OrderStatus.SUBMITTED  # Submitting
 
     def test_submit_failed_to_rejected(self):
         from nautilus_trader.model.enums import OrderStatus
-        assert futu_order_status_to_nautilus(5) == OrderStatus.REJECTED
+        assert futu_order_status_to_nautilus(3) == OrderStatus.REJECTED  # SubmitFailed
+
+    def test_timeout_to_rejected(self):
+        from nautilus_trader.model.enums import OrderStatus
+        assert futu_order_status_to_nautilus(4) == OrderStatus.REJECTED  # TimeOut
+
+    def test_submitted_to_accepted(self):
+        from nautilus_trader.model.enums import OrderStatus
+        assert futu_order_status_to_nautilus(5) == OrderStatus.ACCEPTED  # Submitted
+
+    def test_filled_part_to_partially_filled(self):
+        from nautilus_trader.model.enums import OrderStatus
+        assert futu_order_status_to_nautilus(10) == OrderStatus.PARTIALLY_FILLED  # FilledPart
+
+    def test_filled_all_to_filled(self):
+        from nautilus_trader.model.enums import OrderStatus
+        assert futu_order_status_to_nautilus(11) == OrderStatus.FILLED  # FilledAll
 
     def test_cancelling_to_pending_cancel(self):
         from nautilus_trader.model.enums import OrderStatus
-        assert futu_order_status_to_nautilus(13) == OrderStatus.PENDING_CANCEL
-        assert futu_order_status_to_nautilus(14) == OrderStatus.PENDING_CANCEL
+        assert futu_order_status_to_nautilus(12) == OrderStatus.PENDING_CANCEL  # CancellingPart
+        assert futu_order_status_to_nautilus(13) == OrderStatus.PENDING_CANCEL  # CancellingAll
+
+    def test_cancelled_to_canceled(self):
+        from nautilus_trader.model.enums import OrderStatus
+        assert futu_order_status_to_nautilus(14) == OrderStatus.CANCELED  # CancelledPart
+        assert futu_order_status_to_nautilus(15) == OrderStatus.CANCELED  # CancelledAll
+
+    def test_failed_to_rejected(self):
+        from nautilus_trader.model.enums import OrderStatus
+        assert futu_order_status_to_nautilus(21) == OrderStatus.REJECTED  # Failed
 
     def test_disabled_deleted_to_canceled(self):
         from nautilus_trader.model.enums import OrderStatus
-        assert futu_order_status_to_nautilus(18) == OrderStatus.CANCELED  # DISABLED
-        assert futu_order_status_to_nautilus(19) == OrderStatus.CANCELED  # DELETED
-        assert futu_order_status_to_nautilus(20) == OrderStatus.CANCELED  # FILL_CANCELLED
+        assert futu_order_status_to_nautilus(22) == OrderStatus.CANCELED  # Disabled
+        assert futu_order_status_to_nautilus(23) == OrderStatus.CANCELED  # Deleted
+        assert futu_order_status_to_nautilus(24) == OrderStatus.CANCELED  # FillCancelled
 
     def test_unknown_status_defaults_to_initialized(self, caplog):
         import logging
@@ -228,7 +242,7 @@ class TestParseOrderToReport:
         base = {
             "trd_side": 1,
             "order_type": 1,
-            "order_status": 10,
+            "order_status": 5,
             "order_id": 123456,
             "order_id_ex": "ORD123456",
             "code": "00700",

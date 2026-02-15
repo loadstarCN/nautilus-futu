@@ -45,6 +45,7 @@ from nautilus_futu.constants import (
     FUTU_ORDER_STATUS_SUBMITTED,
     FUTU_ORDER_STATUS_SUBMIT_FAILED,
     FUTU_ORDER_STATUS_SUBMITTING,
+    FUTU_ORDER_STATUS_TIMEOUT,
     FUTU_ORDER_STATUS_UNKNOWN,
     FUTU_ORDER_STATUS_UNSUBMITTED,
     FUTU_ORDER_STATUS_WAITING_SUBMIT,
@@ -109,7 +110,7 @@ def futu_order_status_to_nautilus(status: int) -> OrderStatus:
         return OrderStatus.INITIALIZED
     elif status in (FUTU_ORDER_STATUS_WAITING_SUBMIT, FUTU_ORDER_STATUS_SUBMITTING):
         return OrderStatus.SUBMITTED
-    elif status == FUTU_ORDER_STATUS_SUBMIT_FAILED:
+    elif status in (FUTU_ORDER_STATUS_SUBMIT_FAILED, FUTU_ORDER_STATUS_TIMEOUT):
         return OrderStatus.REJECTED
     elif status == FUTU_ORDER_STATUS_SUBMITTED:
         return OrderStatus.ACCEPTED
