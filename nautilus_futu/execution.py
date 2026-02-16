@@ -28,7 +28,7 @@ from nautilus_trader.model.identifiers import (
     TradeId,
     VenueOrderId,
 )
-from nautilus_trader.model.objects import Currency, Money, Price, Quantity
+from nautilus_trader.model.objects import AccountBalance, Currency, Money, Price, Quantity
 from nautilus_trader.model.orders import Order
 
 from nautilus_futu.common import (
@@ -43,6 +43,10 @@ from nautilus_futu.constants import (
     FUTU_ORDER_STATUS_WAITING_SUBMIT,
     FUTU_PROTO_TRD_FILL,
     FUTU_PROTO_TRD_ORDER,
+    FUTU_TRD_MARKET_CN,
+    FUTU_TRD_MARKET_HK,
+    FUTU_TRD_MARKET_HKCC,
+    FUTU_TRD_MARKET_US,
     FUTU_VENUE,
     VENUE_TO_FUTU_TRD_SEC_MARKET,
 )
@@ -58,6 +62,15 @@ from nautilus_futu.parsing.orders import (
     qot_market_to_currency,
     sec_market_to_qot_market,
 )
+
+
+# trd_market -> currency mapping
+_TRD_MARKET_CURRENCY: dict[int, str] = {
+    FUTU_TRD_MARKET_HK: "HKD",
+    FUTU_TRD_MARKET_US: "USD",
+    FUTU_TRD_MARKET_CN: "CNY",
+    FUTU_TRD_MARKET_HKCC: "HKD",
+}
 
 
 class FutuLiveExecutionClient(LiveExecutionClient):
@@ -140,6 +153,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             # Set the framework-level account_id for reconciliation
             self._set_account_id(AccountId(f"FUTU-{self._acc_id}"))
 
+            # Generate initial account state so the account appears in cache
+            await self._update_account_state()
+
             # Unlock trade if password provided
             if self._config.unlock_pwd_md5:
                 await asyncio.to_thread(
@@ -167,6 +183,41 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         except Exception as e:
             self._log.error(f"Failed to connect execution client: {e}")
             raise
+
+    async def _update_account_state(self) -> None:
+        """Query Futu account funds and generate AccountState."""
+        currency_str = _TRD_MARKET_CURRENCY.get(self._trd_market, "USD")
+        currency = Currency.from_str(currency_str)
+
+        try:
+            funds = await asyncio.to_thread(
+                self._client.get_funds,
+                self._trd_env,
+                self._acc_id,
+                self._trd_market,
+            )
+            # get_funds returns dict with: total_assets, cash, available_funds, etc.
+            total = Money(funds.get("total_assets", 0), currency)
+            free = Money(funds.get("available_funds", funds.get("cash", 0)), currency)
+            locked = Money(total.as_double() - free.as_double(), currency)
+        except Exception as e:
+            self._log.warning(f"Failed to get funds, using zero balance: {e}")
+            total = Money(0, currency)
+            free = Money(0, currency)
+            locked = Money(0, currency)
+
+        account_balance = AccountBalance(
+            total=total,
+            locked=locked,
+            free=free,
+        )
+        self.generate_account_state(
+            balances=[account_balance],
+            margins=[],
+            reported=True,
+            ts_event=self._clock.timestamp_ns(),
+        )
+        self._log.info(f"Account state generated: {currency_str} total={total}")
 
     async def _disconnect(self) -> None:
         """Disconnect from Futu OpenD."""
