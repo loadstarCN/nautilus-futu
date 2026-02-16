@@ -44,6 +44,31 @@ FUTU_TRD_MARKET_HK = 1
 FUTU_TRD_MARKET_US = 2
 FUTU_TRD_MARKET_CN = 3
 FUTU_TRD_MARKET_HKCC = 4
+FUTU_TRD_MARKET_FUTURES = 5
+
+# Futu proto Currency enum values (for get_funds request)
+FUTU_CURRENCY_HKD = 1
+FUTU_CURRENCY_USD = 2
+FUTU_CURRENCY_CNH = 3
+FUTU_CURRENCY_JPY = 4
+FUTU_CURRENCY_SGD = 5
+
+# Futu proto currency int -> NautilusTrader currency string
+FUTU_CURRENCY_TO_STR: dict[int, str] = {
+    FUTU_CURRENCY_HKD: "HKD",
+    FUTU_CURRENCY_USD: "USD",
+    FUTU_CURRENCY_CNH: "CNH",
+    FUTU_CURRENCY_JPY: "JPY",
+    FUTU_CURRENCY_SGD: "SGD",
+}
+
+# Currencies to query for multi-currency accounts (unified/futures)
+FUTU_MULTI_CURRENCIES: list[int] = [
+    FUTU_CURRENCY_HKD,
+    FUTU_CURRENCY_USD,
+    FUTU_CURRENCY_CNH,
+    FUTU_CURRENCY_JPY,
+]
 
 # Futu SubType values
 FUTU_SUB_TYPE_BASIC = 1

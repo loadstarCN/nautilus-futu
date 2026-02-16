@@ -37,6 +37,8 @@ from nautilus_futu.common import (
 )
 from nautilus_futu.config import FutuExecClientConfig
 from nautilus_futu.constants import (
+    FUTU_CURRENCY_TO_STR,
+    FUTU_MULTI_CURRENCIES,
     FUTU_ORDER_STATUS_FILLED_PART,
     FUTU_ORDER_STATUS_SUBMITTED,
     FUTU_ORDER_STATUS_SUBMITTING,
@@ -70,6 +72,14 @@ _TRD_MARKET_CURRENCY: dict[int, str] = {
     FUTU_TRD_MARKET_US: "USD",
     FUTU_TRD_MARKET_CN: "CNY",
     FUTU_TRD_MARKET_HKCC: "HKD",
+}
+
+# Futu proto Currency enum: HKD=1, USD=2, CNH=3
+_TRD_MARKET_FUTU_CURRENCY: dict[int, int] = {
+    FUTU_TRD_MARKET_HK: 1,
+    FUTU_TRD_MARKET_US: 2,
+    FUTU_TRD_MARKET_CN: 3,
+    FUTU_TRD_MARKET_HKCC: 1,
 }
 
 
@@ -123,6 +133,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         self._acc_id = config.acc_id
         self._trd_env = config.trd_env
         self._trd_market = config.trd_market
+        self._is_multi_currency: bool = False
         self._push_task: asyncio.Task | None = None
 
     async def _connect(self) -> None:
@@ -143,12 +154,37 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 else:
                     self._log.info("Reusing existing Futu OpenD connection")
 
-            # Get account list if acc_id not specified
+            # Get account list (need_general_sec_account=True to include
+            # the securities sub-account of unified margin accounts)
+            accounts = await asyncio.to_thread(
+                self._client.get_acc_list,
+                None,  # trd_category
+                True,  # need_general_sec_account
+            )
+
+            # Auto-discover acc_id if not specified
             if self._acc_id == 0:
-                accounts = await asyncio.to_thread(self._client.get_acc_list)
-                if accounts:
+                for acc in accounts:
+                    if acc["trd_env"] == self._trd_env and acc.get("acc_status") == 0:
+                        if self._trd_market in acc.get("trd_market_auth_list", []):
+                            self._acc_id = acc["acc_id"]
+                            self._log.info(f"Auto-selected account: {self._acc_id}")
+                            break
+                if self._acc_id == 0 and accounts:
                     self._acc_id = accounts[0]["acc_id"]
-                    self._log.info(f"Using account ID: {self._acc_id}")
+                    self._log.info(f"Fallback account: {self._acc_id}")
+
+            # Detect multi-currency account (unified account sub-accounts
+            # have uni_card_num set and require currency param for get_funds)
+            for acc in accounts:
+                if acc["acc_id"] == self._acc_id:
+                    if acc.get("uni_card_num"):
+                        self._is_multi_currency = True
+                        self._log.info(
+                            f"Unified account detected (uni_card={acc['uni_card_num'][-4:]}), "
+                            "using multi-currency mode",
+                        )
+                    break
 
             # Set the framework-level account_id for reconciliation
             self._set_account_id(AccountId(f"FUTU-{self._acc_id}"))
@@ -186,8 +222,29 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
     async def _update_account_state(self) -> None:
         """Query Futu account funds and generate AccountState."""
+        if self._is_multi_currency:
+            balances = await self._get_multi_currency_balances()
+        else:
+            balances = await self._get_securities_balance()
+
+        if not balances:
+            self._log.warning("No account balances obtained")
+            return
+
+        self.generate_account_state(
+            balances=balances,
+            margins=[],
+            reported=True,
+            ts_event=self._clock.timestamp_ns(),
+        )
+        for b in balances:
+            self._log.info(f"Account balance: {b.currency} total={b.total}")
+
+    async def _get_securities_balance(self) -> list[AccountBalance]:
+        """Get balance for a single-currency securities account."""
         currency_str = _TRD_MARKET_CURRENCY.get(self._trd_market, "USD")
         currency = Currency.from_str(currency_str)
+        futu_currency = _TRD_MARKET_FUTU_CURRENCY.get(self._trd_market)
 
         try:
             funds = await asyncio.to_thread(
@@ -195,8 +252,8 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 self._trd_env,
                 self._acc_id,
                 self._trd_market,
+                futu_currency,
             )
-            # get_funds returns dict with: total_assets, cash, available_funds, etc.
             total = Money(funds.get("total_assets", 0), currency)
             free = Money(funds.get("available_funds", funds.get("cash", 0)), currency)
             locked = Money(total.as_double() - free.as_double(), currency)
@@ -206,18 +263,33 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             free = Money(0, currency)
             locked = Money(0, currency)
 
-        account_balance = AccountBalance(
-            total=total,
-            locked=locked,
-            free=free,
-        )
-        self.generate_account_state(
-            balances=[account_balance],
-            margins=[],
-            reported=True,
-            ts_event=self._clock.timestamp_ns(),
-        )
-        self._log.info(f"Account state generated: {currency_str} total={total}")
+        return [AccountBalance(total=total, locked=locked, free=free)]
+
+    async def _get_multi_currency_balances(self) -> list[AccountBalance]:
+        """Get balances for a multi-currency account (unified or futures)."""
+        balances: list[AccountBalance] = []
+        for futu_cur in FUTU_MULTI_CURRENCIES:
+            currency_str = FUTU_CURRENCY_TO_STR.get(futu_cur, "USD")
+            currency = Currency.from_str(currency_str)
+            try:
+                funds = await asyncio.to_thread(
+                    self._client.get_funds,
+                    self._trd_env,
+                    self._acc_id,
+                    self._trd_market,
+                    futu_cur,
+                )
+                total = funds.get("total_assets", 0)
+                cash = funds.get("cash", 0)
+                if total == 0 and cash == 0:
+                    continue
+                total_m = Money(total, currency)
+                free_m = Money(funds.get("available_funds", cash), currency)
+                locked_m = Money(total - free_m.as_double(), currency)
+                balances.append(AccountBalance(total=total_m, locked=locked_m, free=free_m))
+            except Exception as e:
+                self._log.debug(f"Multi-currency get_funds {currency_str}: {e}")
+        return balances
 
     async def _disconnect(self) -> None:
         """Disconnect from Futu OpenD."""

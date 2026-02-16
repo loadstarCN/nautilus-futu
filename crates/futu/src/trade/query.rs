@@ -127,6 +127,7 @@ pub async fn get_funds(
     trd_env: i32,
     acc_id: u64,
     trd_market: i32,
+    currency: Option<i32>,
 ) -> Result<crate::generated::trd_get_funds::Response, TradeError> {
     let header = crate::generated::trd_common::TrdHeader {
         trd_env,
@@ -136,7 +137,8 @@ pub async fn get_funds(
 
     let c2s = crate::generated::trd_get_funds::C2s {
         header,
-        ..Default::default()
+        refresh_cache: None,
+        currency,
     };
     let request = crate::generated::trd_get_funds::Request { c2s };
     let body = request.encode_to_vec();

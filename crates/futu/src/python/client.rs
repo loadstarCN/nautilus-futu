@@ -354,7 +354,13 @@ impl PyFutuClient {
     }
 
     /// Get account list.
-    fn get_acc_list(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+    #[pyo3(signature = (trd_category=None, need_general_sec_account=None))]
+    fn get_acc_list(
+        &self,
+        py: Python<'_>,
+        trd_category: Option<i32>,
+        need_general_sec_account: Option<bool>,
+    ) -> PyResult<Vec<PyObject>> {
         let client = self.get_client()?;
         let client = &*client;
 
@@ -364,7 +370,7 @@ impl PyFutuClient {
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
-                crate::trade::account::get_acc_list(client, user_id).await
+                crate::trade::account::get_acc_list(client, user_id, trd_category, need_general_sec_account).await
             }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Get acc list failed: {}", e)))?;
 
@@ -376,8 +382,11 @@ impl PyFutuClient {
                 dict.set_item("trd_env", acc.trd_env)?;
                 dict.set_item("trd_market_auth_list", &acc.trd_market_auth_list)?;
                 dict.set_item("acc_type", acc.acc_type)?;
+                dict.set_item("card_num", acc.card_num.as_deref())?;
                 dict.set_item("security_firm", acc.security_firm)?;
                 dict.set_item("sim_acc_type", acc.sim_acc_type)?;
+                dict.set_item("uni_card_num", acc.uni_card_num.as_deref())?;
+                dict.set_item("acc_status", acc.acc_status)?;
                 result.push(dict.into_any().unbind());
             }
         }
@@ -604,19 +613,21 @@ impl PyFutuClient {
 
     /// Get account funds.
     /// Returns a dict with fund details.
+    #[pyo3(signature = (trd_env, acc_id, trd_market, currency=None))]
     fn get_funds(
         &self,
         py: Python<'_>,
         trd_env: i32,
         acc_id: u64,
         trd_market: i32,
+        currency: Option<i32>,
     ) -> PyResult<PyObject> {
         let client = self.get_client()?;
         let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
-                crate::trade::query::get_funds(client, trd_env, acc_id, trd_market).await
+                crate::trade::query::get_funds(client, trd_env, acc_id, trd_market, currency).await
             }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Get funds failed: {}", e)))?;
 

@@ -19,10 +19,13 @@ pub enum TradeError {
 pub async fn get_acc_list(
     client: &FutuClient,
     user_id: u64,
+    trd_category: Option<i32>,
+    need_general_sec_account: Option<bool>,
 ) -> Result<crate::generated::trd_get_acc_list::Response, TradeError> {
     let c2s = crate::generated::trd_get_acc_list::C2s {
         user_id,
-        ..Default::default()
+        trd_category,
+        need_general_sec_account,
     };
     let request = crate::generated::trd_get_acc_list::Request { c2s };
     let body = request.encode_to_vec();
