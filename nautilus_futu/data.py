@@ -262,8 +262,9 @@ class FutuLiveDataClient(LiveMarketDataClient):
         for bar in bars:
             self._handle_data(bar)
 
-    async def _subscribe_quote_ticks(self, instrument_id: InstrumentId) -> None:
+    async def _subscribe_quote_ticks(self, command) -> None:
         """Subscribe to quote tick updates."""
+        instrument_id = getattr(command, "instrument_id", command)
         market, code = instrument_id_to_futu_security(instrument_id)
         try:
             await asyncio.to_thread(
@@ -277,8 +278,9 @@ class FutuLiveDataClient(LiveMarketDataClient):
         except Exception as e:
             self._log.error(f"Failed to subscribe quote ticks for {instrument_id}: {e}")
 
-    async def _subscribe_trade_ticks(self, instrument_id: InstrumentId) -> None:
+    async def _subscribe_trade_ticks(self, command) -> None:
         """Subscribe to trade tick updates."""
+        instrument_id = getattr(command, "instrument_id", command)
         market, code = instrument_id_to_futu_security(instrument_id)
         try:
             await asyncio.to_thread(
@@ -292,8 +294,9 @@ class FutuLiveDataClient(LiveMarketDataClient):
         except Exception as e:
             self._log.error(f"Failed to subscribe trade ticks for {instrument_id}: {e}")
 
-    async def _subscribe_order_book_deltas(self, instrument_id: InstrumentId) -> None:
+    async def _subscribe_order_book_deltas(self, command) -> None:
         """Subscribe to order book updates."""
+        instrument_id = getattr(command, "instrument_id", command)
         market, code = instrument_id_to_futu_security(instrument_id)
         try:
             await asyncio.to_thread(
@@ -307,10 +310,11 @@ class FutuLiveDataClient(LiveMarketDataClient):
         except Exception as e:
             self._log.error(f"Failed to subscribe order book for {instrument_id}: {e}")
 
-    async def _subscribe_bars(self, bar_type: BarType) -> None:
+    async def _subscribe_bars(self, command) -> None:
         """Subscribe to bar updates."""
         from nautilus_futu.parsing.market_data import bar_spec_to_futu_sub_type
 
+        bar_type = getattr(command, "bar_type", command)
         instrument_id = bar_type.instrument_id
         market, code = instrument_id_to_futu_security(instrument_id)
         sub_type = bar_spec_to_futu_sub_type(bar_type.spec)
@@ -330,8 +334,9 @@ class FutuLiveDataClient(LiveMarketDataClient):
         else:
             self._log.warning(f"Unsupported bar type: {bar_type.spec}")
 
-    async def _unsubscribe_quote_ticks(self, instrument_id: InstrumentId) -> None:
+    async def _unsubscribe_quote_ticks(self, command) -> None:
         """Unsubscribe from quote tick updates."""
+        instrument_id = getattr(command, "instrument_id", command)
         market, code = instrument_id_to_futu_security(instrument_id)
         try:
             await asyncio.to_thread(
@@ -344,8 +349,9 @@ class FutuLiveDataClient(LiveMarketDataClient):
         except Exception as e:
             self._log.error(f"Failed to unsubscribe: {e}")
 
-    async def _unsubscribe_trade_ticks(self, instrument_id: InstrumentId) -> None:
+    async def _unsubscribe_trade_ticks(self, command) -> None:
         """Unsubscribe from trade tick updates."""
+        instrument_id = getattr(command, "instrument_id", command)
         market, code = instrument_id_to_futu_security(instrument_id)
         try:
             await asyncio.to_thread(
@@ -358,8 +364,9 @@ class FutuLiveDataClient(LiveMarketDataClient):
         except Exception as e:
             self._log.error(f"Failed to unsubscribe: {e}")
 
-    async def _unsubscribe_order_book_deltas(self, instrument_id: InstrumentId) -> None:
+    async def _unsubscribe_order_book_deltas(self, command) -> None:
         """Unsubscribe from order book updates."""
+        instrument_id = getattr(command, "instrument_id", command)
         market, code = instrument_id_to_futu_security(instrument_id)
         try:
             await asyncio.to_thread(
@@ -372,10 +379,11 @@ class FutuLiveDataClient(LiveMarketDataClient):
         except Exception as e:
             self._log.error(f"Failed to unsubscribe order book: {e}")
 
-    async def _unsubscribe_bars(self, bar_type: BarType) -> None:
+    async def _unsubscribe_bars(self, command) -> None:
         """Unsubscribe from bar updates."""
         from nautilus_futu.parsing.market_data import bar_spec_to_futu_sub_type
 
+        bar_type = getattr(command, "bar_type", command)
         instrument_id = bar_type.instrument_id
         market, code = instrument_id_to_futu_security(instrument_id)
         sub_type = bar_spec_to_futu_sub_type(bar_type.spec)

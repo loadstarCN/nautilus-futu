@@ -34,6 +34,8 @@ from nautilus_futu.constants import (
     FUTU_KL_TYPE_30MIN,
     FUTU_KL_TYPE_60MIN,
     FUTU_KL_TYPE_DAY,
+    FUTU_KL_TYPE_WEEK,
+    FUTU_KL_TYPE_MONTH,
     FUTU_SUB_TYPE_KL_1MIN,
     FUTU_SUB_TYPE_KL_5MIN,
     FUTU_SUB_TYPE_KL_15MIN,
@@ -82,6 +84,14 @@ def bar_spec_to_futu_kl_type(spec: BarSpecification) -> int | None:
         return None
     elif spec.aggregation == BarAggregation.DAY:
         return FUTU_KL_TYPE_DAY
+    elif spec.aggregation == BarAggregation.WEEK:
+        if spec.step == 1:
+            return FUTU_KL_TYPE_WEEK
+        return None
+    elif spec.aggregation == BarAggregation.MONTH:
+        if spec.step == 1:
+            return FUTU_KL_TYPE_MONTH
+        return None
     return None
 
 
@@ -160,6 +170,8 @@ _KL_TYPE_TO_BAR_SPEC: dict[int, BarSpecification] = {
     FUTU_KL_TYPE_30MIN: BarSpecification(30, BarAggregation.MINUTE, PriceType.LAST),
     FUTU_KL_TYPE_60MIN: BarSpecification(1, BarAggregation.HOUR, PriceType.LAST),
     FUTU_KL_TYPE_DAY: BarSpecification(1, BarAggregation.DAY, PriceType.LAST),
+    FUTU_KL_TYPE_WEEK: BarSpecification(1, BarAggregation.WEEK, PriceType.LAST),
+    FUTU_KL_TYPE_MONTH: BarSpecification(1, BarAggregation.MONTH, PriceType.LAST),
 }
 
 

@@ -195,11 +195,26 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                     self._acc_id = accounts[0]["acc_id"]
                     self._log.info(f"Fallback account: {self._acc_id}")
 
+            # Save authorized market list for multi-market reconciliation
+            for acc in accounts:
+                if acc["acc_id"] == self._acc_id:
+                    self._trd_market_auth_list = acc.get(
+                        "trd_market_auth_list", [self._trd_market],
+                    )
+                    break
+            else:
+                self._trd_market_auth_list = [self._trd_market]
+            self._log.info(f"Authorized markets: {self._trd_market_auth_list}")
+
             # Set the framework-level account_id for reconciliation
             self._set_account_id(AccountId(f"FUTU-{self._acc_id}"))
 
             # Generate initial account state so the account appears in cache
             await self._update_account_state()
+
+            # Register venue-account aliases for each authorized market
+            # so Portfolio.account_for_venue(Venue("HKEX")) can find the account
+            await self._register_venue_account_aliases()
 
             # Unlock trade if password provided
             if self._config.unlock_pwd_md5:
@@ -280,6 +295,53 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             balance = AccountBalance(total=zero, locked=zero, free=zero)
 
         return [balance]
+
+    async def _register_venue_account_aliases(self) -> None:
+        """Register account aliases for each authorized market venue.
+
+        This allows ``Portfolio.account_for_venue(Venue("HKEX"))`` (or NYSE,
+        SSE, etc.) to find the Futu account, preventing PnL init timeouts.
+        """
+        import time
+
+        from nautilus_trader.accounting.accounts.cash import CashAccount
+        from nautilus_trader.core.uuid import UUID4
+        from nautilus_trader.model.events.account import AccountState
+
+        from nautilus_futu.constants import FUTU_TRD_MARKET_TO_VENUE
+
+        for trd_market in self._trd_market_auth_list:
+            venue = FUTU_TRD_MARKET_TO_VENUE.get(trd_market)
+            if venue is None:
+                continue
+            venue_str = str(venue)
+            if venue_str == "FUTU":
+                continue
+
+            alias_id = AccountId(f"{venue_str}-{self._acc_id}")
+            if self._cache.account(alias_id) is not None:
+                continue
+
+            try:
+                usd = Currency.from_str("USD")
+                zero = Money(0, usd)
+                event = AccountState(
+                    account_id=alias_id,
+                    account_type=AccountType.CASH,
+                    base_currency=None,
+                    reported=False,
+                    balances=[AccountBalance(total=zero, locked=zero, free=zero)],
+                    margins=[],
+                    info={"alias_of": f"FUTU-{self._acc_id}"},
+                    event_id=UUID4(),
+                    ts_event=time.time_ns(),
+                    ts_init=time.time_ns(),
+                )
+                account = CashAccount(event)
+                self._cache.add_account(account)
+                self._log.info(f"Registered venue-account alias: {venue_str} -> {alias_id}")
+            except Exception as e:
+                self._log.warning(f"Failed to register venue-account alias ({venue_str}): {e}")
 
     async def _disconnect(self) -> None:
         """Disconnect from Futu OpenD."""
@@ -598,28 +660,34 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         start: Any = None,
         end: Any = None,
     ) -> list[OrderStatusReport]:
-        """Generate order status reports for all active orders."""
-        try:
-            orders = await asyncio.to_thread(
-                self._client.get_order_list,
-                self._trd_env,
-                self._acc_id,
-                self._trd_market,
-            )
-        except Exception as e:
-            self._log.error(f"Failed to get order list: {e}")
-            return []
-
+        """Generate order status reports across all authorized markets."""
+        markets = getattr(self, "_trd_market_auth_list", [self._trd_market])
         account_id = AccountId(f"FUTU-{self._acc_id}")
         reports = []
-        for order_dict in orders:
-            try:
-                report = parse_futu_order_to_report(order_dict, account_id)
-                reports.append(report)
-            except Exception as e:
-                self._log.warning(f"Failed to parse order {order_dict.get('order_id')}: {e}")
+        seen_ids: set[str] = set()
 
-        self._log.info(f"Generated {len(reports)} order status reports")
+        for market in markets:
+            try:
+                orders = await asyncio.to_thread(
+                    self._client.get_order_list,
+                    self._trd_env,
+                    self._acc_id,
+                    market,
+                )
+                for order_dict in orders:
+                    try:
+                        order_id_str = str(order_dict.get("order_id"))
+                        if order_id_str in seen_ids:
+                            continue
+                        seen_ids.add(order_id_str)
+                        report = parse_futu_order_to_report(order_dict, account_id)
+                        reports.append(report)
+                    except Exception as e:
+                        self._log.warning(f"Failed to parse order {order_dict.get('order_id')}: {e}")
+            except Exception as e:
+                self._log.warning(f"Failed to query market {market} orders: {e}")
+
+        self._log.info(f"Generated {len(reports)} order status reports (multi-market)")
         return reports
 
     async def generate_fill_reports(
@@ -629,33 +697,38 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         start: Any = None,
         end: Any = None,
     ) -> list[FillReport]:
-        """Generate fill reports."""
-        try:
-            fills = await asyncio.to_thread(
-                self._client.get_order_fill_list,
-                self._trd_env,
-                self._acc_id,
-                self._trd_market,
-            )
-        except Exception as e:
-            self._log.error(f"Failed to get fill list: {e}")
-            return []
-
+        """Generate fill reports across all authorized markets."""
+        markets = getattr(self, "_trd_market_auth_list", [self._trd_market])
         account_id = AccountId(f"FUTU-{self._acc_id}")
         reports = []
-        for fill_dict in fills:
-            try:
-                # Filter by venue_order_id if specified
-                if venue_order_id is not None:
-                    fill_order_id = fill_dict.get("order_id")
-                    if fill_order_id is not None and str(fill_order_id) != venue_order_id.value:
-                        continue
-                report = parse_futu_fill_to_report(fill_dict, account_id)
-                reports.append(report)
-            except Exception as e:
-                self._log.warning(f"Failed to parse fill {fill_dict.get('fill_id')}: {e}")
+        seen_ids: set[str] = set()
 
-        self._log.info(f"Generated {len(reports)} fill reports")
+        for market in markets:
+            try:
+                fills = await asyncio.to_thread(
+                    self._client.get_order_fill_list,
+                    self._trd_env,
+                    self._acc_id,
+                    market,
+                )
+                for fill_dict in fills:
+                    try:
+                        if venue_order_id is not None:
+                            fill_order_id = fill_dict.get("order_id")
+                            if fill_order_id is not None and str(fill_order_id) != venue_order_id.value:
+                                continue
+                        fill_id_str = str(fill_dict.get("fill_id"))
+                        if fill_id_str in seen_ids:
+                            continue
+                        seen_ids.add(fill_id_str)
+                        report = parse_futu_fill_to_report(fill_dict, account_id)
+                        reports.append(report)
+                    except Exception as e:
+                        self._log.warning(f"Failed to parse fill {fill_dict.get('fill_id')}: {e}")
+            except Exception as e:
+                self._log.warning(f"Failed to query market {market} fills: {e}")
+
+        self._log.info(f"Generated {len(reports)} fill reports (multi-market)")
         return reports
 
     async def generate_position_status_reports(
@@ -664,28 +737,53 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         start: Any = None,
         end: Any = None,
     ) -> list[PositionStatusReport]:
-        """Generate position status reports."""
-        try:
-            positions = await asyncio.to_thread(
-                self._client.get_position_list,
-                self._trd_env,
-                self._acc_id,
-                self._trd_market,
-            )
-        except Exception as e:
-            self._log.error(f"Failed to get position list: {e}")
-            return []
+        """Generate position status reports across all authorized markets."""
+        from nautilus_futu.parsing.instruments import parse_futu_instrument
 
+        markets = getattr(self, "_trd_market_auth_list", [self._trd_market])
         account_id = AccountId(f"FUTU-{self._acc_id}")
         reports = []
-        for pos_dict in positions:
-            try:
-                report = parse_futu_position_to_report(pos_dict, account_id)
-                reports.append(report)
-            except Exception as e:
-                self._log.warning(f"Failed to parse position {pos_dict.get('code')}: {e}")
+        seen_ids: set[str] = set()
 
-        self._log.info(f"Generated {len(reports)} position status reports")
+        for market in markets:
+            try:
+                positions = await asyncio.to_thread(
+                    self._client.get_position_list,
+                    self._trd_env,
+                    self._acc_id,
+                    market,
+                )
+                for pos_dict in positions:
+                    try:
+                        report = parse_futu_position_to_report(pos_dict, account_id)
+                        inst_id_str = str(report.instrument_id)
+                        if inst_id_str in seen_ids:
+                            continue
+                        seen_ids.add(inst_id_str)
+                        reports.append(report)
+
+                        # Auto-load missing instrument into cache for reconciliation
+                        if self._cache.instrument(report.instrument_id) is None:
+                            code = pos_dict["code"]
+                            sec_market = pos_dict.get("sec_market")
+                            qot_market = sec_market_to_qot_market(sec_market)
+                            try:
+                                static_info = await asyncio.to_thread(
+                                    self._client.get_static_info, [(qot_market, code)],
+                                )
+                                if static_info:
+                                    for info in static_info:
+                                        inst = parse_futu_instrument(info)
+                                        if inst is not None:
+                                            self._cache.add_instrument(inst)
+                            except Exception as e:
+                                self._log.warning(f"Auto-load instrument failed: {e}")
+                    except Exception as e:
+                        self._log.warning(f"Failed to parse position {pos_dict.get('code')}: {e}")
+            except Exception as e:
+                self._log.warning(f"Failed to query market {market} positions: {e}")
+
+        self._log.info(f"Generated {len(reports)} position reports (multi-market)")
         return reports
 
     async def _cancel_all_orders(self, command: Any) -> None:
