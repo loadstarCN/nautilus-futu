@@ -811,6 +811,112 @@ impl PyFutuClient {
         }
     }
 
+    /// Filter stocks by conditions (Qot_StockFilter, proto 3215).
+    /// base_filters: list of (fieldName, filterMin, filterMax, sortDir)
+    /// accumulate_filters: list of (fieldName, days, filterMin, filterMax, sortDir)
+    /// financial_filters: list of (fieldName, quarter, filterMin, filterMax, sortDir)
+    #[pyo3(signature = (market, begin=0, num=200, base_filters=None, accumulate_filters=None, financial_filters=None))]
+    fn stock_filter(
+        &self,
+        py: Python<'_>,
+        market: i32,
+        begin: i32,
+        num: i32,
+        base_filters: Option<Vec<(i32, Option<f64>, Option<f64>, Option<i32>)>>,
+        accumulate_filters: Option<Vec<(i32, i32, Option<f64>, Option<f64>, Option<i32>)>>,
+        financial_filters: Option<Vec<(i32, i32, Option<f64>, Option<f64>, Option<i32>)>>,
+    ) -> PyResult<PyObject> {
+        let client = self.get_client()?;
+        let client = &*client;
+
+        let base = base_filters.unwrap_or_default().into_iter().map(|(field, min, max, sort)| {
+            crate::generated::qot_stock_filter::BaseFilter {
+                field_name: field,
+                filter_min: min,
+                filter_max: max,
+                is_no_filter: None,
+                sort_dir: sort,
+            }
+        }).collect();
+
+        let accumulate = accumulate_filters.unwrap_or_default().into_iter().map(|(field, days, min, max, sort)| {
+            crate::generated::qot_stock_filter::AccumulateFilter {
+                field_name: field,
+                filter_min: min,
+                filter_max: max,
+                is_no_filter: None,
+                sort_dir: sort,
+                days,
+            }
+        }).collect();
+
+        let financial = financial_filters.unwrap_or_default().into_iter().map(|(field, quarter, min, max, sort)| {
+            crate::generated::qot_stock_filter::FinancialFilter {
+                field_name: field,
+                filter_min: min,
+                filter_max: max,
+                is_no_filter: None,
+                sort_dir: sort,
+                quarter,
+            }
+        }).collect();
+
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::quote::snapshot::stock_filter(
+                    client, begin, num, market, None, base, accumulate, financial,
+                ).await
+            }).map_err(|e| e.to_string())
+        }).map_err(|e| PyRuntimeError::new_err(format!("Stock filter failed: {}", e)))?;
+
+        let result = pyo3::types::PyDict::new_bound(py);
+        if let Some(s2c) = response.s2c {
+            result.set_item("last_page", s2c.last_page)?;
+            result.set_item("all_count", s2c.all_count)?;
+
+            let data_list = pyo3::types::PyList::empty_bound(py);
+            for stock in &s2c.data_list {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                dict.set_item("market", stock.security.market)?;
+                dict.set_item("code", &stock.security.code)?;
+                dict.set_item("name", &stock.name)?;
+
+                let base_data = pyo3::types::PyList::empty_bound(py);
+                for bd in &stock.base_data_list {
+                    let d = pyo3::types::PyDict::new_bound(py);
+                    d.set_item("field", bd.field_name)?;
+                    d.set_item("value", bd.value)?;
+                    base_data.append(d)?;
+                }
+                dict.set_item("base_data", base_data)?;
+
+                let acc_data = pyo3::types::PyList::empty_bound(py);
+                for ad in &stock.accumulate_data_list {
+                    let d = pyo3::types::PyDict::new_bound(py);
+                    d.set_item("field", ad.field_name)?;
+                    d.set_item("value", ad.value)?;
+                    d.set_item("days", ad.days)?;
+                    acc_data.append(d)?;
+                }
+                dict.set_item("accumulate_data", acc_data)?;
+
+                let fin_data = pyo3::types::PyList::empty_bound(py);
+                for fd in &stock.financial_data_list {
+                    let d = pyo3::types::PyDict::new_bound(py);
+                    d.set_item("field", fd.field_name)?;
+                    d.set_item("value", fd.value)?;
+                    d.set_item("quarter", fd.quarter)?;
+                    fin_data.append(d)?;
+                }
+                dict.set_item("financial_data", fin_data)?;
+
+                data_list.append(dict)?;
+            }
+            result.set_item("data", data_list)?;
+        }
+        Ok(result.into_any().unbind())
+    }
+
     /// Get global state from Futu OpenD (proto 1002).
     /// Returns a dict with market states and connection info.
     fn get_global_state(&self, py: Python<'_>) -> PyResult<PyObject> {

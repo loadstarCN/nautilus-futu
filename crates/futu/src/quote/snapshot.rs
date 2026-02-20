@@ -7,6 +7,7 @@ const PROTO_QOT_GET_SECURITY_SNAPSHOT: u32 = 3203;
 const PROTO_QOT_GET_STATIC_INFO: u32 = 3202;
 const PROTO_QOT_GET_TICKER: u32 = 3010;
 const PROTO_QOT_GET_ORDER_BOOK: u32 = 3012;
+const PROTO_QOT_STOCK_FILTER: u32 = 3215;
 
 /// Get basic quote data for securities.
 pub async fn get_basic_qot(
@@ -145,6 +146,47 @@ pub async fn get_ticker(
         .map_err(QuoteError::Connection)?;
 
     let response = crate::generated::qot_get_ticker::Response::decode(resp.body.as_slice())
+        .map_err(|e| QuoteError::Decode(e.to_string()))?;
+
+    if response.ret_type != 0 {
+        return Err(QuoteError::Server {
+            ret_type: response.ret_type,
+            msg: response.ret_msg.unwrap_or_default(),
+        });
+    }
+
+    Ok(response)
+}
+
+/// Filter stocks by conditions (Qot_StockFilter, proto 3215).
+pub async fn stock_filter(
+    client: &FutuClient,
+    begin: i32,
+    num: i32,
+    market: i32,
+    plate: Option<(i32, String)>,
+    base_filters: Vec<crate::generated::qot_stock_filter::BaseFilter>,
+    accumulate_filters: Vec<crate::generated::qot_stock_filter::AccumulateFilter>,
+    financial_filters: Vec<crate::generated::qot_stock_filter::FinancialFilter>,
+) -> Result<crate::generated::qot_stock_filter::Response, QuoteError> {
+    let plate = plate.map(|(m, c)| crate::generated::qot_common::Security { market: m, code: c });
+
+    let c2s = crate::generated::qot_stock_filter::C2s {
+        begin,
+        num,
+        market,
+        plate,
+        base_filter_list: base_filters,
+        accumulate_filter_list: accumulate_filters,
+        financial_filter_list: financial_filters,
+    };
+    let request = crate::generated::qot_stock_filter::Request { c2s };
+    let body = request.encode_to_vec();
+
+    let resp = client.request(PROTO_QOT_STOCK_FILTER, &body).await
+        .map_err(QuoteError::Connection)?;
+
+    let response = crate::generated::qot_stock_filter::Response::decode(resp.body.as_slice())
         .map_err(|e| QuoteError::Decode(e.to_string()))?;
 
     if response.ret_type != 0 {
@@ -392,5 +434,75 @@ mod tests {
         assert_eq!(decoded.ret_type, -1);
         assert_eq!(decoded.ret_msg.unwrap(), "quota exceeded");
         assert!(decoded.s2c.is_none());
+    }
+
+    #[test]
+    fn test_stock_filter_proto_id() {
+        assert_eq!(super::PROTO_QOT_STOCK_FILTER, 3215);
+    }
+
+    #[test]
+    fn test_stock_filter_request_encode_decode() {
+        let base_filter = crate::generated::qot_stock_filter::BaseFilter {
+            field_name: 1,
+            filter_min: Some(10.0),
+            filter_max: Some(100.0),
+            is_no_filter: None,
+            sort_dir: Some(2),
+        };
+        let c2s = crate::generated::qot_stock_filter::C2s {
+            begin: 0,
+            num: 50,
+            market: 1,
+            plate: None,
+            base_filter_list: vec![base_filter],
+            accumulate_filter_list: vec![],
+            financial_filter_list: vec![],
+        };
+        let request = crate::generated::qot_stock_filter::Request { c2s };
+        let encoded = request.encode_to_vec();
+        let decoded = crate::generated::qot_stock_filter::Request::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.c2s.begin, 0);
+        assert_eq!(decoded.c2s.num, 50);
+        assert_eq!(decoded.c2s.market, 1);
+        assert_eq!(decoded.c2s.base_filter_list.len(), 1);
+        assert_eq!(decoded.c2s.base_filter_list[0].field_name, 1);
+        assert_eq!(decoded.c2s.base_filter_list[0].filter_min, Some(10.0));
+    }
+
+    #[test]
+    fn test_stock_filter_response_success() {
+        let stock = crate::generated::qot_stock_filter::StockData {
+            security: crate::generated::qot_common::Security {
+                market: 1,
+                code: "00700".to_string(),
+            },
+            name: "TENCENT".to_string(),
+            base_data_list: vec![crate::generated::qot_stock_filter::BaseData {
+                field_name: 1,
+                value: 350.0,
+            }],
+            accumulate_data_list: vec![],
+            financial_data_list: vec![],
+        };
+        let response = crate::generated::qot_stock_filter::Response {
+            ret_type: 0,
+            ret_msg: None,
+            err_code: None,
+            s2c: Some(crate::generated::qot_stock_filter::S2c {
+                last_page: true,
+                all_count: 1,
+                data_list: vec![stock],
+            }),
+        };
+        let encoded = response.encode_to_vec();
+        let decoded = crate::generated::qot_stock_filter::Response::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.ret_type, 0);
+        let s2c = decoded.s2c.unwrap();
+        assert!(s2c.last_page);
+        assert_eq!(s2c.all_count, 1);
+        assert_eq!(s2c.data_list.len(), 1);
+        assert_eq!(s2c.data_list[0].security.code, "00700");
+        assert_eq!(s2c.data_list[0].name, "TENCENT");
     }
 }

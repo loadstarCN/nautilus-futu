@@ -61,3 +61,5 @@ pub mod trd_update_order_fill;
 pub mod trd_sub_acc_push;
 #[allow(clippy::all)]
 pub mod get_global_state;
+#[allow(clippy::all)]
+pub mod qot_stock_filter;
