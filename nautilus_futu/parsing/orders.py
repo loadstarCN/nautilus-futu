@@ -172,8 +172,8 @@ def parse_futu_order_to_report(
     order_status = futu_order_status_to_nautilus(order["order_status"])
     time_in_force = futu_time_in_force_to_nautilus(order.get("time_in_force"))
 
-    qty = Quantity.from_raw(int(order["qty"] * 1e9), precision=9)
-    filled_qty = Quantity.from_raw(int((order.get("fill_qty") or 0.0) * 1e9), precision=9)
+    qty = Quantity.from_raw(round(order["qty"] * 1e9), precision=9)
+    filled_qty = Quantity.from_raw(round((order.get("fill_qty") or 0.0) * 1e9), precision=9)
     price = Price.from_str(str(order.get("price") or 0)) if order.get("price") else None
     avg_px = Decimal(str(order.get("fill_avg_price") or 0)) if order.get("fill_avg_price") else None
 
@@ -235,7 +235,7 @@ def parse_futu_fill_to_report(
         venue_order_id=VenueOrderId(str(fill.get("order_id") or 0)),
         trade_id=TradeId(str(fill["fill_id"])),
         order_side=order_side,
-        last_qty=Quantity.from_raw(int(fill["qty"] * 1e9), precision=9),
+        last_qty=Quantity.from_raw(round(fill["qty"] * 1e9), precision=9),
         last_px=Price.from_str(str(fill["price"])),
         commission=commission,
         liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
@@ -280,7 +280,7 @@ def parse_futu_position_to_report(
         account_id=account_id,
         instrument_id=instrument_id,
         position_side=position_side,
-        quantity=Quantity.from_raw(int(abs(qty) * 1e9), precision=9),
+        quantity=Quantity.from_raw(round(abs(qty) * 1e9), precision=9),
         report_id=UUID4(),
         ts_last=0,
         ts_init=0,

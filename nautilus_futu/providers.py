@@ -60,5 +60,7 @@ class FutuInstrumentProvider(InstrumentProvider):
                     instrument = parse_futu_instrument(info)
                     if instrument is not None:
                         self.add(instrument)
+                    else:
+                        self._log.warning(f"Failed to parse instrument for {instrument_id}")
         except Exception as e:
             self._log.error(f"Failed to load instrument {instrument_id}: {e}")

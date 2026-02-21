@@ -158,6 +158,7 @@ fn decode_trd_order(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
     order_dict.set_item("order_id", o.order_id)?;
     order_dict.set_item("order_id_ex", &o.order_id_ex)?;
     order_dict.set_item("code", &o.code)?;
+    order_dict.set_item("name", &o.name)?;
     order_dict.set_item("qty", o.qty)?;
     order_dict.set_item("price", o.price)?;
     order_dict.set_item("fill_qty", o.fill_qty)?;

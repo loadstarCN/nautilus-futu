@@ -416,6 +416,8 @@ class FutuLiveDataClient(LiveMarketDataClient):
                     self._handle_instrument(
                         instrument, request.id, request.start, request.end, request.params,
                     )
+                else:
+                    self._log.warning(f"Failed to parse instrument for {instrument_id}")
         except Exception as e:
             self._log.error(f"Failed to request instrument {instrument_id}: {e}")
 

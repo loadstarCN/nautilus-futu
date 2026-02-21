@@ -156,6 +156,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         self._trd_env = config.trd_env
         self._trd_market = config.trd_market
         self._push_task: asyncio.Task | None = None
+        self._trd_market_auth_list: list[int] = [config.trd_market]
 
     async def _connect(self) -> None:
         """Connect to Futu OpenD for trading."""
@@ -659,7 +660,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
     ) -> list[OrderStatusReport]:
         """Generate order status reports across all authorized markets."""
         instrument_id = command.instrument_id
-        markets = getattr(self, "_trd_market_auth_list", [self._trd_market])
+        markets = self._trd_market_auth_list
         account_id = AccountId(f"FUTU-{self._acc_id}")
         reports = []
         seen_ids: set[str] = set()
@@ -695,7 +696,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         """Generate fill reports across all authorized markets."""
         instrument_id = command.instrument_id
         venue_order_id = command.venue_order_id
-        markets = getattr(self, "_trd_market_auth_list", [self._trd_market])
+        markets = self._trd_market_auth_list
         account_id = AccountId(f"FUTU-{self._acc_id}")
         reports = []
         seen_ids: set[str] = set()
@@ -736,7 +737,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         instrument_id = command.instrument_id
         from nautilus_futu.parsing.instruments import parse_futu_instrument
 
-        markets = getattr(self, "_trd_market_auth_list", [self._trd_market])
+        markets = self._trd_market_auth_list
         account_id = AccountId(f"FUTU-{self._acc_id}")
         reports = []
         seen_ids: set[str] = set()
