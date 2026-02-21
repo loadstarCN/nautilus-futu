@@ -473,27 +473,11 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 ts_event=ts_event,
             )
         elif nt_status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
-            fill_qty = order_data.get("fill_qty") or 0.0
-            fill_avg_price = order_data.get("fill_avg_price") or 0.0
-            if fill_qty > 0 and fill_avg_price > 0:
-                # Determine the last fill qty from order data
-                currency = qot_market_to_currency(market)
-                self.generate_order_filled(
-                    strategy_id=order.strategy_id,
-                    instrument_id=instrument_id,
-                    client_order_id=client_order_id,
-                    venue_order_id=venue_order_id,
-                    venue_position_id=None,
-                    trade_id=TradeId(f"{order_data['order_id']}-{ts_event}"),
-                    order_side=futu_trd_side_to_nautilus(order_data["trd_side"]),
-                    order_type=futu_order_type_to_nautilus(order_data["order_type"]),
-                    last_qty=Quantity.from_str(str(fill_qty)),
-                    last_px=Price.from_str(str(fill_avg_price)),
-                    quote_currency=currency,
-                    commission=Money(0, currency),
-                    liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
-                    ts_event=ts_event,
-                )
+            # Fill events are handled by _handle_push_fill (proto 2218) which
+            # has the actual per-fill qty/price.  The order update only carries
+            # cumulative fill_qty/fill_avg_price, so we skip fill generation
+            # here to avoid duplicates and incorrect incremental values.
+            pass
 
     def _handle_push_fill(self, data: dict) -> None:
         """Handle fill update push (proto 2218)."""
@@ -546,6 +530,13 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         sec_market = VENUE_TO_FUTU_TRD_SEC_MARKET.get(instrument_id.venue)
 
         try:
+            self.generate_order_submitted(
+                strategy_id=order.strategy_id,
+                instrument_id=instrument_id,
+                client_order_id=order.client_order_id,
+                ts_event=self._clock.timestamp_ns(),
+            )
+
             result = await asyncio.to_thread(
                 self._client.place_order,
                 self._trd_env,
@@ -561,6 +552,13 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
             if result and "order_id" in result:
                 venue_order_id = VenueOrderId(str(result["order_id"]))
+                self.generate_order_accepted(
+                    strategy_id=order.strategy_id,
+                    instrument_id=instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=venue_order_id,
+                    ts_event=self._clock.timestamp_ns(),
+                )
                 self._log.info(
                     f"Order submitted: {order.client_order_id} -> {venue_order_id}"
                 )
@@ -627,11 +625,12 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
     async def generate_order_status_report(
         self,
-        instrument_id: InstrumentId,
-        client_order_id: ClientOrderId | None = None,
-        venue_order_id: VenueOrderId | None = None,
+        command,
     ) -> OrderStatusReport | None:
         """Generate an order status report for a specific order."""
+        instrument_id = command.instrument_id
+        client_order_id = command.client_order_id
+        venue_order_id = command.venue_order_id
         try:
             orders = await asyncio.to_thread(
                 self._client.get_order_list,
@@ -656,11 +655,10 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
     async def generate_order_status_reports(
         self,
-        instrument_id: InstrumentId | None = None,
-        start: Any = None,
-        end: Any = None,
+        command,
     ) -> list[OrderStatusReport]:
         """Generate order status reports across all authorized markets."""
+        instrument_id = command.instrument_id
         markets = getattr(self, "_trd_market_auth_list", [self._trd_market])
         account_id = AccountId(f"FUTU-{self._acc_id}")
         reports = []
@@ -692,12 +690,11 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
     async def generate_fill_reports(
         self,
-        instrument_id: InstrumentId | None = None,
-        venue_order_id: VenueOrderId | None = None,
-        start: Any = None,
-        end: Any = None,
+        command,
     ) -> list[FillReport]:
         """Generate fill reports across all authorized markets."""
+        instrument_id = command.instrument_id
+        venue_order_id = command.venue_order_id
         markets = getattr(self, "_trd_market_auth_list", [self._trd_market])
         account_id = AccountId(f"FUTU-{self._acc_id}")
         reports = []
@@ -733,11 +730,10 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
     async def generate_position_status_reports(
         self,
-        instrument_id: InstrumentId | None = None,
-        start: Any = None,
-        end: Any = None,
+        command,
     ) -> list[PositionStatusReport]:
         """Generate position status reports across all authorized markets."""
+        instrument_id = command.instrument_id
         from nautilus_futu.parsing.instruments import parse_futu_instrument
 
         markets = getattr(self, "_trd_market_auth_list", [self._trd_market])

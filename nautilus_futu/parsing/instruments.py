@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import logging
-from decimal import Decimal
 from typing import Any
 
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.instruments import Equity, FuturesContract, OptionContract
 from nautilus_trader.model.enums import AssetClass, OptionKind
-from nautilus_trader.model.objects import Currency, Money, Price, Quantity
+from nautilus_trader.model.objects import Currency, Price, Quantity
 
 from nautilus_futu.common import futu_security_to_instrument_id
 from nautilus_futu.constants import (

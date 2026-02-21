@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
 from typing import Any
 
 from nautilus_trader.model.data import (
@@ -16,7 +15,6 @@ from nautilus_trader.model.data import (
     TradeTick,
 )
 from nautilus_trader.model.enums import (
-    AggregationSource,
     AggressorSide,
     BarAggregation,
     BookAction,
@@ -26,7 +24,6 @@ from nautilus_trader.model.enums import (
 from nautilus_trader.model.identifiers import InstrumentId, TradeId
 from nautilus_trader.model.objects import Price, Quantity
 
-from nautilus_futu.common import futu_security_to_instrument_id
 from nautilus_futu.constants import (
     FUTU_KL_TYPE_1MIN,
     FUTU_KL_TYPE_5MIN,
@@ -63,7 +60,9 @@ def bar_spec_to_futu_sub_type(spec: BarSpecification) -> int | None:
             return FUTU_SUB_TYPE_KL_60MIN
         return None
     elif spec.aggregation == BarAggregation.DAY:
-        return FUTU_SUB_TYPE_KL_DAY
+        if spec.step == 1:
+            return FUTU_SUB_TYPE_KL_DAY
+        return None
     return None
 
 
@@ -83,7 +82,9 @@ def bar_spec_to_futu_kl_type(spec: BarSpecification) -> int | None:
             return FUTU_KL_TYPE_60MIN
         return None
     elif spec.aggregation == BarAggregation.DAY:
-        return FUTU_KL_TYPE_DAY
+        if spec.step == 1:
+            return FUTU_KL_TYPE_DAY
+        return None
     elif spec.aggregation == BarAggregation.WEEK:
         if spec.step == 1:
             return FUTU_KL_TYPE_WEEK

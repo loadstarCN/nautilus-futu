@@ -43,6 +43,7 @@ fn decode_basic_qot(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
         dict.set_item("high_price", qot.high_price)?;
         dict.set_item("open_price", qot.open_price)?;
         dict.set_item("low_price", qot.low_price)?;
+        dict.set_item("last_close_price", qot.last_close_price)?;
         dict.set_item("turnover", qot.turnover)?;
         dict.set_item("update_timestamp", qot.update_timestamp)?;
         list.append(dict)?;
@@ -155,6 +156,7 @@ fn decode_trd_order(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
     order_dict.set_item("order_type", o.order_type)?;
     order_dict.set_item("order_status", o.order_status)?;
     order_dict.set_item("order_id", o.order_id)?;
+    order_dict.set_item("order_id_ex", &o.order_id_ex)?;
     order_dict.set_item("code", &o.code)?;
     order_dict.set_item("qty", o.qty)?;
     order_dict.set_item("price", o.price)?;
@@ -184,7 +186,9 @@ fn decode_trd_fill(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
     let fill_dict = PyDict::new_bound(py);
     fill_dict.set_item("trd_side", f.trd_side)?;
     fill_dict.set_item("fill_id", f.fill_id)?;
+    fill_dict.set_item("fill_id_ex", &f.fill_id_ex)?;
     fill_dict.set_item("order_id", f.order_id)?;
+    fill_dict.set_item("order_id_ex", &f.order_id_ex)?;
     fill_dict.set_item("code", &f.code)?;
     fill_dict.set_item("qty", f.qty)?;
     fill_dict.set_item("price", f.price)?;

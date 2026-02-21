@@ -76,7 +76,8 @@ class TestParseFutuInstrument:
         # Should succeed with defaults (market=0, code="")
         # or return None if code is empty - depends on implementation
         # It actually succeeds with empty code
-        assert instrument is not None or instrument is None  # No crash
+        # Should succeed with defaults or return None -- either is fine, just no crash
+        assert True
 
     def test_price_precision(self):
         """All instruments should have price_precision=3."""
@@ -107,7 +108,8 @@ class TestParseFutuInstrument:
         # Should not raise
         result = parse_futu_instrument(info)
         # Result may be None or a valid instrument - just ensure no crash
-        assert result is not None or result is None
+        # Should not raise -- either result is fine, just no crash
+        assert True
 
     def test_exception_logged(self, caplog):
         """When parsing fails with an exception, it should be logged."""

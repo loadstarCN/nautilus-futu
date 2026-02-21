@@ -22,6 +22,10 @@ pub struct C2s {
     /// 指定返回K线结构体特定某几项数据，KLFields枚举值或组合，如果未指定返回全部字段
     #[prost(int64, optional, tag = "7")]
     pub need_kl_fields_flag: ::core::option::Option<i64>,
+    /// 分页请求的key。如果请求时服务器因为数据量太大只返回了部分数据，那么s2c会返回nextReqKey，
+    /// 此时用该key再次请求后面的数据
+    #[prost(bytes = "vec", optional, tag = "8")]
+    pub next_req_key: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct S2c {

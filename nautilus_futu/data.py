@@ -9,8 +9,8 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.live.data_client import LiveMarketDataClient
-from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
+from nautilus_trader.model.data import BarType
+from nautilus_trader.model.identifiers import ClientId, InstrumentId
 
 from nautilus_futu.common import (
     futu_security_to_instrument_id,
@@ -400,12 +400,11 @@ class FutuLiveDataClient(LiveMarketDataClient):
             except Exception as e:
                 self._log.error(f"Failed to unsubscribe bars for {bar_type}: {e}")
 
-    async def _request_instrument(
-        self, instrument_id: InstrumentId, correlation_id: Any, params: dict | None = None,
-    ) -> None:
+    async def _request_instrument(self, request) -> None:
         """Request a single instrument definition."""
         from nautilus_futu.parsing.instruments import parse_futu_instrument
 
+        instrument_id = request.instrument_id
         market, code = instrument_id_to_futu_security(instrument_id)
         try:
             static_info_list = await asyncio.to_thread(
@@ -414,22 +413,17 @@ class FutuLiveDataClient(LiveMarketDataClient):
             if static_info_list:
                 instrument = parse_futu_instrument(static_info_list[0])
                 if instrument is not None:
-                    self._handle_instrument(instrument, correlation_id)
+                    self._handle_instrument(
+                        instrument, request.id, request.start, request.end, request.params,
+                    )
         except Exception as e:
             self._log.error(f"Failed to request instrument {instrument_id}: {e}")
 
-    async def _request_quote_ticks(
-        self,
-        instrument_id: InstrumentId,
-        limit: int,
-        correlation_id: Any,
-        start: Any = None,
-        end: Any = None,
-        params: dict | None = None,
-    ) -> None:
+    async def _request_quote_ticks(self, request) -> None:
         """Request quote ticks (basic quote snapshot)."""
         from nautilus_futu.parsing.market_data import parse_futu_quote_tick
 
+        instrument_id = request.instrument_id
         market, code = instrument_id_to_futu_security(instrument_id)
         try:
             result = await asyncio.to_thread(
@@ -440,22 +434,18 @@ class FutuLiveDataClient(LiveMarketDataClient):
             for data in result:
                 tick = parse_futu_quote_tick(data, instrument_id, ts_init)
                 ticks.append(tick)
-            self._handle_quote_ticks(instrument_id, ticks, correlation_id)
+            self._handle_quote_ticks(
+                instrument_id, ticks, request.id, request.start, request.end, request.params,
+            )
         except Exception as e:
             self._log.error(f"Failed to request quote ticks for {instrument_id}: {e}")
 
-    async def _request_trade_ticks(
-        self,
-        instrument_id: InstrumentId,
-        limit: int,
-        correlation_id: Any,
-        start: Any = None,
-        end: Any = None,
-        params: dict | None = None,
-    ) -> None:
+    async def _request_trade_ticks(self, request) -> None:
         """Request trade ticks (ticker data)."""
         from nautilus_futu.parsing.market_data import parse_futu_trade_tick
 
+        instrument_id = request.instrument_id
+        limit = request.limit
         market, code = instrument_id_to_futu_security(instrument_id)
         max_ret = limit if limit and limit > 0 else 100
         try:
@@ -467,7 +457,9 @@ class FutuLiveDataClient(LiveMarketDataClient):
             for ticker in result:
                 tick = parse_futu_trade_tick(ticker, instrument_id, ts_init)
                 ticks.append(tick)
-            self._handle_trade_ticks(instrument_id, ticks, correlation_id)
+            self._handle_trade_ticks(
+                instrument_id, ticks, request.id, request.start, request.end, request.params,
+            )
         except Exception as e:
             self._log.error(f"Failed to request trade ticks for {instrument_id}: {e}")
 
