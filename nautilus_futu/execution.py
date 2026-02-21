@@ -415,6 +415,15 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 self._config.client_id,
                 self._config.client_ver,
             )
+            # Re-unlock trade if password was configured
+            if self._config.unlock_pwd_md5:
+                await asyncio.to_thread(
+                    self._client.unlock_trade,
+                    True,
+                    self._config.unlock_pwd_md5,
+                )
+                self._log.info("Trade re-unlocked after reconnection")
+
             # Re-subscribe trade push
             await asyncio.to_thread(
                 self._client.sub_acc_push,
@@ -424,6 +433,10 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 self._client.start_push,
                 [FUTU_PROTO_TRD_ORDER, FUTU_PROTO_TRD_FILL],
             )
+
+            # Refresh account state
+            await self._update_account_state()
+
             self._log.info("Execution client reconnected to Futu OpenD")
         except Exception as e:
             self._log.error(f"Execution reconnection failed: {e}")
@@ -784,18 +797,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         return reports
 
     async def _cancel_all_orders(self, command: Any) -> None:
-        """Cancel all active orders."""
-        try:
-            orders = await asyncio.to_thread(
-                self._client.get_order_list,
-                self._trd_env,
-                self._acc_id,
-                self._trd_market,
-            )
-        except Exception as e:
-            self._log.error(f"Failed to get order list for cancel all: {e}")
-            return
-
+        """Cancel all active orders across all authorized markets."""
         active_statuses = {
             FUTU_ORDER_STATUS_WAITING_SUBMIT,
             FUTU_ORDER_STATUS_SUBMITTING,
@@ -803,23 +805,35 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             FUTU_ORDER_STATUS_FILLED_PART,
         }
         cancelled = 0
-        for order_dict in orders:
-            if order_dict["order_status"] in active_statuses:
-                try:
-                    await asyncio.to_thread(
-                        self._client.modify_order,
-                        self._trd_env,
-                        self._acc_id,
-                        self._trd_market,
-                        order_dict["order_id"],
-                        2,  # ModifyOrderOp_Cancel
-                        None,
-                        None,
-                    )
-                    cancelled += 1
-                except Exception as e:
-                    self._log.warning(
-                        f"Failed to cancel order {order_dict['order_id']}: {e}"
-                    )
+        for market in self._trd_market_auth_list:
+            try:
+                orders = await asyncio.to_thread(
+                    self._client.get_order_list,
+                    self._trd_env,
+                    self._acc_id,
+                    market,
+                )
+            except Exception as e:
+                self._log.error(f"Failed to get order list (market={market}) for cancel all: {e}")
+                continue
+
+            for order_dict in orders:
+                if order_dict["order_status"] in active_statuses:
+                    try:
+                        await asyncio.to_thread(
+                            self._client.modify_order,
+                            self._trd_env,
+                            self._acc_id,
+                            market,
+                            order_dict["order_id"],
+                            2,  # ModifyOrderOp_Cancel
+                            None,
+                            None,
+                        )
+                        cancelled += 1
+                    except Exception as e:
+                        self._log.warning(
+                            f"Failed to cancel order {order_dict['order_id']}: {e}"
+                        )
 
         self._log.info(f"Cancelled {cancelled} orders")

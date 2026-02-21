@@ -1684,18 +1684,45 @@ impl PyFutuClient {
                 d.set_item("issuer", w.issuer)?;
                 d.set_item("name", &w.name)?;
                 d.set_item("maturity_time", &w.maturity_time)?;
+                d.set_item("maturity_timestamp", w.maturity_timestamp)?;
+                d.set_item("list_time", &w.list_time)?;
+                d.set_item("list_timestamp", w.list_timestamp)?;
+                d.set_item("last_trade_time", &w.last_trade_time)?;
+                d.set_item("last_trade_timestamp", w.last_trade_timestamp)?;
+                d.set_item("recovery_price", w.recovery_price)?;
                 d.set_item("strike_price", w.strike_price)?;
                 d.set_item("cur_price", w.cur_price)?;
                 d.set_item("last_close_price", w.last_close_price)?;
+                d.set_item("price_change_val", w.price_change_val)?;
+                d.set_item("change_rate", w.change_rate)?;
                 d.set_item("volume", w.volume)?;
                 d.set_item("turnover", w.turnover)?;
                 d.set_item("premium", w.premium)?;
+                d.set_item("break_even_point", w.break_even_point)?;
                 d.set_item("conversion_ratio", w.conversion_ratio)?;
+                d.set_item("conversion_price", w.conversion_price)?;
                 d.set_item("lot_size", w.lot_size)?;
                 d.set_item("leverage", w.leverage)?;
+                d.set_item("ipop", w.ipop)?;
                 d.set_item("effective_leverage", w.effective_leverage)?;
                 d.set_item("score", w.score)?;
                 d.set_item("status", w.status)?;
+                d.set_item("bid_price", w.bid_price)?;
+                d.set_item("ask_price", w.ask_price)?;
+                d.set_item("bid_vol", w.bid_vol)?;
+                d.set_item("ask_vol", w.ask_vol)?;
+                d.set_item("high_price", w.high_price)?;
+                d.set_item("low_price", w.low_price)?;
+                d.set_item("implied_volatility", w.implied_volatility)?;
+                d.set_item("delta", w.delta)?;
+                d.set_item("street_rate", w.street_rate)?;
+                d.set_item("street_vol", w.street_vol)?;
+                d.set_item("amplitude", w.amplitude)?;
+                d.set_item("issue_size", w.issue_size)?;
+                d.set_item("upper_strike_price", w.upper_strike_price)?;
+                d.set_item("lower_strike_price", w.lower_strike_price)?;
+                d.set_item("in_line_price_status", w.in_line_price_status)?;
+                d.set_item("price_recovery_ratio", w.price_recovery_ratio)?;
                 data_list.append(d)?;
             }
             result.set_item("data", data_list)?;
@@ -1974,7 +2001,22 @@ impl PyFutuClient {
                 dict.set_item("quote_currency", &info.quote_currency)?;
                 dict.set_item("min_var", info.min_var)?;
                 dict.set_item("min_var_unit", &info.min_var_unit)?;
+                dict.set_item("quote_unit", info.quote_unit.as_deref())?;
                 dict.set_item("time_zone", &info.time_zone)?;
+                dict.set_item("exchange_format_url", &info.exchange_format_url)?;
+                if let Some(ref origin) = info.origin {
+                    dict.set_item("origin_market", origin.market)?;
+                    dict.set_item("origin_code", &origin.code)?;
+                }
+                // trade_time is a repeated TradeTime array
+                let times = pyo3::types::PyList::empty_bound(py);
+                for tt in &info.trade_time {
+                    let td = pyo3::types::PyDict::new_bound(py);
+                    td.set_item("begin", tt.begin)?;
+                    td.set_item("end", tt.end)?;
+                    times.append(td)?;
+                }
+                dict.set_item("trade_time", times)?;
                 result.push(dict.into_any().unbind());
             }
         }

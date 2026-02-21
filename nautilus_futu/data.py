@@ -191,9 +191,61 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 self._client.start_push,
                 [FUTU_PROTO_BASIC_QOT, FUTU_PROTO_TICKER, FUTU_PROTO_ORDER_BOOK, FUTU_PROTO_KL],
             )
+            # Re-subscribe all previously subscribed instruments
+            await self._restore_subscriptions()
             self._log.info("Reconnected to Futu OpenD")
         except Exception as e:
             self._log.error(f"Reconnection failed: {e}")
+
+    async def _restore_subscriptions(self) -> None:
+        """Re-subscribe all instruments after reconnection."""
+        from nautilus_futu.parsing.market_data import bar_spec_to_futu_sub_type
+
+        for instrument_id in self._subscribed_quote_ticks:
+            market, code = instrument_id_to_futu_security(instrument_id)
+            try:
+                await asyncio.to_thread(
+                    self._client.subscribe, [(market, code)], [FUTU_SUB_TYPE_BASIC], True,
+                )
+            except Exception as e:
+                self._log.warning(f"Failed to re-subscribe quote ticks for {instrument_id}: {e}")
+
+        for instrument_id in self._subscribed_trade_ticks:
+            market, code = instrument_id_to_futu_security(instrument_id)
+            try:
+                await asyncio.to_thread(
+                    self._client.subscribe, [(market, code)], [FUTU_SUB_TYPE_TICKER], True,
+                )
+            except Exception as e:
+                self._log.warning(f"Failed to re-subscribe trade ticks for {instrument_id}: {e}")
+
+        for instrument_id in self._subscribed_order_books:
+            market, code = instrument_id_to_futu_security(instrument_id)
+            try:
+                await asyncio.to_thread(
+                    self._client.subscribe, [(market, code)], [FUTU_SUB_TYPE_ORDER_BOOK], True,
+                )
+            except Exception as e:
+                self._log.warning(f"Failed to re-subscribe order book for {instrument_id}: {e}")
+
+        for bar_type in self._subscribed_bars:
+            instrument_id = bar_type.instrument_id
+            market, code = instrument_id_to_futu_security(instrument_id)
+            sub_type = bar_spec_to_futu_sub_type(bar_type.spec)
+            if sub_type is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._client.subscribe, [(market, code)], [sub_type], True,
+                    )
+                except Exception as e:
+                    self._log.warning(f"Failed to re-subscribe bars for {bar_type}: {e}")
+
+        total = (
+            len(self._subscribed_quote_ticks) + len(self._subscribed_trade_ticks)
+            + len(self._subscribed_order_books) + len(self._subscribed_bars)
+        )
+        if total > 0:
+            self._log.info(f"Restored {total} subscriptions after reconnection")
 
     def _handle_push_basic_qot(self, data_list: list) -> None:
         """Handle basic quote push (proto 3005)."""
