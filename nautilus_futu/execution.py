@@ -194,7 +194,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                             break
                 if self._acc_id == 0 and accounts:
                     self._acc_id = accounts[0]["acc_id"]
-                    self._log.info(f"Fallback account: {self._acc_id}")
+                    self._log.warning(f"No matching account for trd_env={self._trd_env} market={self._trd_market}, falling back to first account: {self._acc_id}")
+                elif self._acc_id == 0:
+                    self._log.error("No accounts found from Futu OpenD, trading will not work")
 
             # Save authorized market list for multi-market reconciliation
             for acc in accounts:
@@ -443,6 +445,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
     def _handle_push_order(self, data: dict) -> None:
         """Handle order update push (proto 2208)."""
+        # Validate push belongs to our account/environment
+        if data.get("trd_env") != self._trd_env or data.get("acc_id") != self._acc_id:
+            return
         order_data = data["order"]
         order_status_int = order_data["order_status"]
         nt_status = futu_order_status_to_nautilus(order_status_int)
@@ -495,6 +500,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
     def _handle_push_fill(self, data: dict) -> None:
         """Handle fill update push (proto 2218)."""
+        # Validate push belongs to our account/environment
+        if data.get("trd_env") != self._trd_env or data.get("acc_id") != self._acc_id:
+            return
         fill_data = data["fill"]
         order_id = fill_data.get("order_id")
         if order_id is None:
