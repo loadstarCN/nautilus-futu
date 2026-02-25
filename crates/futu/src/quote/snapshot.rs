@@ -179,6 +179,7 @@ pub async fn get_ticker(
 }
 
 /// Filter stocks by conditions (Qot_StockFilter, proto 3215).
+#[allow(clippy::too_many_arguments)]
 pub async fn stock_filter(
     client: &FutuClient,
     begin: i32,
@@ -482,6 +483,7 @@ pub async fn get_owner_plate(
 }
 
 /// Get option chain for an underlying security.
+#[allow(clippy::too_many_arguments)]
 pub async fn get_option_chain(
     client: &FutuClient,
     owner_market: i32,
@@ -523,6 +525,7 @@ pub async fn get_option_chain(
 }
 
 /// Get warrant list.
+#[allow(clippy::too_many_arguments)]
 pub async fn get_warrant(
     client: &FutuClient,
     begin: i32,

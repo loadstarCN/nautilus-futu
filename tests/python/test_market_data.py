@@ -283,8 +283,8 @@ class TestTickEdgeCases:
         assert str(tick.ask_price) == "0"
 
     def test_trade_tick_zero_volume(self):
-        """volume=0 raises ValueError from NautilusTrader validation."""
+        """volume=0 is clamped to 1 to avoid ValueError."""
         instrument_id = InstrumentId(Symbol("TEST"), HKEX_VENUE)
         data = {"price": 100.0, "volume": 0, "dir": 1, "sequence": 1}
-        with pytest.raises(ValueError, match="not a positive integer"):
-            parse_futu_trade_tick(data, instrument_id, ts_init=0)
+        tick = parse_futu_trade_tick(data, instrument_id, ts_init=0)
+        assert str(tick.size) == "1"

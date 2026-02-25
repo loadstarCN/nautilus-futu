@@ -44,6 +44,18 @@ impl Dispatcher {
         rx
     }
 
+    /// Clear all pending request senders.
+    /// Dropping the oneshot senders causes callers to receive `RecvError`,
+    /// which maps to `ConnectionError::Disconnected`.
+    pub async fn clear_pending(&self) {
+        let mut pending = self.pending.lock().await;
+        let count = pending.len();
+        pending.clear();
+        if count > 0 {
+            tracing::debug!("Cleared {} pending requests", count);
+        }
+    }
+
     /// Dispatch an incoming message.
     pub async fn dispatch(&self, msg: FutuMessage) {
         // First try to match as a response to a pending request
@@ -54,16 +66,19 @@ impl Dispatcher {
         }
         drop(pending);
 
-        // Otherwise treat as a push notification
-        let mut handlers = self.push_handlers.lock().await;
-        if let Some(senders) = handlers.get_mut(&msg.proto_id) {
-            // Remove closed channels, then send to remaining
-            senders.retain(|s| !s.is_closed());
-            for sender in senders.iter() {
-                let _ = sender.send(msg.clone());
+        // Push: copy senders under lock, then send without lock held
+        let senders = {
+            let mut handlers = self.push_handlers.lock().await;
+            if let Some(senders) = handlers.get_mut(&msg.proto_id) {
+                senders.retain(|s| !s.is_closed());
+                senders.clone()
+            } else {
+                tracing::debug!("No handler for proto_id={}, serial_no={}", msg.proto_id, msg.serial_no);
+                return;
             }
-        } else {
-            tracing::debug!("No handler for proto_id={}, serial_no={}", msg.proto_id, msg.serial_no);
+        };
+        for sender in &senders {
+            let _ = sender.send(msg.clone());
         }
     }
 }

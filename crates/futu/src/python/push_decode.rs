@@ -38,13 +38,18 @@ fn decode_basic_qot(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
         let dict = PyDict::new_bound(py);
         dict.set_item("market", qot.security.market)?;
         dict.set_item("code", &qot.security.code)?;
+        dict.set_item("name", &qot.name)?;
+        dict.set_item("is_suspended", qot.is_suspended)?;
         dict.set_item("cur_price", qot.cur_price)?;
+        dict.set_item("price_spread", qot.price_spread)?;
         dict.set_item("volume", qot.volume)?;
         dict.set_item("high_price", qot.high_price)?;
         dict.set_item("open_price", qot.open_price)?;
         dict.set_item("low_price", qot.low_price)?;
         dict.set_item("last_close_price", qot.last_close_price)?;
         dict.set_item("turnover", qot.turnover)?;
+        dict.set_item("turnover_rate", qot.turnover_rate)?;
+        dict.set_item("amplitude", qot.amplitude)?;
         dict.set_item("update_timestamp", qot.update_timestamp)?;
         list.append(dict)?;
     }
@@ -130,7 +135,10 @@ fn decode_kl(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
         d.set_item("high_price", kl.high_price)?;
         d.set_item("low_price", kl.low_price)?;
         d.set_item("close_price", kl.close_price)?;
+        d.set_item("last_close_price", kl.last_close_price)?;
         d.set_item("volume", kl.volume)?;
+        d.set_item("turnover", kl.turnover)?;
+        d.set_item("change_rate", kl.change_rate)?;
         d.set_item("timestamp", kl.timestamp)?;
         d.set_item("is_blank", kl.is_blank)?;
         kl_list.append(d)?;
@@ -168,6 +176,7 @@ fn decode_trd_order(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
     order_dict.set_item("update_timestamp", o.update_timestamp)?;
     order_dict.set_item("time_in_force", o.time_in_force)?;
     order_dict.set_item("remark", &o.remark)?;
+    order_dict.set_item("last_err_msg", &o.last_err_msg)?;
     dict.set_item("order", order_dict)?;
     Ok(dict.into_any().unbind())
 }
@@ -191,10 +200,15 @@ fn decode_trd_fill(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
     fill_dict.set_item("order_id", f.order_id)?;
     fill_dict.set_item("order_id_ex", &f.order_id_ex)?;
     fill_dict.set_item("code", &f.code)?;
+    fill_dict.set_item("name", &f.name)?;
     fill_dict.set_item("qty", f.qty)?;
     fill_dict.set_item("price", f.price)?;
     fill_dict.set_item("sec_market", f.sec_market)?;
     fill_dict.set_item("create_timestamp", f.create_timestamp)?;
+    fill_dict.set_item("counter_broker_id", f.counter_broker_id.unwrap_or_default())?;
+    fill_dict.set_item("counter_broker_name", f.counter_broker_name.clone().unwrap_or_default())?;
+    fill_dict.set_item("update_timestamp", f.update_timestamp.unwrap_or(0.0))?;
+    fill_dict.set_item("status", f.status)?;
     dict.set_item("fill", fill_dict)?;
     Ok(dict.into_any().unbind())
 }
@@ -428,6 +442,9 @@ mod tests {
                 create_time: "2024-01-01 10:00:05".to_string(),
                 sec_market: Some(1),
                 create_timestamp: Some(1704067205.0),
+                counter_broker_id: Some(1234),
+                counter_broker_name: Some("中银国际".to_string()),
+                update_timestamp: Some(1704067210.0),
                 ..Default::default()
             },
         };
@@ -442,6 +459,9 @@ mod tests {
         let s2c = decoded.s2c.unwrap();
         assert_eq!(s2c.order_fill.fill_id, 555);
         assert_eq!(s2c.order_fill.qty, 50.0);
+        assert_eq!(s2c.order_fill.counter_broker_id, Some(1234));
+        assert_eq!(s2c.order_fill.counter_broker_name, Some("中银国际".to_string()));
+        assert_eq!(s2c.order_fill.update_timestamp, Some(1704067210.0));
     }
 
     #[test]

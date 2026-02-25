@@ -4,7 +4,7 @@ pub mod keepalive;
 pub mod dispatcher;
 
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::FutuConfig;
 use crate::protocol::FutuMessage;
@@ -46,33 +46,46 @@ impl FutuClient {
         let resp = init::init_connect(&self.conn).await?;
         tracing::info!("InitConnect success, keepalive_interval={}s", resp.keep_alive_interval);
 
-        // Start keepalive
+        // Start keepalive with failure notification channel
+        let (ka_fail_tx, ka_fail_rx) = oneshot::channel();
         let keepalive_handle = keepalive::start_keepalive(
             Arc::clone(&self.conn),
             resp.keep_alive_interval,
+            ka_fail_tx,
         );
         self.keepalive_handle = Some(keepalive_handle);
 
-        // Start receive loop
+        // Start receive loop — also monitors keepalive failure signal
         let conn = Arc::clone(&self.conn);
         let dispatcher = Arc::clone(&self.dispatcher);
         let recv_handle = tokio::spawn(async move {
             tracing::debug!("Recv loop started");
+            let mut ka_fail_rx = ka_fail_rx;
             loop {
-                match conn.recv().await {
-                    Ok(msg) => {
-                        dispatcher.dispatch(msg).await;
+                tokio::select! {
+                    result = conn.recv() => {
+                        match result {
+                            Ok(msg) => {
+                                dispatcher.dispatch(msg).await;
+                            }
+                            Err(ConnectionError::Disconnected) => {
+                                tracing::warn!("Connection disconnected");
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::error!("Receive error: {}", e);
+                                break;
+                            }
+                        }
                     }
-                    Err(ConnectionError::Disconnected) => {
-                        tracing::warn!("Connection disconnected");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!("Receive error: {}", e);
+                    _ = &mut ka_fail_rx => {
+                        tracing::warn!("Keepalive failure detected, closing recv loop");
                         break;
                     }
                 }
             }
+            // Clear pending requests so callers don't hang forever
+            dispatcher.clear_pending().await;
         });
         self.recv_handle = Some(recv_handle);
 
@@ -110,8 +123,15 @@ impl FutuClient {
         self.init_response.as_ref()
     }
 
+    /// Clear all pending requests so callers get `Disconnected` instead of hanging.
+    pub async fn clear_pending(&self) {
+        self.dispatcher.clear_pending().await;
+    }
+
     /// Disconnect and clean up.
     pub async fn disconnect(&mut self) {
+        // Clear pending requests first so callers get Disconnected error
+        self.dispatcher.clear_pending().await;
         if let Some(handle) = self.keepalive_handle.take() {
             handle.abort();
         }

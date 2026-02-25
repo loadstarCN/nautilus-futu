@@ -243,6 +243,7 @@ pub async fn get_history_order_fill_list(
 }
 
 /// Get maximum tradeable quantities.
+#[allow(clippy::too_many_arguments)]
 pub async fn get_max_trd_qtys(
     client: &FutuClient,
     trd_env: i32,

@@ -80,6 +80,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
         self._subscribed_order_books: set[InstrumentId] = set()
         self._subscribed_bars: set[BarType] = set()
         self._push_task: asyncio.Task | None = None
+        self._push_channel_id: int | None = None
 
     async def _connect(self) -> None:
         """Connect to Futu OpenD."""
@@ -101,12 +102,12 @@ class FutuLiveDataClient(LiveMarketDataClient):
 
             await self._instrument_provider.initialize()
 
-            await asyncio.to_thread(
+            self._push_channel_id = await asyncio.to_thread(
                 self._client.start_push,
                 [FUTU_PROTO_BASIC_QOT, FUTU_PROTO_TICKER, FUTU_PROTO_ORDER_BOOK, FUTU_PROTO_KL],
             )
             self._push_task = self.create_task(self._run_push_loop())
-            self._log.info("Push loop started")
+            self._log.info(f"Push loop started (channel_id={self._push_channel_id})")
         except Exception as e:
             self._log.error(f"Failed to connect to Futu OpenD: {e}")
             raise
@@ -134,7 +135,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
         try:
             while True:
                 try:
-                    msg = await asyncio.to_thread(self._client.poll_push, 100)
+                    msg = await asyncio.to_thread(self._client.poll_push, self._push_channel_id, 100)
                     consecutive_errors = 0
                 except Exception as e:
                     consecutive_errors += 1
@@ -187,13 +188,13 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 self._config.client_id,
                 self._config.client_ver,
             )
-            await asyncio.to_thread(
+            self._push_channel_id = await asyncio.to_thread(
                 self._client.start_push,
                 [FUTU_PROTO_BASIC_QOT, FUTU_PROTO_TICKER, FUTU_PROTO_ORDER_BOOK, FUTU_PROTO_KL],
             )
             # Re-subscribe all previously subscribed instruments
             await self._restore_subscriptions()
-            self._log.info("Reconnected to Futu OpenD")
+            self._log.info(f"Reconnected to Futu OpenD (channel_id={self._push_channel_id})")
         except Exception as e:
             self._log.error(f"Reconnection failed: {e}")
 

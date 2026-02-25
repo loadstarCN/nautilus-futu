@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use prost::Message;
+use tokio::sync::oneshot;
 use tokio::time;
 
 use crate::client::connection::{FutuConnection, ConnectionError};
@@ -10,9 +11,13 @@ const PROTO_ID_KEEP_ALIVE: u32 = 1004;
 
 /// Start the keepalive heartbeat loop.
 /// Returns a JoinHandle that can be used to cancel the loop.
+///
+/// When keepalive fails `MAX_FAILURES` consecutive times, a signal is sent
+/// via `failure_tx` so the recv loop can detect the dead connection.
 pub fn start_keepalive(
     conn: Arc<FutuConnection>,
     interval_secs: i32,
+    failure_tx: oneshot::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     let interval = Duration::from_secs(interval_secs.max(1) as u64);
 
@@ -28,6 +33,7 @@ pub fn start_keepalive(
                 consecutive_failures += 1;
                 if consecutive_failures >= MAX_FAILURES {
                     tracing::error!("KeepAlive failed {} consecutive times, stopping: {}", MAX_FAILURES, e);
+                    let _ = failure_tx.send(());
                     break;
                 }
                 tracing::warn!("KeepAlive failed (attempt {}/{}): {}", consecutive_failures, MAX_FAILURES, e);

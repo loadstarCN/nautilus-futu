@@ -79,12 +79,26 @@ class TestParseFutuInstrument:
         # Should succeed with defaults or return None -- either is fine, just no crash
         assert True
 
-    def test_price_precision(self):
-        """All instruments should have price_precision=3."""
+    def test_price_precision_us(self):
+        """US instruments should have price_precision=2 (market default)."""
         info = {"market": 11, "code": "TSLA", "lot_size": 1}
         instrument = parse_futu_instrument(info)
         assert instrument is not None
+        assert instrument.price_precision == 2
+
+    def test_price_precision_hk(self):
+        """HK instruments should have price_precision=3 (market default)."""
+        info = {"market": 1, "code": "00700", "lot_size": 100}
+        instrument = parse_futu_instrument(info)
+        assert instrument is not None
         assert instrument.price_precision == 3
+
+    def test_price_precision_from_spread(self):
+        """price_spread in static_info should override market default."""
+        info = {"market": 1, "code": "00700", "lot_size": 100, "price_spread": 0.2}
+        instrument = parse_futu_instrument(info)
+        assert instrument is not None
+        assert instrument.price_precision == 1
 
     def test_sgx_currency_sgd(self):
         """market=31 (SGX) should use SGD currency."""

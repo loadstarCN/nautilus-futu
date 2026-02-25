@@ -101,13 +101,22 @@ def parse_futu_quote_tick(
     instrument_id: InstrumentId,
     ts_init: int,
 ) -> QuoteTick:
-    """Parse Futu basic quote to NautilusTrader QuoteTick."""
+    """Parse Futu basic quote to NautilusTrader QuoteTick.
+
+    Uses ``price_spread`` to derive bid/ask prices instead of fabricating
+    a zero-spread tick from ``cur_price`` alone.
+    """
+    cur_price = data.get("cur_price") or 0
+    spread = data.get("price_spread") or 0
+    bid_price = cur_price
+    ask_price = cur_price + spread
+    volume = max(data.get("volume") or 0, 1)  # avoid zero-quantity
     return QuoteTick(
         instrument_id=instrument_id,
-        bid_price=Price.from_str(str(data.get("cur_price", 0))),
-        ask_price=Price.from_str(str(data.get("cur_price", 0))),
-        bid_size=Quantity.from_int(data.get("volume", 0)),
-        ask_size=Quantity.from_int(data.get("volume", 0)),
+        bid_price=Price.from_str(str(bid_price)),
+        ask_price=Price.from_str(str(ask_price)),
+        bid_size=Quantity.from_int(volume),
+        ask_size=Quantity.from_int(volume),
         ts_event=ts_init,
         ts_init=ts_init,
     )
@@ -129,8 +138,8 @@ def parse_futu_trade_tick(
 
     return TradeTick(
         instrument_id=instrument_id,
-        price=Price.from_str(str(data.get("price", 0))),
-        size=Quantity.from_int(data.get("volume", 0)),
+        price=Price.from_str(str(data.get("price") or 0)),
+        size=Quantity.from_int(max(data.get("volume") or 0, 1)),
         aggressor_side=aggressor_side,
         trade_id=TradeId(str(data.get("sequence", 0))),
         ts_event=ts_init,
@@ -148,15 +157,24 @@ def parse_futu_bars(
         if kl.get("is_blank", False):
             continue
 
+        # Use `or 0` to handle explicit None values (key exists but value is None)
+        open_val = kl.get("open_price") or 0
+        high_val = kl.get("high_price") or 0
+        low_val = kl.get("low_price") or 0
+        close_val = kl.get("close_price") or 0
+        vol_val = max(kl.get("volume") or 0, 1)  # avoid zero-quantity
+        ts_val = kl.get("timestamp")
+        ts_ns = int(ts_val * 1e9) if ts_val else 0
+
         bar = Bar(
             bar_type=bar_type,
-            open=Price.from_str(str(kl.get("open_price", 0))),
-            high=Price.from_str(str(kl.get("high_price", 0))),
-            low=Price.from_str(str(kl.get("low_price", 0))),
-            close=Price.from_str(str(kl.get("close_price", 0))),
-            volume=Quantity.from_int(kl.get("volume", 0)),
-            ts_event=int(kl.get("timestamp", 0) * 1e9) if kl.get("timestamp") else 0,
-            ts_init=int(kl.get("timestamp", 0) * 1e9) if kl.get("timestamp") else 0,
+            open=Price.from_str(str(open_val)),
+            high=Price.from_str(str(high_val)),
+            low=Price.from_str(str(low_val)),
+            close=Price.from_str(str(close_val)),
+            volume=Quantity.from_int(vol_val),
+            ts_event=ts_ns,
+            ts_init=ts_ns,
         )
         bars.append(bar)
 

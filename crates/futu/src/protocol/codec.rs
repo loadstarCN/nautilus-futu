@@ -56,6 +56,14 @@ impl Decoder for FutuCodec {
         // Extract body
         let body = src.split_to(body_len).to_vec();
 
+        // Verify body SHA1 checksum
+        if !header.verify_body(&body) {
+            return Err(CodecError::ChecksumMismatch {
+                proto_id: header.proto_id,
+                serial_no: header.serial_no,
+            });
+        }
+
         Ok(Some(FutuMessage {
             proto_id: header.proto_id,
             serial_no: header.serial_no,
@@ -84,6 +92,8 @@ pub enum CodecError {
     Io(#[from] std::io::Error),
     #[error("body too large: {0} bytes (max {MAX_BODY_SIZE})")]
     BodyTooLarge(u32),
+    #[error("SHA1 checksum mismatch for proto_id={proto_id}, serial_no={serial_no}")]
+    ChecksumMismatch { proto_id: u32, serial_no: u32 },
 }
 
 #[cfg(test)]
@@ -196,6 +206,27 @@ mod tests {
         assert_eq!(decoded.proto_id, 3103);
         assert_eq!(decoded.serial_no, 99);
         assert_eq!(decoded.body, body);
+    }
+
+    #[test]
+    fn test_codec_checksum_mismatch() {
+        let mut codec = FutuCodec;
+        // Build a valid packet then tamper with the body
+        let msg = FutuMessage {
+            proto_id: 1001,
+            serial_no: 42,
+            body: b"original".to_vec(),
+        };
+        let mut buf = BytesMut::new();
+        codec.encode(msg, &mut buf).unwrap();
+
+        // Tamper with the body bytes (after the 44-byte header)
+        buf[HEADER_SIZE] ^= 0xFF;
+
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, CodecError::ChecksumMismatch { proto_id: 1001, serial_no: 42 }));
     }
 
     #[test]

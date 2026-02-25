@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from nautilus_trader.model.objects import Currency
 
-from nautilus_futu.execution import parse_funds_to_balance
+from nautilus_futu.execution import FutuLiveExecutionClient, parse_funds_to_balance
 
 
 USD = Currency.from_str("USD")
@@ -167,3 +169,109 @@ class TestParseBalanceEdgeCases:
         assert float(b.total) == 4173.12
         assert float(b.free) == 4173.12
         assert float(b.locked) == 0.0
+
+
+# ─────────────────────────────────────────────────────────
+# Push handler 防御性测试
+# ─────────────────────────────────────────────────────────
+
+
+def _make_mock_self():
+    """Create a mock 'self' with attributes needed by push handler methods.
+
+    NautilusTrader's LiveExecutionClient is Cython-based, so we cannot use
+    ``object.__new__``.  Instead we create a plain MagicMock and attach
+    the attributes that ``_handle_push_order`` / ``_handle_push_fill`` access.
+    """
+    mock = MagicMock()
+    mock._trd_env = 1
+    mock._acc_id = 12345
+    mock._cache.order.return_value = None  # No cached order by default
+    mock._clock.timestamp_ns.return_value = 0
+    return mock
+
+
+class TestPushOrderDefensive:
+    """Verify _handle_push_order does not crash on missing/malformed data."""
+
+    def test_push_order_missing_order_key(self):
+        """data dict without 'order' key should not raise."""
+        mock = _make_mock_self()
+        data = {"trd_env": 1, "acc_id": 12345}
+        FutuLiveExecutionClient._handle_push_order(mock, data)
+        mock._log.warning.assert_called()
+
+    def test_push_order_missing_order_status(self):
+        """order_data without 'order_status' should not raise."""
+        mock = _make_mock_self()
+        data = {
+            "trd_env": 1,
+            "acc_id": 12345,
+            "order": {"order_id": 1, "code": "00700"},
+        }
+        FutuLiveExecutionClient._handle_push_order(mock, data)
+        mock._log.warning.assert_called()
+
+    def test_push_order_missing_order_id(self):
+        """order_data without 'order_id' should not raise."""
+        mock = _make_mock_self()
+        data = {
+            "trd_env": 1,
+            "acc_id": 12345,
+            "order": {"order_status": 10, "code": "00700"},
+        }
+        FutuLiveExecutionClient._handle_push_order(mock, data)
+        mock._log.warning.assert_called()
+
+    def test_push_order_wrong_account_ignored(self):
+        """Push for different acc_id should be silently ignored."""
+        mock = _make_mock_self()
+        data = {
+            "trd_env": 1,
+            "acc_id": 99999,
+            "order": {"order_status": 10, "order_id": 1, "code": "00700"},
+        }
+        FutuLiveExecutionClient._handle_push_order(mock, data)
+        mock._log.warning.assert_not_called()
+
+    def test_push_order_empty_data(self):
+        """Completely empty data dict should not raise."""
+        mock = _make_mock_self()
+        FutuLiveExecutionClient._handle_push_order(mock, {})
+
+
+class TestPushFillDefensive:
+    """Verify _handle_push_fill does not crash on missing/malformed data."""
+
+    def test_push_fill_missing_fill_key(self):
+        """data dict without 'fill' key should not raise."""
+        mock = _make_mock_self()
+        data = {"trd_env": 1, "acc_id": 12345}
+        FutuLiveExecutionClient._handle_push_fill(mock, data)
+        mock._log.warning.assert_called()
+
+    def test_push_fill_missing_order_id(self):
+        """fill_data without 'order_id' should silently return."""
+        mock = _make_mock_self()
+        data = {
+            "trd_env": 1,
+            "acc_id": 12345,
+            "fill": {"fill_id": 1, "code": "00700"},
+        }
+        FutuLiveExecutionClient._handle_push_fill(mock, data)
+
+    def test_push_fill_wrong_account_ignored(self):
+        """Push for different acc_id should be silently ignored."""
+        mock = _make_mock_self()
+        data = {
+            "trd_env": 1,
+            "acc_id": 99999,
+            "fill": {"fill_id": 1, "order_id": 1, "code": "00700"},
+        }
+        FutuLiveExecutionClient._handle_push_fill(mock, data)
+        mock._log.warning.assert_not_called()
+
+    def test_push_fill_empty_data(self):
+        """Completely empty data dict should not raise."""
+        mock = _make_mock_self()
+        FutuLiveExecutionClient._handle_push_fill(mock, {})

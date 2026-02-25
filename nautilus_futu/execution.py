@@ -156,6 +156,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         self._trd_env = config.trd_env
         self._trd_market = config.trd_market
         self._push_task: asyncio.Task | None = None
+        self._push_channel_id: int | None = None
         self._trd_market_auth_list: list[int] = [config.trd_market]
 
     async def _connect(self) -> None:
@@ -235,12 +236,12 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             )
             self._log.info(f"Subscribed to trade push for acc_id={self._acc_id}")
 
-            await asyncio.to_thread(
+            self._push_channel_id = await asyncio.to_thread(
                 self._client.start_push,
                 [FUTU_PROTO_TRD_ORDER, FUTU_PROTO_TRD_FILL],
             )
             self._push_task = self.create_task(self._run_push_loop())
-            self._log.info("Execution push loop started")
+            self._log.info(f"Execution push loop started (channel_id={self._push_channel_id})")
 
             self._log.info("Execution client connected to Futu OpenD")
         except Exception as e:
@@ -305,8 +306,6 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         This allows ``Portfolio.account_for_venue(Venue("HKEX"))`` (or NYSE,
         SSE, etc.) to find the Futu account, preventing PnL init timeouts.
         """
-        import time
-
         from nautilus_trader.accounting.accounts.cash import CashAccount
         from nautilus_trader.core.uuid import UUID4
         from nautilus_trader.model.events.account import AccountState
@@ -337,8 +336,8 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                     margins=[],
                     info={"alias_of": f"FUTU-{self._acc_id}"},
                     event_id=UUID4(),
-                    ts_event=time.time_ns(),
-                    ts_init=time.time_ns(),
+                    ts_event=self._clock.timestamp_ns(),
+                    ts_init=self._clock.timestamp_ns(),
                 )
                 account = CashAccount(event)
                 self._cache.add_account(account)
@@ -368,7 +367,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         try:
             while True:
                 try:
-                    msg = await asyncio.to_thread(self._client.poll_push, 100)
+                    msg = await asyncio.to_thread(self._client.poll_push, self._push_channel_id, 100)
                     consecutive_errors = 0
                 except Exception as e:
                     consecutive_errors += 1
@@ -431,7 +430,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 self._client.sub_acc_push,
                 [self._acc_id],
             )
-            await asyncio.to_thread(
+            self._push_channel_id = await asyncio.to_thread(
                 self._client.start_push,
                 [FUTU_PROTO_TRD_ORDER, FUTU_PROTO_TRD_FILL],
             )
@@ -439,104 +438,129 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             # Refresh account state
             await self._update_account_state()
 
-            self._log.info("Execution client reconnected to Futu OpenD")
+            self._log.info(f"Execution client reconnected to Futu OpenD (channel_id={self._push_channel_id})")
         except Exception as e:
             self._log.error(f"Execution reconnection failed: {e}")
 
     def _handle_push_order(self, data: dict) -> None:
         """Handle order update push (proto 2208)."""
-        # Validate push belongs to our account/environment
-        if data.get("trd_env") != self._trd_env or data.get("acc_id") != self._acc_id:
-            return
-        order_data = data["order"]
-        order_status_int = order_data["order_status"]
-        nt_status = futu_order_status_to_nautilus(order_status_int)
-        venue_order_id = VenueOrderId(str(order_data["order_id"]))
+        try:
+            # Validate push belongs to our account/environment
+            if data.get("trd_env") != self._trd_env or data.get("acc_id") != self._acc_id:
+                return
 
-        # Try to find the matching client order in cache
-        order = self._cache.order(venue_order_id=venue_order_id)
-        if order is None:
-            self._log.debug(f"No cached order for venue_order_id={venue_order_id}")
-            return
+            order_data = data.get("order")
+            if order_data is None:
+                self._log.warning("Push order missing 'order' key")
+                return
 
-        client_order_id = order.client_order_id
-        account_id = AccountId(f"FUTU-{self._acc_id}")
-        sec_market = order_data.get("sec_market")
-        market = sec_market_to_qot_market(sec_market)
-        instrument_id = futu_security_to_instrument_id(market, order_data["code"])
-        ts_event = int((order_data.get("update_timestamp") or 0) * 1e9)
+            order_status_int = order_data.get("order_status")
+            if order_status_int is None:
+                self._log.warning("Push order missing 'order_status'")
+                return
 
-        if nt_status == OrderStatus.ACCEPTED:
-            self.generate_order_accepted(
-                strategy_id=order.strategy_id,
-                instrument_id=instrument_id,
-                client_order_id=client_order_id,
-                venue_order_id=venue_order_id,
-                ts_event=ts_event,
-            )
-        elif nt_status == OrderStatus.CANCELED:
-            self.generate_order_canceled(
-                strategy_id=order.strategy_id,
-                instrument_id=instrument_id,
-                client_order_id=client_order_id,
-                venue_order_id=venue_order_id,
-                ts_event=ts_event,
-            )
-        elif nt_status == OrderStatus.REJECTED:
-            reason = order_data.get("remark") or "Unknown"
-            self.generate_order_rejected(
-                strategy_id=order.strategy_id,
-                instrument_id=instrument_id,
-                client_order_id=client_order_id,
-                reason=str(reason),
-                ts_event=ts_event,
-            )
-        elif nt_status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
-            # Fill events are handled by _handle_push_fill (proto 2218) which
-            # has the actual per-fill qty/price.  The order update only carries
-            # cumulative fill_qty/fill_avg_price, so we skip fill generation
-            # here to avoid duplicates and incorrect incremental values.
-            pass
+            order_id = order_data.get("order_id")
+            if order_id is None:
+                self._log.warning("Push order missing 'order_id'")
+                return
+
+            nt_status = futu_order_status_to_nautilus(order_status_int)
+            venue_order_id = VenueOrderId(str(order_id))
+
+            # Try to find the matching client order in cache
+            order = self._cache.order(venue_order_id=venue_order_id)
+            if order is None:
+                self._log.debug(f"No cached order for venue_order_id={venue_order_id}")
+                return
+
+            client_order_id = order.client_order_id
+            account_id = AccountId(f"FUTU-{self._acc_id}")
+            sec_market = order_data.get("sec_market")
+            market = sec_market_to_qot_market(sec_market)
+            instrument_id = futu_security_to_instrument_id(market, order_data.get("code", ""))
+            ts_event = int((order_data.get("update_timestamp") or 0) * 1e9)
+
+            if nt_status == OrderStatus.ACCEPTED:
+                self.generate_order_accepted(
+                    strategy_id=order.strategy_id,
+                    instrument_id=instrument_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=venue_order_id,
+                    ts_event=ts_event,
+                )
+            elif nt_status == OrderStatus.CANCELED:
+                self.generate_order_canceled(
+                    strategy_id=order.strategy_id,
+                    instrument_id=instrument_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=venue_order_id,
+                    ts_event=ts_event,
+                )
+            elif nt_status == OrderStatus.REJECTED:
+                reason = order_data.get("remark") or "Unknown"
+                self.generate_order_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=instrument_id,
+                    client_order_id=client_order_id,
+                    reason=str(reason),
+                    ts_event=ts_event,
+                )
+            elif nt_status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+                # Fill events are handled by _handle_push_fill (proto 2218) which
+                # has the actual per-fill qty/price.  The order update only carries
+                # cumulative fill_qty/fill_avg_price, so we skip fill generation
+                # here to avoid duplicates and incorrect incremental values.
+                pass
+        except Exception as e:
+            self._log.error(f"Unexpected error in _handle_push_order: {e}")
 
     def _handle_push_fill(self, data: dict) -> None:
         """Handle fill update push (proto 2218)."""
-        # Validate push belongs to our account/environment
-        if data.get("trd_env") != self._trd_env or data.get("acc_id") != self._acc_id:
-            return
-        fill_data = data["fill"]
-        order_id = fill_data.get("order_id")
-        if order_id is None:
-            return
+        try:
+            # Validate push belongs to our account/environment
+            if data.get("trd_env") != self._trd_env or data.get("acc_id") != self._acc_id:
+                return
 
-        venue_order_id = VenueOrderId(str(order_id))
-        order = self._cache.order(venue_order_id=venue_order_id)
-        if order is None:
-            self._log.debug(f"No cached order for fill venue_order_id={venue_order_id}")
-            return
+            fill_data = data.get("fill")
+            if fill_data is None:
+                self._log.warning("Push fill missing 'fill' key")
+                return
 
-        client_order_id = order.client_order_id
-        sec_market = fill_data.get("sec_market")
-        market = sec_market_to_qot_market(sec_market)
-        instrument_id = futu_security_to_instrument_id(market, fill_data["code"])
-        ts_event = int((fill_data.get("create_timestamp") or 0) * 1e9)
-        currency = qot_market_to_currency(market)
+            order_id = fill_data.get("order_id")
+            if order_id is None:
+                return
 
-        self.generate_order_filled(
-            strategy_id=order.strategy_id,
-            instrument_id=instrument_id,
-            client_order_id=client_order_id,
-            venue_order_id=venue_order_id,
-            venue_position_id=None,
-            trade_id=TradeId(str(fill_data["fill_id"])),
-            order_side=futu_trd_side_to_nautilus(fill_data["trd_side"]),
-            order_type=order.order_type,
-            last_qty=Quantity.from_str(str(fill_data["qty"])),
-            last_px=Price.from_str(str(fill_data["price"])),
-            quote_currency=currency,
-            commission=Money(0, currency),
-            liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
-            ts_event=ts_event,
-        )
+            venue_order_id = VenueOrderId(str(order_id))
+            order = self._cache.order(venue_order_id=venue_order_id)
+            if order is None:
+                self._log.debug(f"No cached order for fill venue_order_id={venue_order_id}")
+                return
+
+            client_order_id = order.client_order_id
+            sec_market = fill_data.get("sec_market")
+            market = sec_market_to_qot_market(sec_market)
+            instrument_id = futu_security_to_instrument_id(market, fill_data.get("code", ""))
+            ts_event = int((fill_data.get("create_timestamp") or 0) * 1e9)
+            currency = qot_market_to_currency(market)
+
+            self.generate_order_filled(
+                strategy_id=order.strategy_id,
+                instrument_id=instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=venue_order_id,
+                venue_position_id=None,
+                trade_id=TradeId(str(fill_data.get("fill_id", 0))),
+                order_side=futu_trd_side_to_nautilus(fill_data.get("trd_side", 0)),
+                order_type=order.order_type,
+                last_qty=Quantity.from_str(str(fill_data.get("qty", 0))),
+                last_px=Price.from_str(str(fill_data.get("price", 0))),
+                quote_currency=currency,
+                commission=Money(0, currency),
+                liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
+                ts_event=ts_event,
+            )
+        except Exception as e:
+            self._log.error(f"Unexpected error in _handle_push_fill: {e}")
 
     async def _submit_order(self, command: Any) -> None:
         """Submit a new order."""
@@ -574,13 +598,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
             if result and "order_id" in result:
                 venue_order_id = VenueOrderId(str(result["order_id"]))
-                self.generate_order_accepted(
-                    strategy_id=order.strategy_id,
-                    instrument_id=instrument_id,
-                    client_order_id=order.client_order_id,
-                    venue_order_id=venue_order_id,
-                    ts_event=self._clock.timestamp_ns(),
-                )
+                # NOTE: generate_order_accepted is NOT called here — the push
+                # handler (_handle_push_order) is the single source of truth
+                # for ACCEPTED events, avoiding duplicate generation.
                 self._log.info(
                     f"Order submitted: {order.client_order_id} -> {venue_order_id}"
                 )
@@ -607,6 +627,14 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         qty = float(command.quantity) if command.quantity is not None else None
 
         try:
+            self.generate_order_pending_update(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=venue_order_id,
+                ts_event=self._clock.timestamp_ns(),
+            )
+
             await asyncio.to_thread(
                 self._client.modify_order,
                 self._trd_env,
@@ -631,6 +659,14 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             return
 
         try:
+            self.generate_order_pending_cancel(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=venue_order_id,
+                ts_event=self._clock.timestamp_ns(),
+            )
+
             await asyncio.to_thread(
                 self._client.modify_order,
                 self._trd_env,

@@ -23,8 +23,9 @@ type PushReceiver = Arc<Mutex<mpsc::UnboundedReceiver<PushMessage>>>;
 pub struct PyFutuClient {
     runtime: Runtime,
     client: SyncMutex<Option<Arc<FutuClient>>>,
-    push_tx: SyncMutex<Option<PushSender>>,
-    push_rx: SyncMutex<Option<PushReceiver>>,
+    /// Each `start_push()` call creates its own channel pair so data and
+    /// execution clients don't compete for the same receiver.
+    push_channels: SyncMutex<Vec<(PushSender, PushReceiver)>>,
     push_handles: SyncMutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -50,8 +51,7 @@ impl PyFutuClient {
         Ok(Self {
             runtime,
             client: SyncMutex::new(None),
-            push_tx: SyncMutex::new(None),
-            push_rx: SyncMutex::new(None),
+            push_channels: SyncMutex::new(Vec::new()),
             push_handles: SyncMutex::new(Vec::new()),
         })
     }
@@ -93,13 +93,21 @@ impl PyFutuClient {
     }
 
     /// Disconnect from Futu OpenD.
-    fn disconnect(&self, _py: Python<'_>) -> PyResult<()> {
+    fn disconnect(&self, py: Python<'_>) -> PyResult<()> {
         // Abort push forwarder tasks
         for handle in self.push_handles.lock().drain(..) {
             handle.abort();
         }
-        *self.push_tx.lock() = None;
-        *self.push_rx.lock() = None;
+        self.push_channels.lock().clear();
+
+        // Clear pending requests so callers don't hang forever
+        if let Some(client) = self.client.lock().as_ref().cloned() {
+            py.allow_threads(|| {
+                self.runtime.block_on(async {
+                    client.clear_pending().await;
+                });
+            });
+        }
 
         // Take the Arc out — when the last Arc reference is dropped,
         // FutuClient::drop() aborts keepalive and recv handles.
@@ -294,13 +302,16 @@ impl PyFutuClient {
                 let sec = &qot.security;
                 dict.set_item("market", sec.market)?;
                 dict.set_item("code", &sec.code)?;
+                dict.set_item("name", &qot.name)?;
                 dict.set_item("cur_price", qot.cur_price)?;
+                dict.set_item("price_spread", qot.price_spread)?;
                 dict.set_item("open_price", qot.open_price)?;
                 dict.set_item("high_price", qot.high_price)?;
                 dict.set_item("low_price", qot.low_price)?;
                 dict.set_item("last_close_price", qot.last_close_price)?;
                 dict.set_item("volume", qot.volume)?;
                 dict.set_item("turnover", qot.turnover)?;
+                dict.set_item("turnover_rate", qot.turnover_rate)?;
                 dict.set_item("update_timestamp", qot.update_timestamp)?;
                 result.push(dict.into_any().unbind());
             }
@@ -344,6 +355,7 @@ impl PyFutuClient {
                 dict.set_item("high_price", kl.high_price)?;
                 dict.set_item("low_price", kl.low_price)?;
                 dict.set_item("close_price", kl.close_price)?;
+                dict.set_item("last_close_price", kl.last_close_price)?;
                 dict.set_item("volume", kl.volume)?;
                 dict.set_item("turnover", kl.turnover)?;
                 dict.set_item("timestamp", kl.timestamp)?;
@@ -520,6 +532,7 @@ impl PyFutuClient {
                 dict.set_item("update_timestamp", order.update_timestamp)?;
                 dict.set_item("time_in_force", order.time_in_force)?;
                 dict.set_item("remark", &order.remark)?;
+                dict.set_item("last_err_msg", &order.last_err_msg)?;
                 result.push(dict.into_any().unbind());
             }
         }
@@ -725,27 +738,26 @@ impl PyFutuClient {
     }
 
     /// Start receiving push notifications for the given proto_ids.
-    /// First call creates the merged channel; subsequent calls reuse it
-    /// and only add new forwarder tasks (append mode).
+    /// Each call creates a **new** channel pair and returns its index.
+    /// Data and execution clients should each call this once and store
+    /// their own `channel_id` for use with `poll_push()`.
     fn start_push(
         &self,
         py: Python<'_>,
         proto_ids: Vec<u32>,
-    ) -> PyResult<()> {
+    ) -> PyResult<usize> {
         let client = self.get_client()?;
         let client = &*client;
 
-        // Reuse existing tx/rx if already created, otherwise create new pair
-        let tx = {
-            let mut tx_guard = self.push_tx.lock();
-            if let Some(ref tx) = *tx_guard {
-                tx.clone()
-            } else {
-                let (tx, rx) = mpsc::unbounded_channel::<PushMessage>();
-                *tx_guard = Some(tx.clone());
-                *self.push_rx.lock() = Some(Arc::new(Mutex::new(rx)));
-                tx
-            }
+        // Always create a new channel pair for this caller
+        let (tx, rx) = mpsc::unbounded_channel::<PushMessage>();
+        let rx = Arc::new(Mutex::new(rx));
+
+        let channel_id = {
+            let mut channels = self.push_channels.lock();
+            let id = channels.len();
+            channels.push((tx.clone(), rx));
+            id
         };
 
         // For each proto_id, register a push handler and spawn a forwarder task
@@ -767,20 +779,25 @@ impl PyFutuClient {
             self.push_handles.lock().push(handle);
         }
 
-        Ok(())
+        Ok(channel_id)
     }
 
-    /// Poll for the next push message. Returns a dict or None on timeout.
+    /// Poll for the next push message on a specific channel.
+    /// channel_id: index returned by `start_push()`
     /// timeout_ms: how long to wait for a message (in milliseconds)
-    #[pyo3(signature = (timeout_ms=100))]
+    #[pyo3(signature = (channel_id, timeout_ms=100))]
     fn poll_push(
         &self,
         py: Python<'_>,
+        channel_id: usize,
         timeout_ms: u64,
     ) -> PyResult<Option<PyObject>> {
-        let rx = match self.push_rx.lock().as_ref() {
-            Some(rx) => Arc::clone(rx),
-            None => return Ok(None),
+        let rx = {
+            let channels = self.push_channels.lock();
+            match channels.get(channel_id) {
+                Some((_, rx)) => Arc::clone(rx),
+                None => return Ok(None),
+            }
         };
 
         let timeout = std::time::Duration::from_millis(timeout_ms);
@@ -815,6 +832,7 @@ impl PyFutuClient {
     /// base_filters: list of (fieldName, filterMin, filterMax, sortDir)
     /// accumulate_filters: list of (fieldName, days, filterMin, filterMax, sortDir)
     /// financial_filters: list of (fieldName, quarter, filterMin, filterMax, sortDir)
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     #[pyo3(signature = (market, begin=0, num=200, base_filters=None, accumulate_filters=None, financial_filters=None))]
     fn stock_filter(
         &self,

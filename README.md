@@ -60,7 +60,7 @@ async def main():
         market=1,
         code="00700",
         rehab_type=1,      # 前复权
-        kl_type=1,          # 日K
+        kl_type=2,          # 日K
         begin_time="2025-01-01",
         end_time="2025-12-31",
     )

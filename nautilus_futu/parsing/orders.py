@@ -291,9 +291,17 @@ def sec_market_to_qot_market(sec_market: int | None) -> int:
     """Map Futu TrdSecMarket to QotMarket for instrument_id resolution."""
     if sec_market is None:
         return 0
-    return FUTU_TRD_SEC_MARKET_TO_QOT_MARKET.get(sec_market, 0)
+    result = FUTU_TRD_SEC_MARKET_TO_QOT_MARKET.get(sec_market)
+    if result is None:
+        logger.warning("Unknown sec_market=%d, defaulting to 0", sec_market)
+        return 0
+    return result
 
 
 def qot_market_to_currency(market: int) -> Currency:
     """Map QotMarket to default currency for commission."""
-    return Currency.from_str(FUTU_QOT_MARKET_TO_CURRENCY.get(market, "USD"))
+    code = FUTU_QOT_MARKET_TO_CURRENCY.get(market)
+    if code is None:
+        logger.warning("Unknown QotMarket=%d, defaulting to USD", market)
+        code = "USD"
+    return Currency.from_str(code)
