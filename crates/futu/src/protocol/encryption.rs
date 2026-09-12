@@ -28,8 +28,8 @@ impl AesEcbCipher {
         padded.resize(padded_len, padding_len as u8);
 
         let mut result = padded;
-        for chunk in result.chunks_exact_mut(block_size) {
-            let block = GenericArray::from_mut_slice(chunk);
+        for chunk in result.as_chunks_mut::<16>().0 {
+            let block = GenericArray::from_mut_slice(&mut chunk[..]);
             self.cipher.encrypt_block(block);
         }
         result
@@ -42,8 +42,8 @@ impl AesEcbCipher {
         }
 
         let mut result = data.to_vec();
-        for chunk in result.chunks_exact_mut(16) {
-            let block = GenericArray::from_mut_slice(chunk);
+        for chunk in result.as_chunks_mut::<16>().0 {
+            let block = GenericArray::from_mut_slice(&mut chunk[..]);
             self.cipher.decrypt_block(block);
         }
 
