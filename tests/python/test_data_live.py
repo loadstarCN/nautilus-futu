@@ -17,6 +17,7 @@ from nautilus_futu.config import FutuDataClientConfig
 from nautilus_futu.constants import (
     FUTU_KL_TYPE_1MIN,
     FUTU_KL_TYPE_60MIN,
+    FUTU_SUB_TYPE_BASIC,
     FUTU_SUB_TYPE_KL_1MIN,
     FUTU_SUB_TYPE_ORDER_BOOK,
     FUTU_SUB_TYPE_TICKER,
@@ -92,6 +93,41 @@ class TestSubscriptions:
         h.run(h.client._unsubscribe_order_book_deltas(cmd))
         assert h.rust.subscribe.call_count == 2
         assert h.rust.subscribe.call_args.args[2] is False
+
+    def test_quote_ticks_fall_back_to_basic_qot_when_book_unavailable(self, h):
+        calls = []
+
+        def subscribe(securities, sub_types, is_sub):
+            calls.append((sub_types[0], is_sub))
+            if sub_types[0] == FUTU_SUB_TYPE_ORDER_BOOK:
+                raise RuntimeError("Subscribe failed: no order book permission")
+
+        h.rust.subscribe.side_effect = subscribe
+        h.run(h.client._subscribe_quote_ticks(IID))
+        assert calls == [(FUTU_SUB_TYPE_ORDER_BOOK, True), (FUTU_SUB_TYPE_BASIC, True)]
+        assert IID in h.client._subscribed_quote_ticks
+        assert IID in h.client._quote_fallback_basic
+
+        # BasicQot pushes now produce synthesised quote ticks for this instrument
+        h.client._handle_push_basic_qot([
+            {"market": 1, "code": "00700", "cur_price": 345.2, "price_spread": 0.2, "volume": 10, "update_timestamp": 1718400000.0},
+        ])
+        assert len(h.data) == 1
+        assert isinstance(h.data[0], QuoteTick)
+        assert str(h.data[0].bid_price) == "345.200"
+        assert str(h.data[0].ask_price) == "345.400"
+
+        # order book pushes are ignored for it and unsubscribe releases BasicQot
+        h.client._handle_push_order_book(book_push())
+        assert len(h.data) == 1
+        h.run(h.client._unsubscribe_quote_ticks(IID))
+        assert calls[-1] == (FUTU_SUB_TYPE_BASIC, False)
+        assert IID not in h.client._quote_fallback_basic
+
+    def test_basic_qot_push_ignored_without_fallback(self, h):
+        h.client._subscribed_quote_ticks.add(IID)
+        h.client._handle_push_basic_qot([{"market": 1, "code": "00700", "cur_price": 1.0, "price_spread": 0.1, "volume": 1}])
+        assert h.data == []
 
     def test_l3_book_rejected(self, h):
         cmd = MagicMock(instrument_id=IID, book_type=BookType.L3_MBO, depth=0)

@@ -47,6 +47,26 @@ def test_acquire_connects_once_and_release_disconnects_last():
     asyncio.run(run())
 
 
+def test_failed_acquire_does_not_count_a_consumer():
+    client = _client()
+    client.connect.side_effect = RuntimeError("OpenD down")
+    mgr = FutuConnectionManager(client, "h", 1)
+
+    async def run():
+        for _ in range(2):
+            try:
+                await mgr.acquire()
+            except RuntimeError:
+                pass
+        assert mgr.refcount == 0
+        # once OpenD is back a real acquire counts normally
+        client.connect.side_effect = lambda *a, **k: client.is_connected.__setattr__("return_value", True)
+        assert await mgr.acquire() is True
+        assert mgr.refcount == 1
+
+    asyncio.run(run())
+
+
 def test_ensure_connected_reconnects_only_when_down():
     client = _client(connected=True)
     mgr = FutuConnectionManager(client, "h", 1)

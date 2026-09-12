@@ -368,6 +368,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rsa_key_with_plaintext_opend_stays_plaintext() {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+
+        // Client has an RSA key but the (fake) OpenD has none: the handshake
+        // response is plaintext, so AES must NOT be enabled and later requests
+        // must still work.
+        let mut rng = rand::thread_rng();
+        let private = rsa::RsaPrivateKey::new(&mut rng, 1024).expect("keygen");
+        let pem = private.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap();
+        let key_path = std::env::temp_dir().join(format!("nautilus_futu_test_{}.pem", std::process::id()));
+        std::fs::write(&key_path, pem.as_bytes()).unwrap();
+
+        let addr = spawn_fake_opend(FakeOpts::default()).await;
+        let config = FutuConfig {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            rsa_key_path: Some(key_path.clone()),
+            request_timeout_secs: 5,
+            ..Default::default()
+        };
+        let mut client = FutuClient::connect(config).await.expect("tcp connect");
+        let init = client.init().await.expect("init falls back to plaintext").clone();
+        let _ = std::fs::remove_file(&key_path);
+
+        assert!(!init.encrypted);
+        assert!(!client.connection().is_encrypted().await);
+        let resp = client.request(3001, &[]).await.expect("plaintext request after fallback");
+        assert_eq!(resp.proto_id, 3001);
+    }
+
+    #[tokio::test]
     async fn test_push_delivery_and_close_on_disconnect() {
         let addr = spawn_fake_opend(FakeOpts { push_after_sub: true, ..Default::default() }).await;
         let mut client = connect_client(addr, 5).await;

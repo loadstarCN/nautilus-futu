@@ -81,9 +81,16 @@ pub async fn init_connect(conn: &FutuConnection) -> Result<InitConnectResponse, 
         return Err(InitError::UnexpectedProto(msg.proto_id));
     }
 
+    // `rsa_ok` records whether OpenD actually took part in the RSA handshake.
+    // Only then will it AES-encrypt the rest of the session, so AES must not
+    // be enabled after a plaintext fallback (OpenD without RSA configured).
+    let mut rsa_ok = false;
     let body = match &rsa {
         Some(cipher) => match cipher.decrypt(&msg.body) {
-            Ok(plain) => plain,
+            Ok(plain) => {
+                rsa_ok = true;
+                plain
+            }
             Err(e) => {
                 // OpenD without RSA configured answers in plaintext; fall back
                 // gracefully rather than failing the whole connection.
@@ -115,16 +122,19 @@ pub async fn init_connect(conn: &FutuConnection) -> Result<InitConnectResponse, 
         encrypted: false,
     };
 
-    // Install AES only when we asked for encryption and OpenD handed us a key.
+    // Install AES only when the RSA handshake really happened and OpenD
+    // handed us a 16-byte key.
     let key_bytes = result.conn_aes_key.as_bytes();
-    if want_encryption && key_bytes.len() == 16 {
+    if rsa_ok && key_bytes.len() == 16 {
         let mut key = [0u8; 16];
         key.copy_from_slice(key_bytes);
         conn.set_cipher(&key).await;
         result.encrypted = true;
         tracing::info!("AES-ECB encryption enabled");
-    } else if want_encryption {
+    } else if rsa_ok {
         tracing::warn!("Encryption requested but connAESKey is {} bytes (expected 16); continuing in plaintext", key_bytes.len());
+    } else if want_encryption {
+        tracing::warn!("RSA key configured but OpenD did not encrypt the handshake; session stays in plaintext");
     }
 
     // Store connection ID

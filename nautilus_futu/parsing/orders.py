@@ -71,6 +71,7 @@ from nautilus_futu.constants import (
     FUTU_POSITION_SIDE_LONG,
     FUTU_POSITION_SIDE_SHORT,
     FUTU_QOT_MARKET_TO_CURRENCY,
+    FUTU_QOT_MARKET_US,
     FUTU_TAG_FILL_OUTSIDE_RTH,
     FUTU_TIF_DAY,
     FUTU_TIF_GTC,
@@ -81,6 +82,7 @@ from nautilus_futu.constants import (
     FUTU_TRD_SIDE_BUY_BACK,
     FUTU_TRD_SIDE_SELL,
     FUTU_TRD_SIDE_SELL_SHORT,
+    VENUE_TO_FUTU_MARKET,
 )
 from nautilus_futu.parsing.market_data import make_price, make_qty, seconds_to_ns
 
@@ -321,9 +323,14 @@ def build_futu_order_params(
             # Futu derives the limit price from the trail; explicit price not used
             params["price"] = None
 
-    tag_rth = _fill_outside_rth_from_tags(order.tags)
-    fill_outside_rth = default_fill_outside_rth if tag_rth is None else tag_rth
-    params["fill_outside_rth"] = bool(fill_outside_rth)
+    # `fillOutsideRTH` only applies to US orders; OpenD may reject it elsewhere,
+    # so it is omitted (None) for every other market.
+    if VENUE_TO_FUTU_MARKET.get(order.instrument_id.venue) == FUTU_QOT_MARKET_US:
+        tag_rth = _fill_outside_rth_from_tags(order.tags)
+        fill_outside_rth = default_fill_outside_rth if tag_rth is None else tag_rth
+        params["fill_outside_rth"] = bool(fill_outside_rth)
+    else:
+        params["fill_outside_rth"] = None
 
     return params
 

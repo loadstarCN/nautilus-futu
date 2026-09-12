@@ -35,6 +35,7 @@ from nautilus_trader.model.orders import Order
 from nautilus_futu.common import (
     futu_security_to_instrument_id,
     instrument_id_to_futu_security,
+    log_futu_notify,
 )
 from nautilus_futu.config import FutuExecClientConfig
 from nautilus_futu.connection import FutuConnectionManager
@@ -46,6 +47,7 @@ from nautilus_futu.constants import (
     FUTU_MODIFY_ORDER_OP_CANCEL,
     FUTU_MODIFY_ORDER_OP_NORMAL,
     FUTU_ORDER_STATUS_ACTIVE,
+    FUTU_PROTO_NOTIFY,
     FUTU_PROTO_TRD_FILL,
     FUTU_PROTO_TRD_ORDER,
     FUTU_TRD_MARKET_CN,
@@ -280,14 +282,17 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
             await self._unlock_if_configured()
 
-            # Register push consumers BEFORE asking OpenD to push so nothing is lost
+            # Register push consumers BEFORE asking OpenD to push so nothing is lost.
+            # Gateway notifications (1003) are reported by whichever client opened
+            # the connection, so they are logged exactly once.
             if self._push_channel_id is None:
-                self._push_channel_id = await asyncio.to_thread(self._client.start_push, _EXEC_PUSH_PROTOS)
+                protos = _EXEC_PUSH_PROTOS + ([FUTU_PROTO_NOTIFY] if created else [])
+                self._push_channel_id = await asyncio.to_thread(self._client.start_push, protos)
             await asyncio.to_thread(self._client.sub_acc_push, [self._acc_id])
             self._restored_generation = self._conn.generation
             self._log.info(f"Subscribed to trade push for acc_id={self._acc_id}")
 
-            await self._update_account_state()
+            await self._update_account_state(initial=True)
 
             self._push_task = self.create_task(self._run_push_loop())
             if self._config.account_refresh_interval > 0:
@@ -306,7 +311,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
         if self._acc_id == 0:
             for acc in accounts:
-                if acc["trd_env"] == self._trd_env and acc.get("acc_status", 0) == 0:
+                if acc["trd_env"] == self._trd_env and (acc.get("acc_status") or 0) == 0:
                     if self._trd_market in acc.get("trd_market_auth_list", []):
                         self._acc_id = acc["acc_id"]
                         self._log.info(f"Auto-selected account: {self._acc_id}")
@@ -395,6 +400,8 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                         self._handle_push_order(data)
                     elif proto_id == FUTU_PROTO_TRD_FILL:
                         self._handle_push_fill(data)
+                    elif proto_id == FUTU_PROTO_NOTIFY:
+                        log_futu_notify(self._log, data)
                 except Exception as e:
                     self._log.error(f"Error handling exec push proto_id={proto_id}: {e}")
         except asyncio.CancelledError:
@@ -429,9 +436,23 @@ class FutuLiveExecutionClient(LiveExecutionClient):
     # Account state
     # ------------------------------------------------------------------
 
-    async def _update_account_state(self) -> None:
-        """Query Futu account funds and generate AccountState."""
-        balances, margins = await self._get_account_balances()
+    async def _update_account_state(self, initial: bool = False) -> None:
+        """Query Futu account funds and generate AccountState.
+
+        A failed query on a *refresh* keeps the last published state (publishing
+        zeros would make the risk engine deny every order).  On the initial
+        connect a zero state is still published so the account gets registered.
+        """
+        result = await self._get_account_balances()
+        if result is None:
+            if not initial:
+                self._log.warning("Account refresh failed; keeping last known balances")
+                return
+            currency = Currency.from_str(FUTU_TRD_MARKET_TO_CURRENCY.get(self._trd_market, "USD"))
+            zero = Money(0, currency)
+            self._log.error("Initial funds query failed; registering account with zero balance")
+            result = ([AccountBalance(total=zero, locked=zero, free=zero)], [])
+        balances, margins = result
         if not balances:
             self._log.warning("No account balances obtained")
             return
@@ -446,11 +467,12 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             self._log.info(f"Account balance: {b.currency} total={b.total} free={b.free} locked={b.locked}")
 
     async def _get_account_balance(self) -> list[AccountBalance]:
-        """Backwards-compatible wrapper returning balances only."""
-        balances, _ = await self._get_account_balances()
-        return balances
+        """Backwards-compatible wrapper returning balances only (empty on failure)."""
+        result = await self._get_account_balances()
+        return result[0] if result is not None else []
 
-    async def _get_account_balances(self) -> tuple[list[AccountBalance], list[MarginBalance]]:
+    async def _get_account_balances(self) -> tuple[list[AccountBalance], list[MarginBalance]] | None:
+        """Query funds; ``None`` when OpenD could not be queried."""
         currency = Currency.from_str(FUTU_TRD_MARKET_TO_CURRENCY.get(self._trd_market, "USD"))
         try:
             funds = await asyncio.to_thread(
@@ -461,9 +483,8 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 None,
             )
         except Exception as e:
-            self._log.warning(f"Failed to get funds, using zero balance: {e}")
-            zero = Money(0, currency)
-            return [AccountBalance(total=zero, locked=zero, free=zero)], []
+            self._log.warning(f"Failed to get funds: {e}")
+            return None
 
         balances = parse_funds_to_balances(funds, currency)
         margins: list[MarginBalance] = []
@@ -551,7 +572,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             instrument_id = order.instrument_id
             instrument = self._instrument_for(instrument_id)
             ts_event = self._ts_or_now(order_data.get("update_timestamp"))
-            reason = order_data.get("last_err_msg") or order_data.get("remark") or f"Futu status {order_status_int}"
+            reason = order_data.get("last_err_msg") or f"Futu order status {order_status_int}"
 
             if nt_status == OrderStatus.ACCEPTED:
                 self._on_venue_accepted(order, order_data, venue_order_id, instrument, ts_event)
@@ -611,14 +632,19 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             )
             return
 
+        if order.status == OrderStatus.PENDING_UPDATE:
+            # Our own modify is in flight: `_modify_order` emits OrderUpdated
+            # (or OrderModifyRejected) from the request result, so the venue's
+            # acknowledgement push must not emit a second OrderUpdated.
+            return
+
         new_qty = make_qty(order_data.get("qty"), instrument)
         new_price = make_price(order_data["price"], instrument) if order_data.get("price") else None
         new_trigger = make_price(order_data["aux_price"], instrument) if order_data.get("aux_price") else None
         current_price = order.price if order.has_price else None
         current_trigger = order.trigger_price if order.has_trigger_price else None
         changed = (
-            order.status == OrderStatus.PENDING_UPDATE
-            or new_qty != order.quantity
+            new_qty != order.quantity
             or (new_price is not None and current_price is not None and new_price != current_price)
             or (new_trigger is not None and current_trigger is not None and new_trigger != current_trigger)
         )

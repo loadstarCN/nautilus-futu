@@ -89,12 +89,17 @@ class FutuConnectionManager:
             return True
 
     async def acquire(self) -> bool:
-        """Register a consumer and make sure the link is up."""
+        """Register a consumer and make sure the link is up.
+
+        The consumer is only counted when the link is up afterwards, so a
+        failed connect does not leave a phantom reference behind.
+        """
         async with self._lock:
-            self._refcount += 1
             if self.is_connected:
+                self._refcount += 1
                 return False
             await asyncio.to_thread(self._connect_blocking)
+            self._refcount += 1
             return True
 
     async def release(self) -> None:

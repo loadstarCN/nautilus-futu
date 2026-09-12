@@ -49,6 +49,9 @@ pub struct PyFutuClient {
     /// against the value they last saw to learn that a reconnect happened
     /// (possibly triggered by another consumer) and re-subscribe.
     generation: AtomicU64,
+    /// Serialises `connect()` so two callers can never open two sockets.
+    /// Only ever taken with the GIL released.
+    connect_lock: SyncMutex<()>,
 }
 
 impl PyFutuClient {
@@ -64,8 +67,15 @@ impl PyFutuClient {
     }
 
     /// Like `get_client` but also verifies the recv loop is alive.
+    /// Both "never connected / explicitly disconnected" and "link died" map to
+    /// `ConnectionError` so a polling loop can treat them alike and reconnect.
     fn get_live_client(&self) -> PyResult<Arc<FutuClient>> {
-        let client = self.get_client()?;
+        let client = self
+            .client
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| PyConnectionError::new_err("Not connected to Futu OpenD"))?;
         if !client.is_connected() {
             return Err(PyConnectionError::new_err("Disconnected from Futu OpenD"));
         }
@@ -118,6 +128,7 @@ impl PyFutuClient {
             client: SyncMutex::new(None),
             push_channels: SyncMutex::new(Vec::new()),
             generation: AtomicU64::new(0),
+            connect_lock: SyncMutex::new(()),
         })
     }
 
@@ -142,12 +153,6 @@ impl PyFutuClient {
         rsa_key_path: Option<String>,
         request_timeout_secs: u64,
     ) -> PyResult<()> {
-        if let Some(existing) = self.client.lock().as_ref() {
-            if existing.is_connected() {
-                return Ok(());
-            }
-        }
-
         let config = FutuConfig {
             host: host.to_string(),
             port,
@@ -159,9 +164,19 @@ impl PyFutuClient {
             ..Default::default()
         };
 
-        // Release the GIL during blocking network operations.
-        // No SyncMutex is held here — only `self.runtime` (immutable) is accessed.
-        let client = py.allow_threads(|| {
+        // Everything below runs without the GIL: the connect lock serialises
+        // concurrent callers (a second caller blocks here, then sees the live
+        // connection and returns), and neither the tokio work nor the
+        // channel re-wiring touches Python objects.
+        py.allow_threads(|| {
+            let _serialised = self.connect_lock.lock();
+
+            if let Some(existing) = self.client.lock().as_ref() {
+                if existing.is_connected() {
+                    return Ok(());
+                }
+            }
+
             let mut client = self.runtime.block_on(async {
                 FutuClient::connect(config).await
             }).map_err(|e| e.to_string())?;
@@ -170,15 +185,13 @@ impl PyFutuClient {
                 client.init().await
             }).map_err(|e| e.to_string())?;
 
-            Ok::<_, String>(client)
-        }).map_err(|e| PyRuntimeError::new_err(format!("Connection failed: {}", e)))?;
-
-        let client = Arc::new(client);
-        // Drop the dead client (if any) and install the new one
-        *self.client.lock() = Some(Arc::clone(&client));
-        self.wire_push_channels(&client);
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+            let client = Arc::new(client);
+            // Drop the dead client (if any) and install the new one
+            *self.client.lock() = Some(Arc::clone(&client));
+            self.wire_push_channels(&client);
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(())
+        }).map_err(|e| PyRuntimeError::new_err(format!("Connection failed: {}", e)))
     }
 
     /// Disconnect from Futu OpenD.

@@ -83,12 +83,12 @@ class TestStartPushAppendMode:
             client.poll_push(10)
 
     def test_poll_push_not_connected_raises(self):
-        """poll_push on a registered channel without a connection raises RuntimeError."""
+        """poll_push on a registered channel without a connection raises ConnectionError."""
         from nautilus_futu._rust import PyFutuClient
 
         client = PyFutuClient()
         channel = client.start_push([3005])
-        with pytest.raises(RuntimeError, match="Not connected"):
+        with pytest.raises(ConnectionError, match="Not connected"):
             client.poll_push(channel)
 
 

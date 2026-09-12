@@ -18,21 +18,19 @@ from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_futu.common import (
     futu_security_to_instrument_id,
     instrument_id_to_futu_security,
+    log_futu_notify,
 )
 from nautilus_futu.config import FutuDataClientConfig
 from nautilus_futu.connection import FutuConnectionManager
 from nautilus_futu.constants import (
     FUTU_KL_TYPE_TO_SUB_TYPE,
-    FUTU_NOTIFY_TYPE_CONN_STATUS,
-    FUTU_NOTIFY_TYPE_GTW_EVENT,
-    FUTU_NOTIFY_TYPE_PROGRAM_STATUS,
-    FUTU_NOTIFY_TYPE_USED_QUOTA,
     FUTU_PROTO_BASIC_QOT,
     FUTU_PROTO_KL,
     FUTU_PROTO_NOTIFY,
     FUTU_PROTO_ORDER_BOOK,
     FUTU_PROTO_TICKER,
     FUTU_QOT_MARKET_TO_TZ,
+    FUTU_SUB_TYPE_BASIC,
     FUTU_SUB_TYPE_ORDER_BOOK,
     FUTU_SUB_TYPE_TICKER,
     FUTU_VENUE,
@@ -131,6 +129,9 @@ class FutuLiveDataClient(LiveMarketDataClient):
         self._connect_lock = connect_lock or asyncio.Lock()  # backwards compat
 
         self._subscribed_quote_ticks: set[InstrumentId] = set()
+        # Instruments whose quote ticks come from BasicQot because the order
+        # book stream is not available (no depth quota, e.g. HK BMP accounts)
+        self._quote_fallback_basic: set[InstrumentId] = set()
         self._subscribed_trade_ticks: set[InstrumentId] = set()
         self._subscribed_order_books: dict[InstrumentId, int] = {}  # instrument -> depth
         self._subscribed_bars: dict[tuple[InstrumentId, int], BarType] = {}  # (instrument, kl_type)
@@ -252,10 +253,13 @@ class FutuLiveDataClient(LiveMarketDataClient):
         """Re-subscribe every stream after a (possibly external) reconnect."""
         generation = self._conn.generation
         self._log.info(f"Restoring subscriptions (connection generation {generation})")
-        books = set(self._subscribed_quote_ticks) | set(self._subscribed_order_books)
+        books = (set(self._subscribed_quote_ticks) - self._quote_fallback_basic) | set(self._subscribed_order_books)
         total = 0
         for instrument_id in books:
             if await self._futu_subscribe(instrument_id, FUTU_SUB_TYPE_ORDER_BOOK, True):
+                total += 1
+        for instrument_id in list(self._quote_fallback_basic):
+            if await self._futu_subscribe(instrument_id, FUTU_SUB_TYPE_BASIC, True):
                 total += 1
         for instrument_id in list(self._subscribed_trade_ticks):
             if await self._futu_subscribe(instrument_id, FUTU_SUB_TYPE_TICKER, True):
@@ -277,8 +281,16 @@ class FutuLiveDataClient(LiveMarketDataClient):
         return self._cache.instrument(instrument_id)
 
     def _handle_push_basic_qot(self, data_list: list) -> None:
-        """Basic quote pushes (3005) are not mapped to Nautilus data; kept for diagnostics."""
-        self._log.debug(f"BasicQot push for {len(data_list)} securities ignored")
+        """Basic quote push (3005): quote-tick fallback for instruments without an order book stream."""
+        if not self._quote_fallback_basic:
+            return
+        ts_init = self._clock.timestamp_ns()
+        for data in data_list:
+            instrument_id = futu_security_to_instrument_id(data["market"], data["code"])
+            if instrument_id not in self._quote_fallback_basic or instrument_id not in self._subscribed_quote_ticks:
+                continue
+            tick = parse_futu_quote_tick(data, instrument_id, ts_init, self._instrument_for(instrument_id))
+            self._handle_data(tick)
 
     def _handle_push_ticker(self, data: dict) -> None:
         """Handle ticker push (proto 3011)."""
@@ -298,7 +310,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
         instrument = self._instrument_for(instrument_id)
         ts_init = self._clock.timestamp_ns()
 
-        if instrument_id in self._subscribed_quote_ticks:
+        if instrument_id in self._subscribed_quote_ticks and instrument_id not in self._quote_fallback_basic:
             tick = parse_order_book_to_quote_tick(data, instrument_id, ts_init, instrument)
             if tick is not None:
                 self._handle_data(tick)
@@ -369,22 +381,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
 
     def _handle_push_notify(self, data: dict) -> None:
         """Log OpenD gateway notifications (proto 1003)."""
-        ntype = data.get("type")
-        if ntype == FUTU_NOTIFY_TYPE_GTW_EVENT:
-            event = data.get("event") or {}
-            self._log.warning(f"OpenD gateway event {event.get('event_type')}: {event.get('desc')}")
-        elif ntype == FUTU_NOTIFY_TYPE_CONN_STATUS:
-            status = data.get("connect_status") or {}
-            level = self._log.info if status.get("qot_logined") else self._log.warning
-            level(f"OpenD connection status: qot_logined={status.get('qot_logined')} trd_logined={status.get('trd_logined')}")
-        elif ntype == FUTU_NOTIFY_TYPE_PROGRAM_STATUS:
-            status = data.get("program_status") or {}
-            self._log.info(f"OpenD program status: type={status.get('type')} {status.get('desc') or ''}")
-        elif ntype == FUTU_NOTIFY_TYPE_USED_QUOTA:
-            quota = data.get("used_quota") or {}
-            self._log.info(f"OpenD quota used: subscriptions={quota.get('used_sub_quota')} history_kl={quota.get('used_kline_quota')}")
-        else:
-            self._log.debug(f"OpenD notify: {data}")
+        log_futu_notify(self._log, data)
 
     # ------------------------------------------------------------------
     # Subscriptions
@@ -401,15 +398,31 @@ class FutuLiveDataClient(LiveMarketDataClient):
             return False
 
     def _book_needed(self, instrument_id: InstrumentId) -> bool:
-        return instrument_id in self._subscribed_quote_ticks or instrument_id in self._subscribed_order_books
+        wants_book_quotes = (
+            instrument_id in self._subscribed_quote_ticks and instrument_id not in self._quote_fallback_basic
+        )
+        return wants_book_quotes or instrument_id in self._subscribed_order_books
 
     async def _subscribe_quote_ticks(self, command) -> None:
-        """Subscribe to quote tick updates (level-1 of the order book stream)."""
+        """Subscribe to quote tick updates (level-1 of the order book stream).
+
+        When the order book stream cannot be subscribed (no depth quota for
+        the market), fall back to BasicQot and synthesise bid/ask from the
+        last price and spread, with a warning.
+        """
         instrument_id = getattr(command, "instrument_id", command)
-        already = self._book_needed(instrument_id)
-        if already or await self._futu_subscribe(instrument_id, FUTU_SUB_TYPE_ORDER_BOOK, True):
+        if self._book_needed(instrument_id) or await self._futu_subscribe(instrument_id, FUTU_SUB_TYPE_ORDER_BOOK, True):
+            self._quote_fallback_basic.discard(instrument_id)
             self._subscribed_quote_ticks.add(instrument_id)
             self._log.info(f"Subscribed to quote ticks for {instrument_id}")
+            return
+        if await self._futu_subscribe(instrument_id, FUTU_SUB_TYPE_BASIC, True):
+            self._quote_fallback_basic.add(instrument_id)
+            self._subscribed_quote_ticks.add(instrument_id)
+            self._log.warning(
+                f"Order book stream unavailable for {instrument_id}; quote ticks are synthesised "
+                "from BasicQot (last price and spread), sizes are day volume",
+            )
 
     async def _subscribe_trade_ticks(self, command) -> None:
         """Subscribe to trade tick updates."""
@@ -455,6 +468,10 @@ class FutuLiveDataClient(LiveMarketDataClient):
         """Unsubscribe from quote tick updates."""
         instrument_id = getattr(command, "instrument_id", command)
         self._subscribed_quote_ticks.discard(instrument_id)
+        if instrument_id in self._quote_fallback_basic:
+            self._quote_fallback_basic.discard(instrument_id)
+            await self._futu_subscribe(instrument_id, FUTU_SUB_TYPE_BASIC, False)
+            return
         if not self._book_needed(instrument_id):
             await self._futu_subscribe(instrument_id, FUTU_SUB_TYPE_ORDER_BOOK, False)
 

@@ -58,7 +58,7 @@ class TestBuildFutuOrderParams:
         assert p["price"] == 300.0
         assert p["aux_price"] is None
         assert p["time_in_force"] == FUTU_TIF_DAY
-        assert p["fill_outside_rth"] is False
+        assert p["fill_outside_rth"] is None  # HK order: field omitted
         assert p["remark"] == order.client_order_id.value
 
     def test_nautilus_default_tif_is_gtc(self, factory):
@@ -73,6 +73,12 @@ class TestBuildFutuOrderParams:
         assert p["price"] is None
         assert p["time_in_force"] == FUTU_TIF_GTC
         assert p["fill_outside_rth"] is True
+
+    def test_rth_only_sent_for_us_orders(self, factory):
+        hk = factory.limit(HK.id, OrderSide.BUY, Quantity.from_int(100), Price.from_str("300.000"), tags=["FUTU_RTH:1"])
+        assert build_futu_order_params(hk, default_fill_outside_rth=True)["fill_outside_rth"] is None
+        us = factory.limit(US.id, OrderSide.BUY, Quantity.from_int(1), Price.from_str("190.00"))
+        assert build_futu_order_params(us)["fill_outside_rth"] is False
 
     def test_rth_tag_overrides_default(self, factory):
         order = factory.limit(US.id, OrderSide.BUY, Quantity.from_int(1), Price.from_str("190.00"), tags=["FUTU_RTH:0"])

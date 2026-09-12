@@ -176,8 +176,9 @@ class Harness:
         self.rust.place_order.return_value = {"order_id": 555, "order_id_ex": "EX555"}
         self.rust.modify_order.return_value = None
         self.events: list = []
+        self.account_states: list = []
         self.msgbus.register(endpoint="ExecEngine.process", handler=self._on_event)
-        self.msgbus.register(endpoint="Portfolio.update_account", handler=lambda e: None)
+        self.msgbus.register(endpoint="Portfolio.update_account", handler=self.account_states.append)
 
         config = FutuExecClientConfig(trd_env=0, acc_id=ACC_ID, trd_market=FUTU_TRD_MARKET_HK, **config_kwargs)
         self.client = FutuLiveExecutionClient(
@@ -385,6 +386,24 @@ class TestOrderPush:
         assert len(h.events_of(OrderAccepted)) == 1
         assert len(h.events_of(OrderUpdated)) == 0
 
+    def test_ack_push_during_pending_update_is_silent(self, h):
+        """The modify request path emits OrderUpdated; the venue ack must not duplicate it."""
+        order = h.add_limit_order()
+        h.accept(order)
+        h.pending_update(order)
+        h.client._handle_push_order(h.order_push(price=310.0))
+        assert h.events_of(OrderUpdated) == []
+        assert order.status == OrderStatus.PENDING_UPDATE
+
+    def test_submit_failed_reason_never_leaks_remark(self, h):
+        order = h.add_limit_order()
+        h.cache.add_venue_order_id(order.client_order_id, VenueOrderId("555"))
+        h.client._handle_push_order(h.order_push(status=FUTU_ORDER_STATUS_SUBMIT_FAILED, remark="O-1", last_err_msg=""))
+        rejected = h.events_of(OrderRejected)
+        assert len(rejected) == 1
+        assert "O-1" not in rejected[0].reason
+        assert "status" in rejected[0].reason
+
     def test_accepted_push_with_new_price_generates_updated(self, h):
         order = h.add_limit_order()
         h.accept(order)
@@ -550,6 +569,30 @@ class TestModifyCancel:
         )
         h.run(h.client._cancel_all_orders(cmd))
         assert h.rust.modify_order.call_count == 0
+
+
+class TestAccountRefresh:
+    def test_refresh_failure_keeps_last_state(self, h):
+        h.rust.get_funds.return_value = {"cash": 1000.0, "frozen_cash": 0.0, "currency": 1}
+        h.run(h.client._update_account_state(initial=True))
+        assert len(h.account_states) == 1
+        h.rust.get_funds.side_effect = RuntimeError("Get funds failed: timeout")
+        h.run(h.client._update_account_state())
+        assert len(h.account_states) == 1  # no zero-balance state pushed on a transient failure
+
+    def test_initial_failure_registers_zero_balance(self, h):
+        h.rust.get_funds.side_effect = RuntimeError("Get funds failed: timeout")
+        h.run(h.client._update_account_state(initial=True))
+        assert len(h.account_states) == 1
+        assert float(h.account_states[0].balances[0].total) == 0.0
+
+    def test_account_discovery_treats_missing_status_as_active(self, h):
+        h.client._acc_id = 0
+        h.rust.get_acc_list.return_value = [
+            {"acc_id": 777, "trd_env": 0, "acc_status": None, "trd_market_auth_list": [FUTU_TRD_MARKET_HK], "acc_type": 1},
+        ]
+        h.run(h.client._discover_account())
+        assert h.client._acc_id == 777
 
 
 class TestAccountType:

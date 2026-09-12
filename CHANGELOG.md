@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.1 (2026-09-12)
+
+Second review round after 0.5.0.
+
+### Fixed
+
+- Encrypted transport: AES is only enabled when OpenD actually answered the RSA
+  handshake; an RSA-configured client talking to a plaintext OpenD now stays in
+  plaintext instead of sending AES-encrypted requests it cannot answer.
+- Account refresh failures no longer publish a zero balance (which made the risk
+  engine deny every order); the last known state is kept. The initial connect
+  still registers the account with zeros when the funds query fails.
+- `FutuConnectionManager.acquire()` no longer counts a consumer when the connect
+  fails, so `release()` tears the link down correctly afterwards.
+- Account discovery treats a missing `acc_status` as active instead of skipping
+  the account and falling back to the first one.
+- Rejection reasons no longer fall back to the `remark` (which holds the client
+  order id); the Futu status is reported instead.
+- A venue acknowledgement arriving while a modify is pending no longer emits a
+  duplicate `OrderUpdated`.
+- `fillOutsideRTH` is only sent for US orders.
+- `PyFutuClient.connect()` is serialised with a lock (GIL released), so concurrent
+  callers can never open two sockets; "not connected" and "disconnected" both
+  raise `ConnectionError` from `poll_push` so polling loops reconnect uniformly.
+
+### Added
+
+- Quote-tick fallback: when the order book stream cannot be subscribed (no depth
+  quota, e.g. HK BMP accounts) the client subscribes BasicQot and synthesises
+  bid/ask from last price and spread, with a warning.
+- Gateway notifications (1003) are logged by whichever client opened the
+  connection, so an execution-only setup still reports them.
+
 ## 0.5.0 (2026-09-12)
 
 ### Fixed (critical)
