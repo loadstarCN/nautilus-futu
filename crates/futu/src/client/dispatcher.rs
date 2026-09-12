@@ -33,6 +33,17 @@ impl Dispatcher {
         rx
     }
 
+    /// Remove a pending request (e.g. after the caller timed out) so a late
+    /// response is not mistaken for a push and the map does not grow forever.
+    pub async fn remove_pending(&self, serial_no: u32) -> bool {
+        self.pending.lock().await.remove(&serial_no).is_some()
+    }
+
+    /// Number of in-flight requests (for diagnostics/tests).
+    pub async fn pending_count(&self) -> usize {
+        self.pending.lock().await.len()
+    }
+
     /// Register a push handler for a specific proto_id.
     /// Returns a receiver that will receive push messages.
     pub async fn register_push(&self, proto_id: u32) -> mpsc::UnboundedReceiver<FutuMessage> {
@@ -54,6 +65,12 @@ impl Dispatcher {
         if count > 0 {
             tracing::debug!("Cleared {} pending requests", count);
         }
+    }
+
+    /// Drop all push handler senders so every registered receiver observes
+    /// end-of-stream.  Called when the connection is torn down.
+    pub async fn clear_push_handlers(&self) {
+        self.push_handlers.lock().await.clear();
     }
 
     /// Dispatch an incoming message.
@@ -115,6 +132,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_remove_pending() {
+        let dispatcher = Dispatcher::new();
+        let rx = dispatcher.register_request(7).await;
+        assert_eq!(dispatcher.pending_count().await, 1);
+        assert!(dispatcher.remove_pending(7).await);
+        assert!(!dispatcher.remove_pending(7).await);
+        assert_eq!(dispatcher.pending_count().await, 0);
+        // Sender dropped -> receiver errors instead of hanging
+        assert!(rx.await.is_err());
+    }
+
+    #[tokio::test]
     async fn test_push_dispatch() {
         let dispatcher = Dispatcher::new();
         let mut rx = dispatcher.register_push(3001).await;
@@ -136,6 +165,14 @@ mod tests {
         let r2 = rx2.recv().await.unwrap();
         assert_eq!(r1.body, b"broadcast");
         assert_eq!(r2.body, b"broadcast");
+    }
+
+    #[tokio::test]
+    async fn test_clear_push_handlers_closes_receivers() {
+        let dispatcher = Dispatcher::new();
+        let mut rx = dispatcher.register_push(3005).await;
+        dispatcher.clear_push_handlers().await;
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]

@@ -65,21 +65,31 @@ class TestPyFutuClientIsConnected:
 class TestStartPushAppendMode:
     """Tests for start_push append mode."""
 
-    def test_start_push_requires_connection(self):
-        """start_push should raise when not connected."""
+    def test_start_push_works_before_connection(self):
+        """Channels can be registered up front; they attach on the next connect()."""
         from nautilus_futu._rust import PyFutuClient
 
         client = PyFutuClient()
+        assert client.start_push([3005]) == 0
+        assert client.start_push([2208, 2218]) == 1
+        assert client.connection_generation() == 0
+
+    def test_poll_push_unknown_channel_raises(self):
+        """poll_push on an unregistered channel is a programming error."""
+        from nautilus_futu._rust import PyFutuClient
+
+        client = PyFutuClient()
+        with pytest.raises(RuntimeError, match="Unknown push channel"):
+            client.poll_push(10)
+
+    def test_poll_push_not_connected_raises(self):
+        """poll_push on a registered channel without a connection raises RuntimeError."""
+        from nautilus_futu._rust import PyFutuClient
+
+        client = PyFutuClient()
+        channel = client.start_push([3005])
         with pytest.raises(RuntimeError, match="Not connected"):
-            client.start_push([3005])
-
-    def test_poll_push_without_start_returns_none(self):
-        """poll_push before start_push should return None."""
-        from nautilus_futu._rust import PyFutuClient
-
-        client = PyFutuClient()
-        result = client.poll_push(10)
-        assert result is None
+            client.poll_push(channel)
 
 
 class TestGetGlobalState:

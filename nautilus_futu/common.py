@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+from nautilus_trader.model.identifiers import InstrumentId, Symbol
 
-from nautilus_futu.constants import FUTU_MARKET_TO_VENUE, VENUE_TO_FUTU_MARKET, FUTU_VENUE
+from nautilus_futu.constants import FUTU_MARKET_TO_VENUE, FUTU_VENUE, VENUE_TO_FUTU_MARKET
 
 
 def futu_security_to_instrument_id(market: int, code: str) -> InstrumentId:

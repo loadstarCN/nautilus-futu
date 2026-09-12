@@ -1,5 +1,6 @@
 """Comprehensive test for Futu OpenD adapter (pip installed version)."""
 import time
+
 from nautilus_futu._rust import PyFutuClient
 
 PASS = "[PASS]"
@@ -139,7 +140,7 @@ def main():
             import hashlib
             pwd_md5 = hashlib.md5(b"123456").hexdigest()
             client.unlock_trade(True, pwd_md5)
-            print(f"    Trade unlocked!")
+            print("    Trade unlocked!")
 
             # Place a limit buy order for 00700.HK at a very low price
             # trd_market: 1=HK, trd_side: 1=Buy, order_type: 2=Limit

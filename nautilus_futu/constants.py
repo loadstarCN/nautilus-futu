@@ -11,6 +11,19 @@ SSE_VENUE = Venue("SSE")
 SZSE_VENUE = Venue("SZSE")
 SGX_VENUE = Venue("SGX")
 
+# Venues the adapter registers for routing so that `00700.HKEX`, `AAPL.NYSE`
+# etc. reach the FUTU data/execution clients without extra configuration.
+FUTU_ROUTING_VENUES: frozenset[str] = frozenset(
+    {
+        HKEX_VENUE.value,
+        NYSE_VENUE.value,
+        NASDAQ_VENUE.value,
+        SSE_VENUE.value,
+        SZSE_VENUE.value,
+        SGX_VENUE.value,
+    }
+)
+
 # Futu QotMarket values
 FUTU_QOT_MARKET_HK = 1
 FUTU_QOT_MARKET_HK_FUTURE = 2
@@ -39,6 +52,17 @@ VENUE_TO_FUTU_MARKET = {
     SGX_VENUE: FUTU_QOT_MARKET_SG,
 }
 
+# Futu QotMarket -> IANA time zone (OpenD history K-line time strings are in
+# the market's local time; K-line `timestamp` fields are UTC epoch seconds).
+FUTU_QOT_MARKET_TO_TZ = {
+    FUTU_QOT_MARKET_HK: "Asia/Hong_Kong",
+    FUTU_QOT_MARKET_HK_FUTURE: "Asia/Hong_Kong",
+    FUTU_QOT_MARKET_US: "America/New_York",
+    FUTU_QOT_MARKET_CNSH: "Asia/Shanghai",
+    FUTU_QOT_MARKET_CNSZ: "Asia/Shanghai",
+    FUTU_QOT_MARKET_SG: "Asia/Singapore",
+}
+
 # Futu TrdMarket values
 FUTU_TRD_MARKET_HK = 1
 FUTU_TRD_MARKET_US = 2
@@ -55,12 +79,28 @@ FUTU_TRD_MARKET_TO_VENUE = {
     FUTU_TRD_MARKET_FUTURES: HKEX_VENUE,
 }
 
-# Futu proto Currency enum values (for get_funds request)
+# Venue -> Futu TrdMarket (which trading market a venue's orders go through)
+VENUE_TO_FUTU_TRD_MARKET = {
+    HKEX_VENUE: FUTU_TRD_MARKET_HK,
+    NYSE_VENUE: FUTU_TRD_MARKET_US,
+    NASDAQ_VENUE: FUTU_TRD_MARKET_US,
+    SSE_VENUE: FUTU_TRD_MARKET_CN,
+    SZSE_VENUE: FUTU_TRD_MARKET_CN,
+}
+
+# Futu TrdAccType values
+FUTU_ACC_TYPE_CASH = 1
+FUTU_ACC_TYPE_MARGIN = 2
+
+# Futu proto Currency enum values (Trd_Common.Currency)
 FUTU_CURRENCY_HKD = 1
 FUTU_CURRENCY_USD = 2
 FUTU_CURRENCY_CNH = 3
 FUTU_CURRENCY_JPY = 4
 FUTU_CURRENCY_SGD = 5
+FUTU_CURRENCY_AUD = 6
+FUTU_CURRENCY_CAD = 7
+FUTU_CURRENCY_MYR = 8
 
 # Futu proto currency int -> NautilusTrader currency string
 FUTU_CURRENCY_TO_STR: dict[int, str] = {
@@ -69,6 +109,25 @@ FUTU_CURRENCY_TO_STR: dict[int, str] = {
     FUTU_CURRENCY_CNH: "CNH",
     FUTU_CURRENCY_JPY: "JPY",
     FUTU_CURRENCY_SGD: "SGD",
+    FUTU_CURRENCY_AUD: "AUD",
+    FUTU_CURRENCY_CAD: "CAD",
+    FUTU_CURRENCY_MYR: "MYR",
+}
+
+# Trading market -> settlement currency string / Futu currency enum
+FUTU_TRD_MARKET_TO_CURRENCY: dict[int, str] = {
+    FUTU_TRD_MARKET_HK: "HKD",
+    FUTU_TRD_MARKET_US: "USD",
+    FUTU_TRD_MARKET_CN: "CNH",
+    FUTU_TRD_MARKET_HKCC: "CNH",
+    FUTU_TRD_MARKET_FUTURES: "HKD",
+}
+FUTU_TRD_MARKET_TO_FUTU_CURRENCY: dict[int, int] = {
+    FUTU_TRD_MARKET_HK: FUTU_CURRENCY_HKD,
+    FUTU_TRD_MARKET_US: FUTU_CURRENCY_USD,
+    FUTU_TRD_MARKET_CN: FUTU_CURRENCY_CNH,
+    FUTU_TRD_MARKET_HKCC: FUTU_CURRENCY_CNH,
+    FUTU_TRD_MARKET_FUTURES: FUTU_CURRENCY_HKD,
 }
 
 # Currencies to query for multi-currency accounts (unified/futures)
@@ -90,6 +149,9 @@ FUTU_SUB_TYPE_KL_15MIN = 8
 FUTU_SUB_TYPE_KL_30MIN = 9
 FUTU_SUB_TYPE_KL_60MIN = 10
 FUTU_SUB_TYPE_KL_1MIN = 11
+FUTU_SUB_TYPE_KL_WEEK = 12
+FUTU_SUB_TYPE_KL_MONTH = 13
+FUTU_SUB_TYPE_BROKER = 14
 
 # Futu KLType values
 FUTU_KL_TYPE_1MIN = 1
@@ -101,11 +163,54 @@ FUTU_KL_TYPE_15MIN = 7
 FUTU_KL_TYPE_30MIN = 8
 FUTU_KL_TYPE_60MIN = 9
 
-# Futu OrderType values
-FUTU_ORDER_TYPE_NORMAL = 1
+# SubType (subscription) <-> KLType (K-line push payload) for K-line streams
+FUTU_SUB_TYPE_TO_KL_TYPE: dict[int, int] = {
+    FUTU_SUB_TYPE_KL_1MIN: FUTU_KL_TYPE_1MIN,
+    FUTU_SUB_TYPE_KL_5MIN: FUTU_KL_TYPE_5MIN,
+    FUTU_SUB_TYPE_KL_15MIN: FUTU_KL_TYPE_15MIN,
+    FUTU_SUB_TYPE_KL_30MIN: FUTU_KL_TYPE_30MIN,
+    FUTU_SUB_TYPE_KL_60MIN: FUTU_KL_TYPE_60MIN,
+    FUTU_SUB_TYPE_KL_DAY: FUTU_KL_TYPE_DAY,
+    FUTU_SUB_TYPE_KL_WEEK: FUTU_KL_TYPE_WEEK,
+    FUTU_SUB_TYPE_KL_MONTH: FUTU_KL_TYPE_MONTH,
+}
+FUTU_KL_TYPE_TO_SUB_TYPE: dict[int, int] = {v: k for k, v in FUTU_SUB_TYPE_TO_KL_TYPE.items()}
+
+# Futu RehabType values
+FUTU_REHAB_TYPE_NONE = 0
+FUTU_REHAB_TYPE_FORWARD = 1
+FUTU_REHAB_TYPE_BACKWARD = 2
+
+# Futu OrderType values (Trd_Common.OrderType)
+FUTU_ORDER_TYPE_UNKNOWN = 0
+FUTU_ORDER_TYPE_NORMAL = 1  # limit order
 FUTU_ORDER_TYPE_MARKET = 2
-FUTU_ORDER_TYPE_ABSOLUTE_LIMIT = 5
-FUTU_ORDER_TYPE_AUCTION = 6
+FUTU_ORDER_TYPE_ABSOLUTE_LIMIT = 5  # HK only
+FUTU_ORDER_TYPE_AUCTION = 6  # HK only
+FUTU_ORDER_TYPE_AUCTION_LIMIT = 7  # HK only
+FUTU_ORDER_TYPE_SPECIAL_LIMIT = 8  # HK only
+FUTU_ORDER_TYPE_SPECIAL_LIMIT_ALL = 9  # HK only
+FUTU_ORDER_TYPE_STOP = 10
+FUTU_ORDER_TYPE_STOP_LIMIT = 11
+FUTU_ORDER_TYPE_MARKET_IF_TOUCHED = 12
+FUTU_ORDER_TYPE_LIMIT_IF_TOUCHED = 13
+FUTU_ORDER_TYPE_TRAILING_STOP = 14
+FUTU_ORDER_TYPE_TRAILING_STOP_LIMIT = 15
+FUTU_ORDER_TYPE_TWAP_MARKET = 16
+FUTU_ORDER_TYPE_TWAP_LIMIT = 17
+FUTU_ORDER_TYPE_VWAP_MARKET = 18
+FUTU_ORDER_TYPE_VWAP_LIMIT = 19
+
+# Futu TrailType values
+FUTU_TRAIL_TYPE_RATIO = 1  # percent
+FUTU_TRAIL_TYPE_AMOUNT = 2  # absolute price
+
+# Futu ModifyOrderOp values
+FUTU_MODIFY_ORDER_OP_NORMAL = 1
+FUTU_MODIFY_ORDER_OP_CANCEL = 2
+FUTU_MODIFY_ORDER_OP_DISABLE = 3
+FUTU_MODIFY_ORDER_OP_ENABLE = 4
+FUTU_MODIFY_ORDER_OP_DELETE = 5
 
 # Futu TrdSide values
 FUTU_TRD_SIDE_BUY = 1
@@ -153,6 +258,21 @@ FUTU_ORDER_STATUS_DISABLED = 22
 FUTU_ORDER_STATUS_DELETED = 23
 FUTU_ORDER_STATUS_FILL_CANCELLED = 24
 
+# Order statuses that are still working at the venue
+FUTU_ORDER_STATUS_ACTIVE: frozenset[int] = frozenset(
+    {
+        FUTU_ORDER_STATUS_WAITING_SUBMIT,
+        FUTU_ORDER_STATUS_SUBMITTING,
+        FUTU_ORDER_STATUS_SUBMITTED,
+        FUTU_ORDER_STATUS_FILLED_PART,
+    }
+)
+
+# Futu OrderFillStatus values
+FUTU_FILL_STATUS_OK = 0
+FUTU_FILL_STATUS_CANCELLED = 1
+FUTU_FILL_STATUS_CHANGED = 2
+
 # Futu TimeInForce values
 FUTU_TIF_DAY = 0
 FUTU_TIF_GTC = 1
@@ -169,13 +289,28 @@ FUTU_TICKER_DIR_ASK = 2
 FUTU_OPTION_TYPE_CALL = 1
 FUTU_OPTION_TYPE_PUT = 2
 
-# Futu QotMarket -> Currency mapping
+# Futu SecurityType values (Qot_Common.SecurityType)
+FUTU_SEC_TYPE_UNKNOWN = 0
+FUTU_SEC_TYPE_BOND = 1
+FUTU_SEC_TYPE_BWRT = 2
+FUTU_SEC_TYPE_STOCK = 3
+FUTU_SEC_TYPE_ETF = 4
+FUTU_SEC_TYPE_WARRANT = 5
+FUTU_SEC_TYPE_IDX = 6
+FUTU_SEC_TYPE_PLATE = 7
+FUTU_SEC_TYPE_DRVT = 8  # options
+FUTU_SEC_TYPE_PLATESET = 9
+FUTU_SEC_TYPE_FUTURE = 10
+
+# Futu QotMarket -> Currency mapping.  Futu reports CN cash as CNH (offshore
+# RMB, the only RMB currency in its Currency enum) so instruments use the same
+# code to keep fills and balances in one currency.
 FUTU_QOT_MARKET_TO_CURRENCY = {
     FUTU_QOT_MARKET_HK: "HKD",
     FUTU_QOT_MARKET_HK_FUTURE: "HKD",
     FUTU_QOT_MARKET_US: "USD",
-    FUTU_QOT_MARKET_CNSH: "CNY",
-    FUTU_QOT_MARKET_CNSZ: "CNY",
+    FUTU_QOT_MARKET_CNSH: "CNH",
+    FUTU_QOT_MARKET_CNSZ: "CNH",
     FUTU_QOT_MARKET_SG: "SGD",
 }
 
@@ -189,9 +324,22 @@ FUTU_TRD_SEC_MARKET_TO_QOT_MARKET = {
 }
 
 # Futu push protocol IDs
+FUTU_PROTO_NOTIFY = 1003
 FUTU_PROTO_BASIC_QOT = 3005
 FUTU_PROTO_KL = 3007
 FUTU_PROTO_TICKER = 3011
 FUTU_PROTO_ORDER_BOOK = 3013
 FUTU_PROTO_TRD_ORDER = 2208
 FUTU_PROTO_TRD_FILL = 2218
+
+# Notify (1003) types
+FUTU_NOTIFY_TYPE_GTW_EVENT = 1
+FUTU_NOTIFY_TYPE_PROGRAM_STATUS = 2
+FUTU_NOTIFY_TYPE_CONN_STATUS = 3
+FUTU_NOTIFY_TYPE_QOT_RIGHT = 4
+FUTU_NOTIFY_TYPE_API_LEVEL = 5
+FUTU_NOTIFY_TYPE_API_QUOTA = 6
+FUTU_NOTIFY_TYPE_USED_QUOTA = 7
+
+# Order tag understood by the execution client (e.g. tags=["FUTU_RTH:1"])
+FUTU_TAG_FILL_OUTSIDE_RTH = "FUTU_RTH"

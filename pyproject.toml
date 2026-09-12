@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "nautilus-futu"
-version = "0.4.2"
+version = "0.5.0"
 description = "Futu OpenD adapter for NautilusTrader"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -20,7 +20,16 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
 ]
 dependencies = [
-    "nautilus_trader>=1.221",
+    "nautilus_trader>=1.222",
+    "tzdata; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "maturin>=1.0,<2.0",
+    "pytest>=7.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
 ]
 
 [project.urls]
@@ -30,3 +39,33 @@ Repository = "https://github.com/loadstarCN/nautilus-futu"
 features = ["pyo3/extension-module"]
 manifest-path = "crates/futu/Cargo.toml"
 module-name = "nautilus_futu._rust"
+include = ["nautilus_futu/_rust.pyi", "nautilus_futu/py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["examples/full_example.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",  # line length handled by the formatter
+    "B008",  # function calls in argument defaults (config defaults)
+    "B904",  # raise ... from err inside except (adapter error wrapping)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nautilus_futu"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["nautilus_futu"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = true

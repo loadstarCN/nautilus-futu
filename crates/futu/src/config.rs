@@ -11,7 +11,12 @@ pub struct FutuConfig {
     pub client_id: String,
     /// Client version string
     pub client_ver: i32,
-    /// Path to RSA private key file (optional, for encrypted connections)
+    /// Path to RSA private key file (optional, for encrypted connections).
+    ///
+    /// When set, the `InitConnect` handshake is RSA-encrypted with this key and
+    /// all subsequent packets are AES-ECB encrypted with the key returned by
+    /// OpenD.  The same private key must be configured in OpenD
+    /// (`rsa_private_key` in FutuOpenD.xml).
     pub rsa_key_path: Option<PathBuf>,
     /// Enable AES encryption (requires RSA keys configured in FutuOpenD)
     pub enable_encryption: bool,
@@ -19,6 +24,9 @@ pub struct FutuConfig {
     pub reconnect: bool,
     /// Reconnect interval in seconds
     pub reconnect_interval_secs: u64,
+    /// Maximum time to wait for a response to a request before failing with
+    /// `ConnectionError::Timeout` (default: 15s).
+    pub request_timeout_secs: u64,
 }
 
 impl Default for FutuConfig {
@@ -32,6 +40,7 @@ impl Default for FutuConfig {
             enable_encryption: false,
             reconnect: true,
             reconnect_interval_secs: 5,
+            request_timeout_secs: 15,
         }
     }
 }
@@ -51,6 +60,7 @@ mod tests {
         assert!(!config.enable_encryption);
         assert!(config.reconnect);
         assert_eq!(config.reconnect_interval_secs, 5);
+        assert_eq!(config.request_timeout_secs, 15);
     }
 
     #[test]
@@ -64,6 +74,7 @@ mod tests {
             enable_encryption: true,
             reconnect: false,
             reconnect_interval_secs: 10,
+            request_timeout_secs: 3,
         };
         assert_eq!(config.host, "192.168.1.100");
         assert_eq!(config.port, 22222);
@@ -73,6 +84,7 @@ mod tests {
         assert!(config.enable_encryption);
         assert!(!config.reconnect);
         assert_eq!(config.reconnect_interval_secs, 10);
+        assert_eq!(config.request_timeout_secs, 3);
     }
 
     #[test]

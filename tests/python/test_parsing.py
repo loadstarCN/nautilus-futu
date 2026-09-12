@@ -2,6 +2,26 @@
 
 import pytest
 
+from nautilus_futu.constants import (
+    FUTU_KL_TYPE_1MIN,
+    FUTU_KL_TYPE_DAY,
+    FUTU_ORDER_TYPE_MARKET,
+    FUTU_ORDER_TYPE_NORMAL,
+    FUTU_QOT_MARKET_HK,
+    FUTU_QOT_MARKET_US,
+    FUTU_SUB_TYPE_KL_1MIN,
+    FUTU_SUB_TYPE_KL_DAY,
+    FUTU_TRD_SEC_MARKET_CN_SH,
+    FUTU_TRD_SEC_MARKET_HK,
+    FUTU_TRD_SEC_MARKET_US,
+    FUTU_TRD_SIDE_BUY,
+    FUTU_TRD_SIDE_SELL,
+    FUTU_TRD_SIDE_SELL_SHORT,
+)
+from nautilus_futu.parsing.market_data import (
+    bar_spec_to_futu_kl_type,
+    bar_spec_to_futu_sub_type,
+)
 from nautilus_futu.parsing.orders import (
     futu_order_status_to_nautilus,
     futu_order_type_to_nautilus,
@@ -12,28 +32,8 @@ from nautilus_futu.parsing.orders import (
     parse_futu_fill_to_report,
     parse_futu_order_to_report,
     parse_futu_position_to_report,
-    sec_market_to_qot_market,
     qot_market_to_currency,
-)
-from nautilus_futu.parsing.market_data import (
-    bar_spec_to_futu_kl_type,
-    bar_spec_to_futu_sub_type,
-)
-from nautilus_futu.constants import (
-    FUTU_KL_TYPE_1MIN,
-    FUTU_KL_TYPE_DAY,
-    FUTU_ORDER_TYPE_MARKET,
-    FUTU_ORDER_TYPE_NORMAL,
-    FUTU_QOT_MARKET_HK,
-    FUTU_QOT_MARKET_US,
-    FUTU_SUB_TYPE_KL_1MIN,
-    FUTU_SUB_TYPE_KL_DAY,
-    FUTU_TRD_SIDE_BUY,
-    FUTU_TRD_SIDE_SELL,
-    FUTU_TRD_SIDE_SELL_SHORT,
-    FUTU_TRD_SEC_MARKET_HK,
-    FUTU_TRD_SEC_MARKET_US,
-    FUTU_TRD_SEC_MARKET_CN_SH,
+    sec_market_to_qot_market,
 )
 
 
@@ -128,7 +128,29 @@ class TestOrderConversionEdgeCases:
         from nautilus_trader.model.enums import OrderType
 
         with pytest.raises(ValueError, match="Unsupported order type"):
-            nautilus_order_type_to_futu(OrderType.STOP_MARKET)
+            nautilus_order_type_to_futu(OrderType.MARKET_TO_LIMIT)
+
+    def test_conditional_order_types_supported(self):
+        from nautilus_trader.model.enums import OrderType
+
+        from nautilus_futu.constants import (
+            FUTU_ORDER_TYPE_LIMIT_IF_TOUCHED,
+            FUTU_ORDER_TYPE_MARKET_IF_TOUCHED,
+            FUTU_ORDER_TYPE_STOP,
+            FUTU_ORDER_TYPE_STOP_LIMIT,
+            FUTU_ORDER_TYPE_TRAILING_STOP,
+            FUTU_ORDER_TYPE_TRAILING_STOP_LIMIT,
+        )
+
+        assert nautilus_order_type_to_futu(OrderType.STOP_MARKET) == FUTU_ORDER_TYPE_STOP
+        assert nautilus_order_type_to_futu(OrderType.STOP_LIMIT) == FUTU_ORDER_TYPE_STOP_LIMIT
+        assert nautilus_order_type_to_futu(OrderType.MARKET_IF_TOUCHED) == FUTU_ORDER_TYPE_MARKET_IF_TOUCHED
+        assert nautilus_order_type_to_futu(OrderType.LIMIT_IF_TOUCHED) == FUTU_ORDER_TYPE_LIMIT_IF_TOUCHED
+        assert nautilus_order_type_to_futu(OrderType.TRAILING_STOP_MARKET) == FUTU_ORDER_TYPE_TRAILING_STOP
+        assert nautilus_order_type_to_futu(OrderType.TRAILING_STOP_LIMIT) == FUTU_ORDER_TYPE_TRAILING_STOP_LIMIT
+        # and back
+        assert futu_order_type_to_nautilus(FUTU_ORDER_TYPE_STOP_LIMIT) == OrderType.STOP_LIMIT
+        assert futu_order_type_to_nautilus(FUTU_ORDER_TYPE_TRAILING_STOP) == OrderType.TRAILING_STOP_MARKET
 
     def test_unknown_futu_order_type_defaults_to_limit(self):
         """Unknown Futu order type should default to LIMIT."""
@@ -139,6 +161,7 @@ class TestOrderConversionEdgeCases:
     def test_futu_trd_side_buy_back(self):
         """Futu BUY_BACK(4) should map to Nautilus BUY."""
         from nautilus_trader.model.enums import OrderSide
+
         from nautilus_futu.constants import FUTU_TRD_SIDE_BUY_BACK
 
         assert futu_trd_side_to_nautilus(FUTU_TRD_SIDE_BUY_BACK) == OrderSide.BUY
@@ -146,6 +169,7 @@ class TestOrderConversionEdgeCases:
     def test_futu_order_type_unknown_logs_warning(self, caplog):
         """Unknown Futu order type should return LIMIT and log a warning."""
         import logging
+
         from nautilus_trader.model.enums import OrderType
 
         with caplog.at_level(logging.WARNING, logger="nautilus_futu.parsing.orders"):
@@ -212,6 +236,7 @@ class TestOrderStatusConversion:
 
     def test_unknown_status_defaults_to_initialized(self, caplog):
         import logging
+
         from nautilus_trader.model.enums import OrderStatus
         with caplog.at_level(logging.WARNING, logger="nautilus_futu.parsing.orders"):
             result = futu_order_status_to_nautilus(999)

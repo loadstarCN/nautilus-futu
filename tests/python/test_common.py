@@ -1,6 +1,5 @@
 """Tests for Futu common utilities."""
 
-import pytest
 
 from nautilus_futu.common import (
     futu_security_to_instrument_id,
@@ -73,6 +72,7 @@ class TestSymbolConversionExtended:
 
     def test_instrument_id_to_futu_cn_sz(self):
         from nautilus_trader.model.identifiers import InstrumentId, Symbol
+
         from nautilus_futu.constants import SZSE_VENUE
 
         instrument_id = InstrumentId(Symbol("000001"), SZSE_VENUE)
@@ -82,6 +82,7 @@ class TestSymbolConversionExtended:
 
     def test_instrument_id_to_futu_sg(self):
         from nautilus_trader.model.identifiers import InstrumentId, Symbol
+
         from nautilus_futu.constants import SGX_VENUE
 
         instrument_id = InstrumentId(Symbol("D05"), SGX_VENUE)
@@ -92,6 +93,7 @@ class TestSymbolConversionExtended:
     def test_instrument_id_to_futu_nasdaq(self):
         """NASDAQ venue should also map to market=11 (US)."""
         from nautilus_trader.model.identifiers import InstrumentId, Symbol
+
         from nautilus_futu.constants import NASDAQ_VENUE
 
         instrument_id = InstrumentId(Symbol("TSLA"), NASDAQ_VENUE)

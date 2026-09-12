@@ -3,22 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 from nautilus_trader.model.data import QuoteTick, TradeTick
 from nautilus_trader.model.enums import AggressorSide
-from nautilus_trader.model.identifiers import InstrumentId, Symbol, TradeId, Venue
 
 from nautilus_futu.common import futu_security_to_instrument_id
 from nautilus_futu.constants import (
-    FUTU_SUB_TYPE_BASIC,
-    FUTU_SUB_TYPE_ORDER_BOOK,
-    FUTU_SUB_TYPE_TICKER,
     FUTU_SUB_TYPE_KL_1MIN,
-    HKEX_VENUE,
-    NYSE_VENUE,
+    FUTU_SUB_TYPE_ORDER_BOOK,
 )
 
 
@@ -52,12 +44,9 @@ class TestUnsubscribeMethods:
         mock_client = MockClient()
 
         async def run():
-            from nautilus_futu.data import FutuLiveDataClient
-            from nautilus_futu.config import FutuDataClientConfig
 
             # We can't fully instantiate DataClient without NautilusTrader internals,
             # so we test the logic via the mock directly.
-            instrument_id = futu_security_to_instrument_id(1, "00700")
             market, code = 1, "00700"
 
             mock_client.subscribe([(market, code)], [FUTU_SUB_TYPE_ORDER_BOOK], False)
@@ -74,7 +63,6 @@ class TestUnsubscribeMethods:
         mock_client = MockClient()
 
         async def run():
-            instrument_id = futu_security_to_instrument_id(1, "00700")
             market, code = 1, "00700"
 
             mock_client.subscribe([(market, code)], [FUTU_SUB_TYPE_KL_1MIN], False)
@@ -119,8 +107,9 @@ class TestRequestInstrument:
         ]
 
         result = mock_client.get_static_info([(11, "AAPL_OPT")])
-        from nautilus_futu.parsing.instruments import parse_futu_instrument
         from nautilus_trader.model.instruments import OptionContract
+
+        from nautilus_futu.parsing.instruments import parse_futu_instrument
         instrument = parse_futu_instrument(result[0])
         assert instrument is not None
         assert isinstance(instrument, OptionContract)

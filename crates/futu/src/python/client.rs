@@ -1,8 +1,9 @@
 #![allow(clippy::useless_conversion)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use pyo3::prelude::*;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyConnectionError, PyRuntimeError};
 use parking_lot::Mutex as SyncMutex;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, Mutex};
@@ -14,6 +15,24 @@ type PushMessage = (u32, Vec<u8>);
 type PushSender = mpsc::UnboundedSender<PushMessage>;
 type PushReceiver = Arc<Mutex<mpsc::UnboundedReceiver<PushMessage>>>;
 
+enum PollOutcome {
+    Message(PushMessage),
+    Timeout,
+    Disconnected,
+}
+
+/// One consumer of push messages (a data client or an execution client).
+///
+/// The channel outlives the TCP connection: on every (re)connect the
+/// forwarder tasks are rebuilt from `proto_ids`, so a `channel_id` handed out
+/// by `start_push()` stays valid for the life of the `PyFutuClient`.
+struct PushChannel {
+    tx: PushSender,
+    rx: PushReceiver,
+    proto_ids: Vec<u32>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
 /// Python-facing Futu client.
 ///
 /// All `#[pymethods]` take `&self` (not `&mut self`) to avoid PyO3's internal
@@ -23,10 +42,13 @@ type PushReceiver = Arc<Mutex<mpsc::UnboundedReceiver<PushMessage>>>;
 pub struct PyFutuClient {
     runtime: Runtime,
     client: SyncMutex<Option<Arc<FutuClient>>>,
-    /// Each `start_push()` call creates its own channel pair so data and
+    /// Each `start_push()` call creates its own channel so data and
     /// execution clients don't compete for the same receiver.
-    push_channels: SyncMutex<Vec<(PushSender, PushReceiver)>>,
-    push_handles: SyncMutex<Vec<tokio::task::JoinHandle<()>>>,
+    push_channels: SyncMutex<Vec<PushChannel>>,
+    /// Incremented on every successful `connect()`.  Consumers compare it
+    /// against the value they last saw to learn that a reconnect happened
+    /// (possibly triggered by another consumer) and re-subscribe.
+    generation: AtomicU64,
 }
 
 impl PyFutuClient {
@@ -40,6 +62,49 @@ impl PyFutuClient {
             .cloned()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))
     }
+
+    /// Like `get_client` but also verifies the recv loop is alive.
+    fn get_live_client(&self) -> PyResult<Arc<FutuClient>> {
+        let client = self.get_client()?;
+        if !client.is_connected() {
+            return Err(PyConnectionError::new_err("Disconnected from Futu OpenD"));
+        }
+        Ok(client)
+    }
+
+    /// (Re)build the forwarder tasks of every registered push channel against
+    /// `client`.  Must be called with no `SyncMutex` held by the caller.
+    fn wire_push_channels(&self, client: &Arc<FutuClient>) {
+        let mut channels = self.push_channels.lock();
+        for channel in channels.iter_mut() {
+            for handle in channel.handles.drain(..) {
+                handle.abort();
+            }
+            for proto_id in channel.proto_ids.clone() {
+                let mut push_rx = self.runtime.block_on(client.subscribe_push(proto_id));
+                let tx = channel.tx.clone();
+                let handle = self.runtime.spawn(async move {
+                    while let Some(msg) = push_rx.recv().await {
+                        if tx.send((msg.proto_id, msg.body)).is_err() {
+                            break;
+                        }
+                    }
+                });
+                channel.handles.push(handle);
+            }
+        }
+    }
+
+    /// Abort every forwarder task but keep the channels (and any queued
+    /// messages) so consumers survive a reconnect.
+    fn unwire_push_channels(&self) {
+        let mut channels = self.push_channels.lock();
+        for channel in channels.iter_mut() {
+            for handle in channel.handles.drain(..) {
+                handle.abort();
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -52,11 +117,21 @@ impl PyFutuClient {
             runtime,
             client: SyncMutex::new(None),
             push_channels: SyncMutex::new(Vec::new()),
-            push_handles: SyncMutex::new(Vec::new()),
+            generation: AtomicU64::new(0),
         })
     }
 
     /// Connect to Futu OpenD gateway.
+    ///
+    /// Idempotent: returns immediately when a live connection already exists.
+    /// When the previous connection has died, it is replaced and every push
+    /// channel created by `start_push()` is re-attached to the new one.
+    ///
+    /// `rsa_key_path`: PEM private key shared with OpenD to enable the
+    /// RSA/AES encrypted transport.  `request_timeout_secs`: per-request
+    /// response deadline.
+    #[pyo3(signature = (host, port, client_id, client_ver, rsa_key_path=None, request_timeout_secs=15))]
+    #[allow(clippy::too_many_arguments)]
     fn connect(
         &self,
         py: Python<'_>,
@@ -64,12 +139,23 @@ impl PyFutuClient {
         port: u16,
         client_id: &str,
         client_ver: i32,
+        rsa_key_path: Option<String>,
+        request_timeout_secs: u64,
     ) -> PyResult<()> {
+        if let Some(existing) = self.client.lock().as_ref() {
+            if existing.is_connected() {
+                return Ok(());
+            }
+        }
+
         let config = FutuConfig {
             host: host.to_string(),
             port,
             client_id: client_id.to_string(),
             client_ver,
+            rsa_key_path: rsa_key_path.map(std::path::PathBuf::from),
+            enable_encryption: false,
+            request_timeout_secs,
             ..Default::default()
         };
 
@@ -87,33 +173,57 @@ impl PyFutuClient {
             Ok::<_, String>(client)
         }).map_err(|e| PyRuntimeError::new_err(format!("Connection failed: {}", e)))?;
 
-        // Brief lock to store the connected client
-        *self.client.lock() = Some(Arc::new(client));
+        let client = Arc::new(client);
+        // Drop the dead client (if any) and install the new one
+        *self.client.lock() = Some(Arc::clone(&client));
+        self.wire_push_channels(&client);
+        self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
     /// Disconnect from Futu OpenD.
+    ///
+    /// Push channels are kept so a later `connect()` re-attaches them.
     fn disconnect(&self, py: Python<'_>) -> PyResult<()> {
-        // Abort push forwarder tasks
-        for handle in self.push_handles.lock().drain(..) {
-            handle.abort();
-        }
-        self.push_channels.lock().clear();
+        self.unwire_push_channels();
 
-        // Clear pending requests so callers don't hang forever
-        if let Some(client) = self.client.lock().as_ref().cloned() {
+        // Take the Arc out — when the last Arc reference is dropped,
+        // FutuClient::drop() aborts keepalive and recv handles.
+        let client = self.client.lock().take();
+        if let Some(client) = client {
             py.allow_threads(|| {
                 self.runtime.block_on(async {
                     client.clear_pending().await;
                 });
             });
         }
-
-        // Take the Arc out — when the last Arc reference is dropped,
-        // FutuClient::drop() aborts keepalive and recv handles.
-        let _client = self.client.lock().take();
         tracing::info!("Disconnected from Futu OpenD");
         Ok(())
+    }
+
+    /// Number of successful `connect()` calls so far.  Changes whenever the
+    /// underlying TCP connection was replaced.
+    fn connection_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Check if the client is connected to Futu OpenD *and* the connection is
+    /// still alive (recv loop running).
+    fn is_connected(&self) -> bool {
+        self.client
+            .lock()
+            .as_ref()
+            .map(|c| c.is_connected())
+            .unwrap_or(false)
+    }
+
+    /// Whether the current connection negotiated AES encryption.
+    fn is_encrypted(&self) -> bool {
+        self.client
+            .lock()
+            .as_ref()
+            .and_then(|c| c.init_response().map(|r| r.encrypted))
+            .unwrap_or(false)
     }
 
     /// Subscribe to quote data.
@@ -319,7 +429,11 @@ impl PyFutuClient {
         Ok(result)
     }
 
-    /// Get historical K-line data.
+    /// Get historical K-line data (Qot_RequestHistoryKL, proto 3103).
+    ///
+    /// Follows `next_req_key` pagination automatically until `max_count`
+    /// bars are collected (or all bars in the range when `max_count` is None).
+    /// Time strings accept "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS".
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (market, code, rehab_type, kl_type, begin_time, end_time, max_count=None))]
     fn get_history_kl(
@@ -336,30 +450,47 @@ impl PyFutuClient {
         let client = self.get_client()?;
         let client = &*client;
 
-        let response = py.allow_threads(|| {
+        let kl_list = py.allow_threads(|| {
             self.runtime.block_on(async {
-                crate::quote::history::get_history_kl(
+                crate::quote::history::get_history_kl_all(
                     client, market, code, rehab_type, kl_type,
                     begin_time, end_time, max_count,
                 ).await
             }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Get history KL failed: {}", e)))?;
 
+        let mut result = Vec::with_capacity(kl_list.len());
+        for kl in kl_list {
+            result.push(kline_to_dict(py, &kl)?);
+        }
+        Ok(result)
+    }
+
+    /// Get the most recent K-lines for a *subscribed* security (Qot_GetKL, proto 3006).
+    /// Unlike `get_history_kl` this does not consume history quota.
+    #[pyo3(signature = (market, code, rehab_type, kl_type, req_count=100))]
+    fn get_kl(
+        &self,
+        py: Python<'_>,
+        market: i32,
+        code: String,
+        rehab_type: i32,
+        kl_type: i32,
+        req_count: i32,
+    ) -> PyResult<Vec<PyObject>> {
+        let client = self.get_client()?;
+        let client = &*client;
+
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                crate::quote::history::get_kl(client, market, code, rehab_type, kl_type, req_count).await
+            }).map_err(|e| e.to_string())
+        }).map_err(|e| PyRuntimeError::new_err(format!("Get KL failed: {}", e)))?;
+
         let mut result = Vec::new();
         if let Some(s2c) = response.s2c {
-            for kl in s2c.kl_list {
-                let dict = pyo3::types::PyDict::new_bound(py);
-                dict.set_item("time", &kl.time)?;
-                dict.set_item("is_blank", kl.is_blank)?;
-                dict.set_item("open_price", kl.open_price)?;
-                dict.set_item("high_price", kl.high_price)?;
-                dict.set_item("low_price", kl.low_price)?;
-                dict.set_item("close_price", kl.close_price)?;
-                dict.set_item("last_close_price", kl.last_close_price)?;
-                dict.set_item("volume", kl.volume)?;
-                dict.set_item("turnover", kl.turnover)?;
-                dict.set_item("timestamp", kl.timestamp)?;
-                result.push(dict.into_any().unbind());
+            for kl in &s2c.kl_list {
+                result.push(kline_to_dict(py, kl)?);
             }
         }
         Ok(result)
@@ -426,9 +557,16 @@ impl PyFutuClient {
     }
 
     /// Place an order.
-    /// sec_market: 1=HK, 2=US, 3=CN_SH, 4=CN_SZ, etc.
+    /// sec_market: 1=HK, 2=US, 31=CN_SH, 32=CN_SZ, etc.
+    /// remark: free text (<=64 bytes) echoed back on order pushes/queries;
+    ///         the adapter stores the Nautilus client_order_id here.
+    /// time_in_force: 0=DAY, 1=GTC.  fill_outside_rth: US pre/after market.
+    /// aux_price: trigger price for STOP/STOP_LIMIT/MIT/LIT orders.
+    /// trail_type/trail_value/trail_spread: trailing stop parameters.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (trd_env, acc_id, trd_market, trd_side, order_type, code, qty, price=None, sec_market=None))]
+    #[pyo3(signature = (trd_env, acc_id, trd_market, trd_side, order_type, code, qty, price=None, sec_market=None,
+                        remark=None, time_in_force=None, fill_outside_rth=None, aux_price=None,
+                        trail_type=None, trail_value=None, trail_spread=None, adjust_limit=None))]
     fn place_order(
         &self,
         py: Python<'_>,
@@ -441,6 +579,14 @@ impl PyFutuClient {
         qty: f64,
         price: Option<f64>,
         sec_market: Option<i32>,
+        remark: Option<String>,
+        time_in_force: Option<i32>,
+        fill_outside_rth: Option<bool>,
+        aux_price: Option<f64>,
+        trail_type: Option<i32>,
+        trail_value: Option<f64>,
+        trail_spread: Option<f64>,
+        adjust_limit: Option<f64>,
     ) -> PyResult<PyObject> {
         let client = self.get_client()?;
         let client = &*client;
@@ -450,7 +596,8 @@ impl PyFutuClient {
                 crate::trade::order::place_order(
                     client, trd_env, acc_id, trd_market,
                     trd_side, order_type, code, qty, price,
-                    None, sec_market, None, None, None, None, None, None, None,
+                    adjust_limit, sec_market, remark, time_in_force, fill_outside_rth,
+                    aux_price, trail_type, trail_value, trail_spread,
                 ).await
             }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Place order failed: {}", e)))?;
@@ -465,7 +612,10 @@ impl PyFutuClient {
 
     /// Modify an order.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (trd_env, acc_id, trd_market, order_id, modify_op, qty=None, price=None))]
+    /// modify_op: 1=Normal (change qty/price), 2=Cancel, 3=Disable, 4=Enable, 5=Delete.
+    /// aux_price / trail_*: new trigger / trailing parameters for conditional orders.
+    #[pyo3(signature = (trd_env, acc_id, trd_market, order_id, modify_op, qty=None, price=None,
+                        aux_price=None, trail_type=None, trail_value=None, trail_spread=None))]
     fn modify_order(
         &self,
         py: Python<'_>,
@@ -476,6 +626,10 @@ impl PyFutuClient {
         modify_op: i32,
         qty: Option<f64>,
         price: Option<f64>,
+        aux_price: Option<f64>,
+        trail_type: Option<i32>,
+        trail_value: Option<f64>,
+        trail_spread: Option<f64>,
     ) -> PyResult<()> {
         let client = self.get_client()?;
         let client = &*client;
@@ -485,6 +639,7 @@ impl PyFutuClient {
                 crate::trade::order::modify_order(
                     client, trd_env, acc_id, trd_market,
                     order_id, modify_op, qty, price, None,
+                    aux_price, trail_type, trail_value, trail_spread,
                 ).await
             }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Modify order failed: {}", e)))?;
@@ -533,6 +688,12 @@ impl PyFutuClient {
                 dict.set_item("time_in_force", order.time_in_force)?;
                 dict.set_item("remark", &order.remark)?;
                 dict.set_item("last_err_msg", &order.last_err_msg)?;
+                dict.set_item("fill_outside_rth", order.fill_outside_rth)?;
+                dict.set_item("aux_price", order.aux_price)?;
+                dict.set_item("trail_type", order.trail_type)?;
+                dict.set_item("trail_value", order.trail_value)?;
+                dict.set_item("trail_spread", order.trail_spread)?;
+                dict.set_item("currency", order.currency)?;
                 result.push(dict.into_any().unbind());
             }
         }
@@ -662,6 +823,22 @@ impl PyFutuClient {
                 dict.set_item("initial_margin", funds.initial_margin)?;
                 dict.set_item("maintenance_margin", funds.maintenance_margin)?;
                 dict.set_item("max_withdrawal", funds.max_withdrawal)?;
+                dict.set_item("net_cash_power", funds.net_cash_power)?;
+                dict.set_item("long_mv", funds.long_mv)?;
+                dict.set_item("short_mv", funds.short_mv)?;
+                dict.set_item("securities_assets", funds.securities_assets)?;
+
+                // Per-currency cash breakdown (unified / futures accounts)
+                let cash_list = pyo3::types::PyList::empty_bound(py);
+                for ci in &funds.cash_info_list {
+                    let d = pyo3::types::PyDict::new_bound(py);
+                    d.set_item("currency", ci.currency)?;
+                    d.set_item("cash", ci.cash)?;
+                    d.set_item("available_balance", ci.available_balance)?;
+                    d.set_item("net_cash_power", ci.net_cash_power)?;
+                    cash_list.append(d)?;
+                }
+                dict.set_item("cash_info_list", cash_list)?;
             }
         }
         Ok(dict.into_any().unbind())
@@ -732,51 +909,32 @@ impl PyFutuClient {
         }).map_err(|e| PyRuntimeError::new_err(format!("Sub acc push failed: {}", e)))
     }
 
-    /// Check if the client is connected to Futu OpenD.
-    fn is_connected(&self) -> bool {
-        self.client.lock().is_some()
-    }
-
     /// Start receiving push notifications for the given proto_ids.
-    /// Each call creates a **new** channel pair and returns its index.
+    /// Each call creates a **new** channel and returns its index.
     /// Data and execution clients should each call this once and store
     /// their own `channel_id` for use with `poll_push()`.
+    ///
+    /// The channel survives reconnects: after `connect()` replaces a dead
+    /// connection, pushes for the same proto_ids keep flowing into it.
     fn start_push(
         &self,
-        py: Python<'_>,
+        _py: Python<'_>,
         proto_ids: Vec<u32>,
     ) -> PyResult<usize> {
-        let client = self.get_client()?;
-        let client = &*client;
-
-        // Always create a new channel pair for this caller
         let (tx, rx) = mpsc::unbounded_channel::<PushMessage>();
         let rx = Arc::new(Mutex::new(rx));
 
         let channel_id = {
             let mut channels = self.push_channels.lock();
             let id = channels.len();
-            channels.push((tx.clone(), rx));
+            channels.push(PushChannel { tx, rx, proto_ids, handles: Vec::new() });
             id
         };
 
-        // For each proto_id, register a push handler and spawn a forwarder task
-        for proto_id in proto_ids {
-            let mut push_rx = py.allow_threads(|| {
-                self.runtime.block_on(async {
-                    client.subscribe_push(proto_id).await
-                })
-            });
-
-            let tx_clone = tx.clone();
-            let handle = self.runtime.spawn(async move {
-                while let Some(msg) = push_rx.recv().await {
-                    if tx_clone.send((msg.proto_id, msg.body)).is_err() {
-                        break;
-                    }
-                }
-            });
-            self.push_handles.lock().push(handle);
+        // Attach immediately when a live connection exists; otherwise the
+        // next `connect()` will do it.
+        if let Ok(client) = self.get_live_client() {
+            self.wire_push_channels(&client);
         }
 
         Ok(channel_id)
@@ -785,6 +943,10 @@ impl PyFutuClient {
     /// Poll for the next push message on a specific channel.
     /// channel_id: index returned by `start_push()`
     /// timeout_ms: how long to wait for a message (in milliseconds)
+    ///
+    /// Returns `None` on timeout.  Raises `ConnectionError` when the
+    /// connection is down so callers can trigger a reconnect instead of
+    /// spinning forever.
     #[pyo3(signature = (channel_id, timeout_ms=100))]
     fn poll_push(
         &self,
@@ -795,37 +957,91 @@ impl PyFutuClient {
         let rx = {
             let channels = self.push_channels.lock();
             match channels.get(channel_id) {
-                Some((_, rx)) => Arc::clone(rx),
-                None => return Ok(None),
+                Some(channel) => Arc::clone(&channel.rx),
+                None => return Err(PyRuntimeError::new_err(format!("Unknown push channel_id={}", channel_id))),
             }
         };
+        let client = self.get_live_client()?;
+        let mut connected = client.connected_watch();
 
         let timeout = std::time::Duration::from_millis(timeout_ms);
 
         let result = py.allow_threads(|| {
             self.runtime.block_on(async {
                 let mut guard = rx.lock().await;
-                tokio::time::timeout(timeout, guard.recv()).await
+                // Drain queued messages first even if the link just died so
+                // nothing that already arrived is lost.
+                if let Ok(msg) = guard.try_recv() {
+                    return PollOutcome::Message(msg);
+                }
+                tokio::select! {
+                    res = tokio::time::timeout(timeout, guard.recv()) => match res {
+                        Ok(Some(msg)) => PollOutcome::Message(msg),
+                        Ok(None) => PollOutcome::Disconnected,
+                        Err(_) => PollOutcome::Timeout,
+                    },
+                    _ = connected.wait_for(|c| !*c) => PollOutcome::Disconnected,
+                }
             })
         });
 
         match result {
-            Ok(Some((proto_id, body))) => {
+            PollOutcome::Message((proto_id, body)) => {
                 let data = super::push_decode::decode_push_message(py, proto_id, &body)?;
                 let dict = pyo3::types::PyDict::new_bound(py);
                 dict.set_item("proto_id", proto_id)?;
                 dict.set_item("data", data)?;
                 Ok(Some(dict.into_any().unbind()))
             }
-            Ok(None) => {
-                // Channel closed
-                Ok(None)
-            }
-            Err(_) => {
-                // Timeout — no message available
-                Ok(None)
-            }
+            PollOutcome::Timeout => Ok(None),
+            PollOutcome::Disconnected => Err(PyConnectionError::new_err("Disconnected from Futu OpenD")),
         }
+    }
+
+    /// Awaitable variant of `poll_push()` for asyncio callers.
+    ///
+    /// Resolves with the next push dict, or raises `ConnectionError` when the
+    /// connection dies.  No worker thread is blocked while waiting.
+    fn poll_push_async<'py>(
+        &self,
+        py: Python<'py>,
+        channel_id: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let rx = {
+            let channels = self.push_channels.lock();
+            match channels.get(channel_id) {
+                Some(channel) => Arc::clone(&channel.rx),
+                None => return Err(PyRuntimeError::new_err(format!("Unknown push channel_id={}", channel_id))),
+            }
+        };
+        let client = self.get_live_client()?;
+        let mut connected = client.connected_watch();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut guard = rx.lock().await;
+            let outcome = if let Ok(msg) = guard.try_recv() {
+                PollOutcome::Message(msg)
+            } else {
+                tokio::select! {
+                    res = guard.recv() => match res {
+                        Some(msg) => PollOutcome::Message(msg),
+                        None => PollOutcome::Disconnected,
+                    },
+                    _ = connected.wait_for(|c| !*c) => PollOutcome::Disconnected,
+                }
+            };
+            drop(guard);
+            match outcome {
+                PollOutcome::Message((proto_id, body)) => Python::with_gil(|py| {
+                    let data = super::push_decode::decode_push_message(py, proto_id, &body)?;
+                    let dict = pyo3::types::PyDict::new_bound(py);
+                    dict.set_item("proto_id", proto_id)?;
+                    dict.set_item("data", data)?;
+                    Ok(dict.into_any().unbind())
+                }),
+                _ => Err(PyConnectionError::new_err("Disconnected from Futu OpenD")),
+            }
+        })
     }
 
     /// Filter stocks by conditions (Qot_StockFilter, proto 3215).
@@ -1045,6 +1261,12 @@ impl PyFutuClient {
                 dict.set_item("update_timestamp", order.update_timestamp)?;
                 dict.set_item("time_in_force", order.time_in_force)?;
                 dict.set_item("remark", &order.remark)?;
+                dict.set_item("fill_outside_rth", order.fill_outside_rth)?;
+                dict.set_item("aux_price", order.aux_price)?;
+                dict.set_item("trail_type", order.trail_type)?;
+                dict.set_item("trail_value", order.trail_value)?;
+                dict.set_item("trail_spread", order.trail_spread)?;
+                dict.set_item("currency", order.currency)?;
                 result.push(dict.into_any().unbind());
             }
         }
@@ -2148,4 +2370,20 @@ impl PyFutuClient {
         }
         Ok(dict.into_any().unbind())
     }
+}
+
+/// Convert a K-line proto into the dict shape shared by `get_history_kl` / `get_kl`.
+fn kline_to_dict(py: Python<'_>, kl: &crate::generated::qot_common::KLine) -> PyResult<PyObject> {
+    let dict = pyo3::types::PyDict::new_bound(py);
+    dict.set_item("time", &kl.time)?;
+    dict.set_item("is_blank", kl.is_blank)?;
+    dict.set_item("open_price", kl.open_price)?;
+    dict.set_item("high_price", kl.high_price)?;
+    dict.set_item("low_price", kl.low_price)?;
+    dict.set_item("close_price", kl.close_price)?;
+    dict.set_item("last_close_price", kl.last_close_price)?;
+    dict.set_item("volume", kl.volume)?;
+    dict.set_item("turnover", kl.turnover)?;
+    dict.set_item("timestamp", kl.timestamp)?;
+    Ok(dict.into_any().unbind())
 }

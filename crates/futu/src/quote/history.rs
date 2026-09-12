@@ -5,6 +5,14 @@ use super::subscribe::QuoteError;
 const PROTO_QOT_GET_KL: u32 = 3006;
 const PROTO_QOT_GET_HISTORY_KL: u32 = 3103;
 
+/// OpenD returns at most this many K-lines per `Qot_RequestHistoryKL` call and
+/// hands back `next_req_key` when more are available.
+pub const HISTORY_KL_PAGE_SIZE: i32 = 1000;
+
+/// Safety cap on pages fetched by [`get_history_kl_all`] so a runaway request
+/// cannot burn the whole 30-day history quota.
+pub const HISTORY_KL_MAX_PAGES: usize = 50;
+
 /// Get K-line (candlestick) data for a subscribed security.
 pub async fn get_kl(
     client: &FutuClient,
@@ -40,7 +48,9 @@ pub async fn get_kl(
     Ok(response)
 }
 
-/// Get historical K-line data.
+/// Get one page of historical K-line data.
+///
+/// Pass the `next_req_key` from a previous response to fetch the following page.
 #[allow(clippy::too_many_arguments)]
 pub async fn get_history_kl(
     client: &FutuClient,
@@ -51,6 +61,7 @@ pub async fn get_history_kl(
     begin_time: String,
     end_time: String,
     max_count: Option<i32>,
+    next_req_key: Option<Vec<u8>>,
 ) -> Result<crate::generated::qot_get_history_kl::Response, QuoteError> {
     let security = crate::generated::qot_common::Security { market, code };
     let c2s = crate::generated::qot_get_history_kl::C2s {
@@ -60,6 +71,7 @@ pub async fn get_history_kl(
         begin_time,
         end_time,
         max_ack_kl_num: max_count,
+        next_req_key,
         ..Default::default()
     };
     let request = crate::generated::qot_get_history_kl::Request { c2s };
@@ -81,6 +93,55 @@ pub async fn get_history_kl(
     Ok(response)
 }
 
+/// Fetch historical K-lines across pages until `max_count` bars are collected,
+/// the server reports no further page, or [`HISTORY_KL_MAX_PAGES`] is reached.
+///
+/// `max_count == None` means "everything in the time range".
+#[allow(clippy::too_many_arguments)]
+pub async fn get_history_kl_all(
+    client: &FutuClient,
+    market: i32,
+    code: String,
+    rehab_type: i32,
+    kl_type: i32,
+    begin_time: String,
+    end_time: String,
+    max_count: Option<i32>,
+) -> Result<Vec<crate::generated::qot_common::KLine>, QuoteError> {
+    let mut collected: Vec<crate::generated::qot_common::KLine> = Vec::new();
+    let mut next_req_key: Option<Vec<u8>> = None;
+
+    for page in 0..HISTORY_KL_MAX_PAGES {
+        let remaining = max_count.map(|m| m - collected.len() as i32);
+        if matches!(remaining, Some(r) if r <= 0) {
+            break;
+        }
+        let page_size = Some(remaining.map_or(HISTORY_KL_PAGE_SIZE, |r| r.min(HISTORY_KL_PAGE_SIZE)));
+
+        let response = get_history_kl(
+            client, market, code.clone(), rehab_type, kl_type,
+            begin_time.clone(), end_time.clone(), page_size, next_req_key.take(),
+        ).await?;
+
+        let Some(s2c) = response.s2c else { break };
+        let got = s2c.kl_list.len();
+        collected.extend(s2c.kl_list);
+        tracing::debug!("history KL page {} for {}: {} bars (total {})", page + 1, code, got, collected.len());
+
+        match s2c.next_req_key {
+            Some(key) if !key.is_empty() && got > 0 => next_req_key = Some(key),
+            _ => break,
+        }
+    }
+
+    if let Some(max) = max_count {
+        if collected.len() > max as usize {
+            collected.truncate(max as usize);
+        }
+    }
+    Ok(collected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +150,7 @@ mod tests {
     fn test_proto_id_constants() {
         assert_eq!(PROTO_QOT_GET_KL, 3006);
         assert_eq!(PROTO_QOT_GET_HISTORY_KL, 3103);
+        assert_eq!(HISTORY_KL_PAGE_SIZE, 1000);
     }
 
     #[test]
@@ -126,6 +188,7 @@ mod tests {
             begin_time: "2024-01-01".to_string(),
             end_time: "2024-12-31".to_string(),
             max_ack_kl_num: Some(500),
+            next_req_key: Some(vec![1, 2, 3]),
             ..Default::default()
         };
         let request = crate::generated::qot_get_history_kl::Request { c2s };
@@ -136,6 +199,7 @@ mod tests {
         assert_eq!(decoded.c2s.begin_time, "2024-01-01");
         assert_eq!(decoded.c2s.end_time, "2024-12-31");
         assert_eq!(decoded.c2s.max_ack_kl_num, Some(500));
+        assert_eq!(decoded.c2s.next_req_key, Some(vec![1, 2, 3]));
     }
 
     #[test]

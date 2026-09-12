@@ -1,8 +1,7 @@
 """Tests for Futu market data parsing."""
 
 import pytest
-
-from nautilus_trader.model.data import BarSpecification, BarType, QuoteTick, TradeTick, Bar
+from nautilus_trader.model.data import Bar, BarSpecification, BarType, QuoteTick, TradeTick
 from nautilus_trader.model.enums import (
     AggregationSource,
     AggressorSide,
@@ -10,17 +9,7 @@ from nautilus_trader.model.enums import (
     PriceType,
 )
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, TradeId
-from nautilus_trader.model.objects import Price, Quantity
 
-from nautilus_futu.common import futu_security_to_instrument_id
-from nautilus_futu.constants import HKEX_VENUE, NYSE_VENUE
-from nautilus_futu.parsing.market_data import (
-    bar_spec_to_futu_kl_type,
-    bar_spec_to_futu_sub_type,
-    parse_futu_bars,
-    parse_futu_quote_tick,
-    parse_futu_trade_tick,
-)
 from nautilus_futu.constants import (
     FUTU_KL_TYPE_5MIN,
     FUTU_KL_TYPE_15MIN,
@@ -30,6 +19,15 @@ from nautilus_futu.constants import (
     FUTU_SUB_TYPE_KL_15MIN,
     FUTU_SUB_TYPE_KL_30MIN,
     FUTU_SUB_TYPE_KL_60MIN,
+    HKEX_VENUE,
+    NYSE_VENUE,
+)
+from nautilus_futu.parsing.market_data import (
+    bar_spec_to_futu_kl_type,
+    bar_spec_to_futu_sub_type,
+    parse_futu_bars,
+    parse_futu_quote_tick,
+    parse_futu_trade_tick,
 )
 
 
@@ -133,11 +131,13 @@ class TestParseBars:
         assert len(bars) == 1
         bar = bars[0]
         assert isinstance(bar, Bar)
-        assert str(bar.open) == "345.0"
-        assert str(bar.high) == "355.0"
-        assert str(bar.low) == "340.0"
-        assert str(bar.close) == "350.0"
+        assert float(bar.open) == 345.0
+        assert float(bar.high) == 355.0
+        assert float(bar.low) == 340.0
+        assert float(bar.close) == 350.0
         assert bar.volume == 10000000
+        assert bar.ts_event == 1718400000 * 1_000_000_000
+        assert not bar.is_revision
 
     def test_multiple_bars(self, bar_type):
         kl_data = [
@@ -223,14 +223,24 @@ class TestBarSpecConversionsExtended:
         assert bar_spec_to_futu_sub_type(spec) is None
         assert bar_spec_to_futu_kl_type(spec) is None
 
-    def test_week_bar_not_supported_via_sub_type(self):
-        """WEEK aggregation is not exposed in sub_type mapping."""
-        spec = BarSpecification(1, BarAggregation.WEEK, PriceType.LAST)
-        assert bar_spec_to_futu_sub_type(spec) is None
+    def test_week_bar_sub_type(self):
+        """WEEK aggregation maps to SubType_KL_Week."""
+        from nautilus_futu.constants import FUTU_SUB_TYPE_KL_WEEK
 
-    def test_month_bar_not_supported_via_sub_type(self):
+        spec = BarSpecification(1, BarAggregation.WEEK, PriceType.LAST)
+        assert bar_spec_to_futu_sub_type(spec) == FUTU_SUB_TYPE_KL_WEEK
+
+    def test_month_bar_sub_type(self):
+        from nautilus_futu.constants import FUTU_SUB_TYPE_KL_MONTH
+
         spec = BarSpecification(1, BarAggregation.MONTH, PriceType.LAST)
-        assert bar_spec_to_futu_sub_type(spec) is None
+        assert bar_spec_to_futu_sub_type(spec) == FUTU_SUB_TYPE_KL_MONTH
+
+    def test_hour_maps_to_60min_stream(self):
+        """1-HOUR uses the 60-minute K-line stream (Nautilus forbids 60-MINUTE specs)."""
+        hour = BarSpecification(1, BarAggregation.HOUR, PriceType.LAST)
+        assert bar_spec_to_futu_kl_type(hour) == FUTU_KL_TYPE_60MIN
+        assert bar_spec_to_futu_sub_type(hour) == FUTU_SUB_TYPE_KL_60MIN
 
     def test_hour_2_not_supported(self):
         """HOUR with step=2 is not supported by Futu."""
@@ -283,8 +293,36 @@ class TestTickEdgeCases:
         assert str(tick.ask_price) == "0"
 
     def test_trade_tick_zero_volume(self):
-        """volume=0 is clamped to 1 to avoid ValueError."""
+        """volume=0 cannot form a TradeTick (size must be positive) -> None."""
         instrument_id = InstrumentId(Symbol("TEST"), HKEX_VENUE)
         data = {"price": 100.0, "volume": 0, "dir": 1, "sequence": 1}
-        tick = parse_futu_trade_tick(data, instrument_id, ts_init=0)
-        assert str(tick.size) == "1"
+        assert parse_futu_trade_tick(data, instrument_id, ts_init=0) is None
+
+    def test_quote_tick_float_sum_never_exceeds_precision(self):
+        """cur_price + price_spread with float noise must not raise (was precision 16)."""
+        instrument_id = InstrumentId(Symbol("TEST"), HKEX_VENUE)
+        data = {"cur_price": 1.1, "price_spread": 0.1, "volume": 10}
+        tick = parse_futu_quote_tick(data, instrument_id, ts_init=0)
+        assert str(tick.bid_price) == "1.1"
+        assert str(tick.ask_price) == "1.2"
+
+    def test_quote_tick_prefers_real_bid_ask(self):
+        """Snapshot payloads carry bid/ask which win over cur_price/spread."""
+        instrument_id = InstrumentId(Symbol("TEST"), HKEX_VENUE)
+        data = {"cur_price": 100.0, "price_spread": 0.1, "bid_price": 99.9, "ask_price": 100.1,
+                "bid_vol": 500, "ask_vol": 700, "update_timestamp": 1718400000.0}
+        tick = parse_futu_quote_tick(data, instrument_id, ts_init=5)
+        assert str(tick.bid_price) == "99.9"
+        assert str(tick.ask_price) == "100.1"
+        assert int(tick.bid_size) == 500
+        assert int(tick.ask_size) == 700
+        assert tick.ts_event == 1718400000 * 1_000_000_000
+        assert tick.ts_init == 5
+
+    def test_trade_tick_uses_exchange_timestamp(self):
+        instrument_id = InstrumentId(Symbol("TEST"), HKEX_VENUE)
+        data = {"price": 100.0, "volume": 1, "dir": 1, "sequence": 7, "timestamp": 1718400000.5}
+        tick = parse_futu_trade_tick(data, instrument_id, ts_init=99)
+        assert tick.ts_event == int(1718400000.5 * 1_000_000_000)
+        assert tick.ts_init == 99
+        assert tick.trade_id.value == "7"

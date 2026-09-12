@@ -12,6 +12,7 @@ pub const PROTO_QOT_UPDATE_ORDER_BOOK: u32 = 3013;
 pub const PROTO_QOT_UPDATE_KL: u32 = 3007;
 pub const PROTO_TRD_UPDATE_ORDER: u32 = 2208;
 pub const PROTO_TRD_UPDATE_ORDER_FILL: u32 = 2218;
+pub const PROTO_NOTIFY: u32 = 1003;
 
 /// Decode a push message body into a Python object based on proto_id.
 pub fn decode_push_message(py: Python<'_>, proto_id: u32, body: &[u8]) -> PyResult<PyObject> {
@@ -22,6 +23,7 @@ pub fn decode_push_message(py: Python<'_>, proto_id: u32, body: &[u8]) -> PyResu
         PROTO_QOT_UPDATE_KL => decode_kl(py, body),
         PROTO_TRD_UPDATE_ORDER => decode_trd_order(py, body),
         PROTO_TRD_UPDATE_ORDER_FILL => decode_trd_fill(py, body),
+        PROTO_NOTIFY => decode_notify(py, body),
         _ => Err(PyValueError::new_err(format!("Unknown push proto_id: {}", proto_id))),
     }
 }
@@ -112,6 +114,8 @@ fn decode_order_book(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
         bids.append(d)?;
     }
     dict.set_item("bids", bids)?;
+    dict.set_item("svr_recv_time_bid_timestamp", s2c.svr_recv_time_bid_timestamp)?;
+    dict.set_item("svr_recv_time_ask_timestamp", s2c.svr_recv_time_ask_timestamp)?;
     Ok(dict.into_any().unbind())
 }
 
@@ -177,6 +181,12 @@ fn decode_trd_order(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
     order_dict.set_item("time_in_force", o.time_in_force)?;
     order_dict.set_item("remark", &o.remark)?;
     order_dict.set_item("last_err_msg", &o.last_err_msg)?;
+    order_dict.set_item("fill_outside_rth", o.fill_outside_rth)?;
+    order_dict.set_item("aux_price", o.aux_price)?;
+    order_dict.set_item("trail_type", o.trail_type)?;
+    order_dict.set_item("trail_value", o.trail_value)?;
+    order_dict.set_item("trail_spread", o.trail_spread)?;
+    order_dict.set_item("currency", o.currency)?;
     dict.set_item("order", order_dict)?;
     Ok(dict.into_any().unbind())
 }
@@ -210,6 +220,80 @@ fn decode_trd_fill(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
     fill_dict.set_item("update_timestamp", f.update_timestamp.unwrap_or(0.0))?;
     fill_dict.set_item("status", f.status)?;
     dict.set_item("fill", fill_dict)?;
+    Ok(dict.into_any().unbind())
+}
+
+/// Decode an OpenD `Notify` (1003) push: gateway events, connection status,
+/// quota changes.  Every sub-message is optional, so the returned dict only
+/// contains the section matching `type`.
+fn decode_notify(py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
+    use crate::generated::notify as n;
+    let resp = n::Response::decode(body)
+        .map_err(|e| PyValueError::new_err(format!("Decode error: {}", e)))?;
+
+    let s2c = resp.s2c
+        .ok_or_else(|| PyValueError::new_err("Missing s2c in notify push"))?;
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("type", s2c.r#type)?;
+    let type_name = match s2c.r#type {
+        n::NOTIFY_TYPE_GTW_EVENT => "gtw_event",
+        n::NOTIFY_TYPE_PROGRAM_STATUS => "program_status",
+        n::NOTIFY_TYPE_CONN_STATUS => "conn_status",
+        n::NOTIFY_TYPE_QOT_RIGHT => "qot_right",
+        n::NOTIFY_TYPE_API_LEVEL => "api_level",
+        n::NOTIFY_TYPE_API_QUOTA => "api_quota",
+        n::NOTIFY_TYPE_USED_QUOTA => "used_quota",
+        _ => "unknown",
+    };
+    dict.set_item("type_name", type_name)?;
+
+    if let Some(ev) = s2c.event {
+        let d = PyDict::new_bound(py);
+        d.set_item("event_type", ev.event_type)?;
+        d.set_item("desc", ev.desc.as_deref())?;
+        dict.set_item("event", d)?;
+    }
+    if let Some(ps) = s2c.program_status.and_then(|p| p.program_status) {
+        let d = PyDict::new_bound(py);
+        d.set_item("type", ps.r#type)?;
+        d.set_item("desc", ps.str_ext_desc.as_deref())?;
+        dict.set_item("program_status", d)?;
+    }
+    if let Some(cs) = s2c.connect_status {
+        let d = PyDict::new_bound(py);
+        d.set_item("qot_logined", cs.qot_logined)?;
+        d.set_item("trd_logined", cs.trd_logined)?;
+        dict.set_item("connect_status", d)?;
+    }
+    if let Some(qr) = s2c.qot_right {
+        let d = PyDict::new_bound(py);
+        d.set_item("hk_qot_right", qr.hk_qot_right)?;
+        d.set_item("us_qot_right", qr.us_qot_right)?;
+        d.set_item("cn_qot_right", qr.cn_qot_right)?;
+        d.set_item("hk_option_qot_right", qr.hk_option_qot_right)?;
+        d.set_item("has_us_option_qot_right", qr.has_us_option_qot_right)?;
+        d.set_item("hk_future_qot_right", qr.hk_future_qot_right)?;
+        d.set_item("us_future_qot_right", qr.us_future_qot_right)?;
+        d.set_item("sg_future_qot_right", qr.sg_future_qot_right)?;
+        d.set_item("jp_future_qot_right", qr.jp_future_qot_right)?;
+        dict.set_item("qot_right", d)?;
+    }
+    if let Some(al) = s2c.api_level {
+        dict.set_item("api_level", al.api_level.as_deref())?;
+    }
+    if let Some(q) = s2c.api_quota {
+        let d = PyDict::new_bound(py);
+        d.set_item("sub_quota", q.sub_quota)?;
+        d.set_item("history_kl_quota", q.history_kl_quota)?;
+        dict.set_item("api_quota", d)?;
+    }
+    if let Some(u) = s2c.used_quota {
+        let d = PyDict::new_bound(py);
+        d.set_item("used_sub_quota", u.used_sub_quota)?;
+        d.set_item("used_kline_quota", u.used_kline_quota)?;
+        dict.set_item("used_quota", d)?;
+    }
     Ok(dict.into_any().unbind())
 }
 
@@ -462,6 +546,24 @@ mod tests {
         assert_eq!(s2c.order_fill.counter_broker_id, Some(1234));
         assert_eq!(s2c.order_fill.counter_broker_name, Some("中银国际".to_string()));
         assert_eq!(s2c.order_fill.update_timestamp, Some(1704067210.0));
+    }
+
+    #[test]
+    fn test_notify_roundtrip() {
+        use crate::generated::notify as n;
+        let s2c = n::S2c {
+            r#type: n::NOTIFY_TYPE_CONN_STATUS,
+            connect_status: Some(n::ConnectStatus { qot_logined: Some(true), trd_logined: Some(false) }),
+            ..Default::default()
+        };
+        let resp = n::Response { ret_type: 0, ret_msg: None, err_code: None, s2c: Some(s2c) };
+        let body = resp.encode_to_vec();
+        let decoded = n::Response::decode(body.as_slice()).unwrap();
+        let s2c = decoded.s2c.unwrap();
+        assert_eq!(s2c.r#type, 3);
+        assert_eq!(s2c.connect_status.unwrap().qot_logined, Some(true));
+        assert!(s2c.event.is_none());
+        assert_eq!(PROTO_NOTIFY, 1003);
     }
 
     #[test]

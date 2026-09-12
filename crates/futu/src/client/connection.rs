@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
@@ -13,6 +14,13 @@ use crate::protocol::encryption::AesEcbCipher;
 type Writer = FramedWrite<OwnedWriteHalf, FutuCodec>;
 type Reader = FramedRead<OwnedReadHalf, FutuCodec>;
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Manages the TCP connection to Futu OpenD.
 /// Read and write halves are split to avoid deadlocks.
 pub struct FutuConnection {
@@ -22,6 +30,10 @@ pub struct FutuConnection {
     serial_counter: AtomicU32,
     cipher: Mutex<Option<AesEcbCipher>>,
     conn_id: Mutex<u64>,
+    /// Unix time (ms) of the last frame received from OpenD.  Used by the
+    /// keepalive loop to detect half-open connections where sends still
+    /// succeed but nothing ever comes back.
+    last_recv_ms: AtomicU64,
 }
 
 impl FutuConnection {
@@ -43,6 +55,7 @@ impl FutuConnection {
             serial_counter: AtomicU32::new(1),
             cipher: Mutex::new(None),
             conn_id: Mutex::new(0),
+            last_recv_ms: AtomicU64::new(now_millis()),
         })
     }
 
@@ -69,12 +82,18 @@ impl FutuConnection {
         };
         drop(cipher);
 
-        tracing::debug!("SEND proto_id={}, serial_no={}, body_len={}, encrypted={}", proto_id, serial_no, body_to_send.len(), encrypted);
+        self.send_raw(proto_id, body_to_send, serial_no, encrypted).await
+    }
+
+    /// Send a message body exactly as given (no AES).  Used for the RSA-encrypted
+    /// `InitConnect` handshake, which happens before the AES key is known.
+    pub async fn send_raw(&self, proto_id: u32, body: Vec<u8>, serial_no: u32, encrypted: bool) -> Result<(), ConnectionError> {
+        tracing::debug!("SEND proto_id={}, serial_no={}, body_len={}, encrypted={}", proto_id, serial_no, body.len(), encrypted);
 
         let msg = FutuMessage {
             proto_id,
             serial_no,
-            body: body_to_send,
+            body,
         };
 
         let mut writer = self.writer.lock().await;
@@ -89,6 +108,7 @@ impl FutuConnection {
             Some(Ok(mut msg)) => {
                 tracing::debug!("RECV proto_id={}, serial_no={}, body_len={}", msg.proto_id, msg.serial_no, msg.body.len());
                 drop(reader); // Release reader lock before acquiring cipher lock
+                self.last_recv_ms.store(now_millis(), Ordering::Relaxed);
                 let mut cipher = self.cipher.lock().await;
                 if let Some(ref aes) = *cipher {
                     if !msg.body.is_empty() {
@@ -117,10 +137,20 @@ impl FutuConnection {
         }
     }
 
+    /// Milliseconds elapsed since the last frame was received from OpenD.
+    pub fn millis_since_last_recv(&self) -> u64 {
+        now_millis().saturating_sub(self.last_recv_ms.load(Ordering::Relaxed))
+    }
+
     /// Set the AES encryption key (after InitConnect).
     pub async fn set_cipher(&self, key: &[u8; 16]) {
         let mut cipher = self.cipher.lock().await;
         *cipher = Some(AesEcbCipher::new(key));
+    }
+
+    /// Whether AES encryption is currently active.
+    pub async fn is_encrypted(&self) -> bool {
+        self.cipher.lock().await.is_some()
     }
 
     /// Set the connection ID.
@@ -151,4 +181,6 @@ pub enum ConnectionError {
     Decryption(String),
     #[error("connection disconnected")]
     Disconnected,
+    #[error("request timed out after {0}s (proto_id={1})")]
+    Timeout(u64, u32),
 }

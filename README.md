@@ -1,21 +1,24 @@
 # nautilus-futu
 
-Futu OpenD adapter for [NautilusTrader](https://github.com/nautechsystems/nautilus_trader) — 通过富途 OpenD 网关接入港股、美股、A股等市场的量化交易适配器。
+Futu OpenD adapter for [NautilusTrader](https://github.com/nautechsystems/nautilus_trader) — 通过富途 OpenD 网关接入港股、美股、沪深港通等市场的量化交易适配器。
 
 ## 特性
 
 - **独立安装包** — 不依赖 NautilusTrader 主仓库，自主控制版本发布
-- **Rust 协议层** — 用 Rust 实现 Futu OpenD TCP 二进制协议，高性能低延迟
-- **无 protobuf 冲突** — 不依赖 `futu-api` Python 包，Rust 侧用 prost 处理 protobuf，彻底避免版本冲突
-- **完整功能覆盖** — 行情订阅、历史K线、下单/改单/撤单、账户资金/持仓查询
+- **Rust 协议层** — 用 Rust 实现 Futu OpenD TCP 二进制协议（含 RSA/AES 加密），高性能低延迟
+- **无 protobuf 冲突** — 不依赖 `futu-api` Python 包，Rust 侧用 prost 处理 protobuf
+- **完整交易生命周期** — 下单 / 改单 / 撤单 / 条件单，订单与成交推送映射为 Nautilus 事件，支持对账
+- **行情** — 真实买卖一档报价（来自盘口）、逐笔成交、L2 盘口、K 线推送（完成 K 线 / 可选修订）、分页历史 K 线
+- **连接管理** — 行情与交易共用一条 TCP 连接，断线检测、自动重连并恢复订阅，请求超时保护
 
 ## 支持市场
 
-| 市场 | 行情 | 交易 |
-|------|------|------|
-| 港股 (HK) | ✅ | ✅ |
-| 美股 (US) | ✅ | ✅ |
-| A股 (CN) | ✅ | ✅ |
+| 市场 | 行情 | 交易 | 备注 |
+|------|------|------|------|
+| 港股 (HKEX) | ✅ | ✅ | 正股 / ETF / 窝轮 / 牛熊 / 期权 |
+| 美股 (NYSE / NASDAQ) | ✅ | ✅ | 支持盘前盘后成交 |
+| 沪深 (SSE / SZSE) | ✅ | ✅ | 交易需开通沪深港通（TrdMarket_HKCC），结算币种 CNH |
+| 新加坡 (SGX) | ✅ | — | 期货行情 |
 
 ## 前置条件
 
@@ -39,67 +42,107 @@ pip install .
 
 ## 快速上手
 
-```python
-import asyncio
-from nautilus_futu.config import FutuDataClientConfig, FutuExecClientConfig
-
-async def main():
-    # 导入 Rust 客户端
-    from nautilus_futu._rust import PyFutuClient
-
-    client = PyFutuClient()
-    client.connect("127.0.0.1", 11111, "nautilus", 100)
-
-    # 获取行情快照
-    quotes = client.get_basic_qot([(1, "00700")])  # 腾讯控股
-    for q in quotes:
-        print(f"{q['code']}: {q['cur_price']}")
-
-    # 获取历史K线
-    bars = client.get_history_kl(
-        market=1,
-        code="00700",
-        rehab_type=1,      # 前复权
-        kl_type=2,          # 日K
-        begin_time="2025-01-01",
-        end_time="2025-12-31",
-    )
-    print(f"获取到 {len(bars)} 根K线")
-
-    client.disconnect()
-
-asyncio.run(main())
-```
-
 ### 集成 NautilusTrader
 
 ```python
+from nautilus_trader.config import InstrumentProviderConfig, TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_futu.config import FutuDataClientConfig, FutuExecClientConfig
 from nautilus_futu.factories import FutuLiveDataClientFactory, FutuLiveExecClientFactory
 
-node = TradingNode()
+config = TradingNodeConfig(
+    data_clients={
+        "FUTU": FutuDataClientConfig(
+            host="127.0.0.1",
+            port=11111,
+            instrument_provider=InstrumentProviderConfig(load_ids=frozenset({"00700.HKEX", "AAPL.NYSE"})),
+        ),
+    },
+    exec_clients={
+        "FUTU": FutuExecClientConfig(
+            host="127.0.0.1",
+            port=11111,          # 与 data client 相同 → 共用一条 TCP 连接
+            trd_env=0,           # 0=模拟, 1=真实
+            trd_market=1,        # 默认交易市场：1=港股, 2=美股, 4=沪深港通
+            account_type="CASH", # 或 "MARGIN"
+            unlock_pwd_md5="",   # 真实交易需要填写
+        ),
+    },
+)
 
-# 注册 Futu 适配器
+node = TradingNode(config=config)
 node.add_data_client_factory("FUTU", FutuLiveDataClientFactory)
 node.add_exec_client_factory("FUTU", FutuLiveExecClientFactory)
-
-# 配置
-data_config = FutuDataClientConfig(
-    host="127.0.0.1",
-    port=11111,
-)
-exec_config = FutuExecClientConfig(
-    host="127.0.0.1",
-    port=11111,
-    trd_env=0,          # 0=模拟, 1=真实
-    trd_market=1,       # 1=港股, 2=美股
-    unlock_pwd_md5="",  # 真实交易需要填写
-)
-
 node.build()
 node.run()
 ```
+
+品种 ID 使用交易所作为 venue（`00700.HKEX`、`AAPL.NYSE`、`600519.SSE`），
+适配器默认把这些 venue 路由到 FUTU 客户端，并把 FUTU 账户注册为所有 venue 的账户，
+无需额外配置 `routing`。
+
+### 策略中可用的操作
+
+```python
+self.subscribe_quote_ticks(instrument_id)        # 买卖一档（来自盘口推送）
+self.subscribe_trade_ticks(instrument_id)        # 逐笔成交
+self.subscribe_order_book_deltas(instrument_id)  # L2 盘口（最多 10 档）
+self.subscribe_bars(BarType.from_str("00700.HKEX-1-MINUTE-LAST-EXTERNAL"))
+self.request_bars(bar_type, start=..., end=...)  # 历史 K 线（自动分页）
+
+self.submit_order(self.order_factory.limit(...))            # 限价
+self.submit_order(self.order_factory.market(...))           # 市价
+self.submit_order(self.order_factory.stop_limit(...))       # 止损限价
+self.submit_order(self.order_factory.trailing_stop_market(...))  # 跟踪止损
+self.modify_order(order, price=...)
+self.cancel_all_orders(instrument_id)
+```
+
+支持的订单类型：`LIMIT`、`MARKET`、`STOP_MARKET`、`STOP_LIMIT`、`MARKET_IF_TOUCHED`、
+`LIMIT_IF_TOUCHED`、`TRAILING_STOP_MARKET`、`TRAILING_STOP_LIMIT`；有效期 `DAY` / `GTC`。
+美股盘前盘后成交通过 `FutuExecClientConfig.fill_outside_rth` 或订单 tag `FUTU_RTH:1` 开启。
+
+### 直接使用 Rust 客户端
+
+```python
+from nautilus_futu._rust import PyFutuClient
+
+client = PyFutuClient()
+client.connect("127.0.0.1", 11111, "nautilus", 100)
+
+quotes = client.get_security_snapshot([(1, "00700")])   # 含 bid/ask
+bars = client.get_history_kl(1, "00700", rehab_type=1, kl_type=2,
+                             begin_time="2025-01-01", end_time="2025-12-31")  # 自动分页
+
+channel = client.start_push([3013])                       # 盘口推送
+client.subscribe([(1, "00700")], [2], True)
+msg = client.poll_push(channel, 1000)                     # 断线时抛 ConnectionError
+client.disconnect()
+```
+
+## 配置说明
+
+| 配置项 | 说明 |
+|--------|------|
+| `rsa_key_path` | 与 OpenD 共用的 RSA 私钥（PEM），设置后握手 RSA 加密、后续 AES 加密 |
+| `request_timeout` | 单个请求等待 OpenD 应答的秒数，默认 15 |
+| `reconnect` / `reconnect_interval` | 断线自动重连及间隔 |
+| `handle_revised_bars` | 为 True 时把未完成 K 线的每次更新以 `is_revision=True` 推送 |
+| `order_book_depth` | 盘口档位上限（港股/美股 10，A 股 5） |
+| `account_type` | `CASH` 或 `MARGIN`，需与富途账户类型一致 |
+| `set_specific_venue` | 把 FUTU 账户注册为所有 venue 的账户（同节点跑其它适配器时关闭） |
+| `account_refresh_interval` | 定时刷新资金秒数（0 关闭；订单/成交推送后总会刷新） |
+
+品种加载：`InstrumentProviderConfig(load_all=True, filters={...})` 支持
+`{"venues": ["HKEX"]}`、`{"markets": [1, 11]}`、`{"plates": [(1, "HK.BK1001")]}`、
+`{"option_chains": [{"instrument_id": "00700.HKEX", "begin": "2026-10-01", "end": "2026-12-31"}]}`。
+
+## 注意事项
+
+- 港股 tick 随价格档位变化，品种精度固定为 0.001；下单前可用 `nautilus_futu.parsing.instruments.hk_tick_size(price)` 取当前档位 tick。
+- Futu 的人民币币种为 `CNH`，沪深品种与资金均使用 `CNH`。
+- 历史 K 线受富途 30 天额度限制，`request_bars` 无 `limit` 时按时间范围全部拉取。
+- 成交手续费不在成交推送中，`OrderFilled.commission` 为 0，可用 `PyFutuClient.get_order_fee` 查询。
 
 ## 项目结构
 
@@ -108,27 +151,26 @@ nautilus-futu/
 ├── crates/futu/           # Rust 核心
 │   ├── proto/             # Futu OpenD .proto 文件
 │   └── src/
-│       ├── protocol/      # TCP 协议：包头、编解码、加解密
-│       ├── client/        # 连接管理、握手、心跳、消息分发
-│       ├── quote/         # 行情：订阅、快照、历史K线
+│       ├── protocol/      # TCP 协议：包头、编解码、RSA/AES
+│       ├── client/        # 连接、握手、心跳、消息分发、超时
+│       ├── quote/         # 行情：订阅、快照、历史K线（分页）
 │       ├── trade/         # 交易：账户、下单、查询
 │       ├── generated/     # Protobuf 生成的 Rust 类型
-│       └── python/        # PyO3 绑定
-├── nautilus_futu/          # Python NautilusTrader 适配器
+│       └── python/        # PyO3 绑定（含 poll_push_async）
+├── nautilus_futu/         # Python NautilusTrader 适配器
+│   ├── connection.py      # 共享连接管理（引用计数、重连代数）
 │   ├── data.py            # FutuLiveDataClient
 │   ├── execution.py       # FutuLiveExecutionClient
 │   ├── providers.py       # FutuInstrumentProvider
-│   └── parsing/           # 数据类型转换
-├── tests/
+│   ├── parsing/           # 数据类型转换
+│   └── _rust.pyi          # Rust 扩展类型存根
+├── tests/python/          # 单元测试 + 假 OpenD 端到端测试
 └── examples/
 ```
 
 ## 开发
 
 ```bash
-# 安装 Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
 # 创建并激活虚拟环境
 python -m venv .venv
 # Linux / macOS
@@ -142,37 +184,14 @@ pip install -r requirements-dev.txt
 # 开发模式构建（自动编译 Rust 并安装 Python 包）
 maturin develop
 
-# 运行 Rust 测试
+# Rust 测试 / lint
 cargo test
+cargo clippy --all-targets -- -D warnings
 
-# 运行 Python 测试
+# Python 测试 / lint
 pytest tests/python -v
+ruff check nautilus_futu tests
+
+# 从 proto 重新生成 Rust 类型（需要 protoc）
+cargo build --features regenerate-protos
 ```
-
-## 架构
-
-```
-Python 应用 / NautilusTrader
-        │
-        ▼
-nautilus_futu (Python 适配器层)
-        │
-        ▼ PyO3
-nautilus_futu._rust (Rust 编译的扩展模块)
-        │
-        ▼ TCP + Protobuf + AES
-Futu OpenD 网关
-        │
-        ▼
-港股 / 美股 / A股 交易所
-```
-
-## 许可证
-
-MIT
-
-## 相关链接
-
-- [NautilusTrader](https://github.com/nautechsystems/nautilus_trader)
-- [Futu OpenD 文档](https://openapi.futunn.com/futu-api-doc/)
-- [Futu API Proto 定义](https://github.com/FutunnOpen/py-futu-api)

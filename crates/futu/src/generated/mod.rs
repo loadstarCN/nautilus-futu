@@ -113,3 +113,5 @@ pub mod qot_get_user_security;
 pub mod qot_modify_user_security;
 #[allow(clippy::all)]
 pub mod qot_get_sub_info;
+#[allow(clippy::all)]
+pub mod notify;

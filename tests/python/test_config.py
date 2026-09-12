@@ -1,6 +1,5 @@
 """Tests for Futu adapter configuration."""
 
-import pytest
 
 
 class TestFutuDataClientConfig:

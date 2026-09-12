@@ -90,6 +90,10 @@ pub async fn modify_order(
     qty: Option<f64>,
     price: Option<f64>,
     adjust_limit: Option<f64>,
+    aux_price: Option<f64>,
+    trail_type: Option<i32>,
+    trail_value: Option<f64>,
+    trail_spread: Option<f64>,
 ) -> Result<crate::generated::trd_modify_order::Response, TradeError> {
     let header = crate::generated::trd_common::TrdHeader {
         trd_env,
@@ -111,6 +115,10 @@ pub async fn modify_order(
         price,
         adjust_price: None,
         adjust_side_and_limit: adjust_limit,
+        aux_price,
+        trail_type,
+        trail_value,
+        trail_spread,
         ..Default::default()
     };
 

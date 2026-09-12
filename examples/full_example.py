@@ -203,35 +203,34 @@ def demo_rust_client():
     # ------------------------------------------------------------------
     # 1.9 推送消息接收 (Push Loop)
     # ------------------------------------------------------------------
-    # start_push 注册推送消息转发器，poll_push 轮询接收
-    # start_push 支持追加模式：多次调用不会覆盖，而是追加新的 proto_id
-    # 这是 DataClient + ExecClient 共享连接的基础
+    # start_push 为每个消费者创建一条独立的推送通道并返回 channel_id；
+    # DataClient 与 ExecClient 各自持有自己的通道，通道在重连后依然有效。
     print("\n=== 推送消息 ===")
 
-    # 第一次调用：注册行情推送
-    client.start_push([
-        3005,  # BasicQot 推送（实时报价变更）
+    # 行情推送通道
+    quote_channel = client.start_push([
+        3013,  # OrderBook 推送（盘口，买卖一档报价来源）
         3011,  # Ticker 推送（逐笔成交）
-        3013,  # OrderBook 推送（盘口变更）
         3007,  # KL 推送（K线更新）
+        1003,  # Notify（网关事件/连接状态/额度）
     ])
 
-    # 第二次调用（追加模式）：注册交易推送
-    # 不会覆盖第一次注册的行情推送
-    client.start_push([
+    # 交易推送通道（独立于行情通道）
+    trade_channel = client.start_push([
         2208,  # Order 推送（订单状态变更）
         2218,  # Fill 推送（成交通知）
     ])
 
-    # poll_push 轮询接收推送消息
+    # poll_push 轮询接收推送消息（也可在 asyncio 中 await client.poll_push_async(channel)）
     # timeout_ms: 等待超时（毫秒），默认 100
-    # 返回 dict {"proto_id": int, "data": ...} 或 None（超时）
+    # 返回 dict {"proto_id": int, "data": ...}；超时返回 None；断线抛 ConnectionError
     for _ in range(3):
-        msg = client.poll_push(timeout_ms=200)
+        msg = client.poll_push(quote_channel, timeout_ms=200)
         if msg is not None:
             print(f"  收到推送: proto_id={msg['proto_id']}")
         else:
             print("  无推送消息（超时）")
+    _ = trade_channel
 
     # ------------------------------------------------------------------
     # 1.10 交易功能
@@ -571,15 +570,14 @@ def demo_nautilus_node():
     # node.run() 内部流程:
     #   1. DataClient._connect():
     #      - 连接 OpenD（或复用已有连接）
-    #      - 注册行情推送 (proto 3005/3011/3013/3007)
-    #      - 启动推送轮询循环
+    #      - 注册行情推送通道 (proto 3013/3011/3007/1003)
+    #      - 启动推送接收循环（断线自动重连并恢复订阅）
     #   2. ExecClient._connect():
-    #      - 复用 DataClient 的连接
-    #      - 获取/自动选择账户
+    #      - 复用 DataClient 的连接（引用计数，最后一个释放时才断开）
+    #      - 获取/自动选择账户，把 FUTU 账户注册为所有 venue 的账户
     #      - 解锁交易（如有密码）
-    #      - 订阅交易推送 (sub_acc_push)
-    #      - 注册交易推送 (proto 2208/2218) — 追加到同一 channel
-    #      - 启动交易推送轮询循环
+    #      - 注册交易推送通道 (proto 2208/2218)，再订阅交易推送 (sub_acc_push)
+    #      - 查询资金生成 AccountState，启动交易推送接收循环
     #   3. 策略启动:
     #      - on_start() 中订阅行情
     #      - 收到行情推送后触发 on_quote_tick/on_trade_tick/on_bar 等回调
@@ -636,8 +634,8 @@ class FutuExampleStrategy(Strategy):
         # --- 订阅实时行情 ---
 
         # 订阅报价 (QuoteTick)
-        # 对应 Futu SubType=1 (Basic)
-        # 推送 proto_id=3005，包含最新价/开高低/成交量等
+        # 对应 Futu SubType=2 (OrderBook)，取买卖一档作为 bid/ask
+        # 推送 proto_id=3013
         self.subscribe_quote_ticks(self.instrument_id)
 
         # 订阅逐笔成交 (TradeTick)

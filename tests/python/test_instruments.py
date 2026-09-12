@@ -1,12 +1,11 @@
 """Tests for Futu instrument parsing."""
 
-import pytest
 
-from nautilus_trader.model.instruments import Equity, FuturesContract, OptionContract
 from nautilus_trader.model.enums import OptionKind
+from nautilus_trader.model.instruments import Equity, FuturesContract, OptionContract
 
-from nautilus_futu.parsing.instruments import parse_futu_instrument
 from nautilus_futu.constants import HKEX_VENUE, NYSE_VENUE, SSE_VENUE, SZSE_VENUE
+from nautilus_futu.parsing.instruments import parse_futu_instrument
 
 
 class TestParseFutuInstrument:
@@ -38,7 +37,8 @@ class TestParseFutuInstrument:
         assert instrument is not None
         assert instrument.id.symbol.value == "600519"
         assert instrument.id.venue == SSE_VENUE
-        assert str(instrument.quote_currency) == "CNY"
+        # Futu settles CN trades in CNH (its Currency enum has no CNY)
+        assert str(instrument.quote_currency) == "CNH"
 
     def test_cn_sz_equity(self):
         info = {"market": 22, "code": "000001", "name": "PING AN", "lot_size": 100}
@@ -46,7 +46,7 @@ class TestParseFutuInstrument:
         assert instrument is not None
         assert instrument.id.symbol.value == "000001"
         assert instrument.id.venue == SZSE_VENUE
-        assert str(instrument.quote_currency) == "CNY"
+        assert str(instrument.quote_currency) == "CNH"
 
     def test_hk_future_uses_hkd(self):
         """market=2 (HK futures) should use HKD."""
@@ -72,7 +72,7 @@ class TestParseFutuInstrument:
 
     def test_empty_dict_returns_none(self):
         """Empty dict should not crash, returns instrument with default fields."""
-        instrument = parse_futu_instrument({})
+        parse_futu_instrument({})
         # Should succeed with defaults (market=0, code="")
         # or return None if code is empty - depends on implementation
         # It actually succeeds with empty code
@@ -94,11 +94,35 @@ class TestParseFutuInstrument:
         assert instrument.price_precision == 3
 
     def test_price_precision_from_spread(self):
-        """price_spread in static_info should override market default."""
+        """A coarse spread never reduces precision below the market's finest tick."""
         info = {"market": 1, "code": "00700", "lot_size": 100, "price_spread": 0.2}
         instrument = parse_futu_instrument(info)
         assert instrument is not None
-        assert instrument.price_precision == 1
+        assert instrument.price_precision == 3
+        assert str(instrument.price_increment) == "0.001"
+
+    def test_price_precision_finer_spread(self):
+        """A finer spread than the market default raises the precision (US sub-penny)."""
+        info = {"market": 11, "code": "SNDL", "lot_size": 1, "price_spread": 0.0001}
+        instrument = parse_futu_instrument(info)
+        assert instrument is not None
+        assert instrument.price_precision == 4
+        assert str(instrument.price_increment) == "0.0001"
+
+    def test_hk_tick_size_table(self):
+        from nautilus_futu.parsing.instruments import hk_tick_size
+
+        assert hk_tick_size(0.1) == 0.001
+        assert hk_tick_size(0.3) == 0.005
+        assert hk_tick_size(5.0) == 0.01
+        assert hk_tick_size(15.0) == 0.02
+        assert hk_tick_size(50.0) == 0.05
+        assert hk_tick_size(150.0) == 0.1
+        assert hk_tick_size(345.0) == 0.2
+        assert hk_tick_size(750.0) == 0.5
+        assert hk_tick_size(1500.0) == 1.0
+        assert hk_tick_size(3000.0) == 2.0
+        assert hk_tick_size(6000.0) == 5.0
 
     def test_sgx_currency_sgd(self):
         """market=31 (SGX) should use SGD currency."""
@@ -111,16 +135,17 @@ class TestParseFutuInstrument:
         assert str(instrument.quote_currency) == "SGD"
 
     def test_lot_size_zero(self):
-        """lot_size=0 triggers validation error, should return None gracefully."""
+        """lot_size=0 (indices/odd data) falls back to a lot size of 1."""
         info = {"market": 1, "code": "00700", "lot_size": 0}
         instrument = parse_futu_instrument(info)
-        assert instrument is None
+        assert instrument is not None
+        assert int(instrument.lot_size) == 1
 
     def test_empty_code(self):
         """Empty code should still parse without crashing."""
         info = {"market": 1, "code": "", "lot_size": 1}
         # Should not raise
-        result = parse_futu_instrument(info)
+        parse_futu_instrument(info)
         # Result may be None or a valid instrument - just ensure no crash
         # Should not raise -- either result is fine, just no crash
         assert True
@@ -291,17 +316,50 @@ class TestFutureParsing:
         assert str(instrument.quote_currency) == "USD"
 
     def test_future_defaults_when_fields_missing(self):
-        """Future with minimal fields should still parse."""
+        """Future with minimal fields (official SecurityType_Future=10) should still parse."""
         info = {
             "market": 2,
             "code": "HSI_FUT",
             "lot_size": 1,
-            "sec_type": 8,
+            "sec_type": 10,
         }
         instrument = parse_futu_instrument(info)
         assert instrument is not None
         assert isinstance(instrument, FuturesContract)
         assert instrument.expiration_ns == 0
+
+    def test_future_detected_by_extended_data(self):
+        """Future extended data wins over an ambiguous sec_type."""
+        info = {
+            "market": 2,
+            "code": "HSImain",
+            "lot_size": 1,
+            "sec_type": 8,
+            "last_trade_timestamp": 1735603200.0,
+            "is_main_contract": True,
+        }
+        instrument = parse_futu_instrument(info)
+        assert isinstance(instrument, FuturesContract)
+        assert instrument.expiration_ns == 1735603200 * 1_000_000_000
+
+    def test_option_official_sec_type_drvt(self):
+        """Official SecurityType_Drvt=8 with option data parses as an option."""
+        from nautilus_trader.model.instruments import OptionContract
+
+        info = {
+            "market": 1,
+            "code": "TCH250130C400000",
+            "lot_size": 100,
+            "sec_type": 8,
+            "option_type": 1,
+            "option_owner_code": "00700",
+            "strike_price": 400.0,
+            "strike_time": "2025-01-30",
+        }
+        instrument = parse_futu_instrument(info)
+        assert isinstance(instrument, OptionContract)
+        assert instrument.underlying == "00700"
+        assert instrument.expiration_ns > 0
 
 
 class TestUnknownSecType:

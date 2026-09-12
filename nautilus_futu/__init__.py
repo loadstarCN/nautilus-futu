@@ -1,5 +1,7 @@
 """Futu OpenD adapter for NautilusTrader."""
 
+__version__ = "0.5.0"
+
 
 def __getattr__(name):
     """Lazy imports to avoid requiring nautilus_trader at import time."""
@@ -7,6 +9,7 @@ def __getattr__(name):
         "FutuDataClientConfig": "nautilus_futu.config",
         "FutuExecClientConfig": "nautilus_futu.config",
         "FUTU_VENUE": "nautilus_futu.constants",
+        "FutuConnectionManager": "nautilus_futu.connection",
         "FutuLiveDataClient": "nautilus_futu.data",
         "FutuLiveExecutionClient": "nautilus_futu.execution",
         "FutuLiveDataClientFactory": "nautilus_futu.factories",
@@ -15,6 +18,7 @@ def __getattr__(name):
     }
     if name in _imports:
         import importlib
+
         module = importlib.import_module(_imports[name])
         return getattr(module, name)
     raise AttributeError(f"module 'nautilus_futu' has no attribute {name!r}")
@@ -22,6 +26,7 @@ def __getattr__(name):
 
 __all__ = [
     "FUTU_VENUE",
+    "FutuConnectionManager",
     "FutuDataClientConfig",
     "FutuExecClientConfig",
     "FutuInstrumentProvider",

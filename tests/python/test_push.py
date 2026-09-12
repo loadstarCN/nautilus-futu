@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import pytest
 from nautilus_trader.model.data import (
     Bar,
     BarSpecification,
     BarType,
-    OrderBookDelta,
     OrderBookDeltas,
     QuoteTick,
     TradeTick,
@@ -20,7 +18,7 @@ from nautilus_trader.model.enums import (
     OrderStatus,
     PriceType,
 )
-from nautilus_trader.model.identifiers import InstrumentId, Symbol, TradeId, Venue
+from nautilus_trader.model.identifiers import TradeId
 
 from nautilus_futu.common import futu_security_to_instrument_id
 from nautilus_futu.constants import (
@@ -33,8 +31,8 @@ from nautilus_futu.constants import (
     FUTU_ORDER_STATUS_CANCELLED_ALL,
     FUTU_ORDER_STATUS_FILLED_ALL,
     FUTU_ORDER_STATUS_FILLED_PART,
-    FUTU_ORDER_STATUS_SUBMITTED,
     FUTU_ORDER_STATUS_SUBMIT_FAILED,
+    FUTU_ORDER_STATUS_SUBMITTED,
 )
 from nautilus_futu.parsing.market_data import (
     futu_kl_type_to_bar_spec,

@@ -9,34 +9,56 @@ use crate::client::connection::{FutuConnection, ConnectionError};
 /// ProtoID for KeepAlive
 const PROTO_ID_KEEP_ALIVE: u32 = 1004;
 
+/// Consecutive keepalive failures tolerated before the connection is
+/// declared dead.
+const MAX_FAILURES: u32 = 3;
+
+/// The connection is considered stale when nothing at all has been received
+/// for this many keepalive intervals.  OpenD answers every KeepAlive, so a
+/// healthy link always refreshes `last_recv` at least once per interval.
+const STALE_INTERVALS: u64 = 3;
+
 /// Start the keepalive heartbeat loop.
 /// Returns a JoinHandle that can be used to cancel the loop.
 ///
-/// When keepalive fails `MAX_FAILURES` consecutive times, a signal is sent
-/// via `failure_tx` so the recv loop can detect the dead connection.
+/// A failure is counted when either the KeepAlive frame cannot be sent, or
+/// nothing has been received from OpenD for `STALE_INTERVALS` intervals
+/// (half-open TCP connection).  After `MAX_FAILURES` consecutive failures a
+/// signal is sent via `failure_tx` so the recv loop can shut down.
 pub fn start_keepalive(
     conn: Arc<FutuConnection>,
     interval_secs: i32,
     failure_tx: oneshot::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
-    let interval = Duration::from_secs(interval_secs.max(1) as u64);
+    let interval_secs = interval_secs.max(1) as u64;
+    let interval = Duration::from_secs(interval_secs);
+    let stale_after_ms = interval_secs * STALE_INTERVALS * 1000;
 
     tokio::spawn(async move {
         let mut ticker = time::interval(interval);
         ticker.tick().await; // Skip the first immediate tick
         let mut consecutive_failures: u32 = 0;
-        const MAX_FAILURES: u32 = 3;
 
         loop {
             ticker.tick().await;
-            if let Err(e) = send_keepalive(&conn).await {
+            let result = send_keepalive(&conn).await;
+            let silent_ms = conn.millis_since_last_recv();
+            let failure: Option<String> = match result {
+                Err(e) => Some(e.to_string()),
+                Ok(()) if silent_ms > stale_after_ms => {
+                    Some(format!("no data received from OpenD for {}ms", silent_ms))
+                }
+                Ok(()) => None,
+            };
+
+            if let Some(reason) = failure {
                 consecutive_failures += 1;
                 if consecutive_failures >= MAX_FAILURES {
-                    tracing::error!("KeepAlive failed {} consecutive times, stopping: {}", MAX_FAILURES, e);
+                    tracing::error!("KeepAlive failed {} consecutive times, stopping: {}", MAX_FAILURES, reason);
                     let _ = failure_tx.send(());
                     break;
                 }
-                tracing::warn!("KeepAlive failed (attempt {}/{}): {}", consecutive_failures, MAX_FAILURES, e);
+                tracing::warn!("KeepAlive failed (attempt {}/{}): {}", consecutive_failures, MAX_FAILURES, reason);
             } else {
                 consecutive_failures = 0;
             }
