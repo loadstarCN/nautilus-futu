@@ -6,12 +6,14 @@ import math
 from typing import Any
 
 from nautilus_trader.model.data import (
+    NULL_ORDER,
     Bar,
     BarSpecification,
     BarType,
     BookOrder,
     OrderBookDelta,
     OrderBookDeltas,
+    OrderBookDepth10,
     QuoteTick,
     TradeTick,
 )
@@ -44,6 +46,9 @@ from nautilus_futu.constants import (
 
 # NautilusTrader's maximum fixed-point precision (standard precision build).
 MAX_PRECISION = 9
+
+# Levels per side of an `OrderBookDepth10`
+DEPTH10_LEVELS = 10
 
 _MINUTE_STEP_TO_KL_TYPE: dict[int, int] = {
     1: FUTU_KL_TYPE_1MIN,
@@ -366,13 +371,7 @@ def parse_push_order_book(
     ``F_LAST`` so the book applies the batch atomically; ``depth`` (>0)
     truncates each side.
     """
-    ts_event = seconds_to_ns(
-        max(
-            float(data.get("svr_recv_time_bid_timestamp") or 0),
-            float(data.get("svr_recv_time_ask_timestamp") or 0),
-        ),
-        ts_init,
-    )
+    ts_event = _book_timestamp(data, ts_init)
     bids = data.get("bids") or []
     asks = data.get("asks") or []
     if depth and depth > 0:
@@ -432,3 +431,63 @@ def parse_push_order_book(
         ts_init=ts_init,
     )
     return OrderBookDeltas(instrument_id=instrument_id, deltas=deltas)
+
+
+def _book_timestamp(data: dict[str, Any], ts_init: int) -> int:
+    return seconds_to_ns(
+        max(
+            float(data.get("svr_recv_time_bid_timestamp") or 0),
+            float(data.get("svr_recv_time_ask_timestamp") or 0),
+        ),
+        ts_init,
+    )
+
+
+def parse_order_book_depth10(
+    data: dict[str, Any],
+    instrument_id: InstrumentId,
+    ts_init: int,
+    instrument: Instrument | None = None,
+    sequence: int = 0,
+) -> OrderBookDepth10:
+    """Parse a Futu order book push/snapshot into an ``OrderBookDepth10``.
+
+    OpenD sends up to 10 levels per side (5 for A-shares); missing levels are
+    padded with null orders and zero counts.  Per-level order counts come from
+    Futu's ``order_count``.
+    """
+
+    def side_levels(levels: list[dict[str, Any]], side: OrderSide) -> tuple[list[BookOrder], list[int]]:
+        orders: list[BookOrder] = []
+        counts: list[int] = []
+        for level in levels:
+            volume = level.get("volume") or 0
+            if volume <= 0:
+                continue
+            orders.append(
+                BookOrder(
+                    side=side,
+                    price=make_price(level["price"], instrument),
+                    size=make_qty(volume, instrument),
+                    order_id=0,
+                )
+            )
+            counts.append(max(0, int(level.get("order_count") or 0)))
+            if len(orders) == DEPTH10_LEVELS:
+                break
+        padding = DEPTH10_LEVELS - len(orders)
+        return orders + [NULL_ORDER] * padding, counts + [0] * padding
+
+    bids, bid_counts = side_levels(data.get("bids") or [], OrderSide.BUY)
+    asks, ask_counts = side_levels(data.get("asks") or [], OrderSide.SELL)
+    return OrderBookDepth10(
+        instrument_id=instrument_id,
+        bids=bids,
+        asks=asks,
+        bid_counts=bid_counts,
+        ask_counts=ask_counts,
+        flags=RecordFlag.F_SNAPSHOT | RecordFlag.F_LAST,
+        sequence=sequence,
+        ts_event=_book_timestamp(data, ts_init),
+        ts_init=ts_init,
+    )

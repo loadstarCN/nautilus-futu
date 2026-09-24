@@ -51,6 +51,9 @@ class FutuDataClientConfig(LiveDataClientConfig, frozen=True):
         When True, every K-line push for the *current* (unfinished) bar is
         forwarded with ``is_revision=True``.  When False only completed bars
         are emitted.
+    market_status_interval : float, default 10.0
+        Seconds between OpenD market-state polls backing
+        ``subscribe_instrument_status`` (only polled while subscribed).
     """
 
     host: str = "127.0.0.1"
@@ -64,6 +67,7 @@ class FutuDataClientConfig(LiveDataClientConfig, frozen=True):
     reconnect: bool = True
     reconnect_interval: float = 5.0
     order_book_depth: int = 10
+    market_status_interval: float = 10.0
     routing: RoutingConfig = FUTU_DEFAULT_ROUTING
 
 

@@ -9,7 +9,15 @@ from unittest.mock import MagicMock
 import pytest
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
-from nautilus_trader.model.data import Bar, BarSpecification, BarType, OrderBookDeltas, QuoteTick, TradeTick
+from nautilus_trader.model.data import (
+    Bar,
+    BarSpecification,
+    BarType,
+    OrderBookDeltas,
+    OrderBookDepth10,
+    QuoteTick,
+    TradeTick,
+)
 from nautilus_trader.model.enums import AggregationSource, BarAggregation, BookAction, BookType, PriceType, RecordFlag
 from nautilus_trader.model.identifiers import TraderId
 
@@ -206,6 +214,66 @@ class TestOrderBookPush:
     def test_unsubscribed_ignored(self, h):
         h.client._handle_push_order_book(book_push())
         assert h.data == []
+
+    def test_depth10_padded_with_counts(self, h):
+        h.client._subscribed_book_depth.add(IID)
+        h.client._handle_push_order_book(book_push(levels=5))
+        assert len(h.data) == 1
+        depth = h.data[0]
+        assert isinstance(depth, OrderBookDepth10)
+        assert len(depth.bids) == len(depth.asks) == 10
+        assert str(depth.bids[0].price) == "345.200"
+        assert str(depth.asks[4].price) == "346.200"
+        assert int(depth.bids[0].size) == 1000
+        assert depth.bids[5].size == 0  # padded level
+        assert depth.bid_counts == [3] * 5 + [0] * 5
+        assert depth.ask_counts == [2] * 5 + [0] * 5
+        assert depth.flags & RecordFlag.F_LAST
+        assert depth.sequence == 1
+        assert depth.ts_event == 1718400000 * 1_000_000_000
+
+    def test_depth10_uneven_sides_and_zero_volume_levels(self, h):
+        h.client._subscribed_book_depth.add(IID)
+        data = book_push(levels=3)
+        data["bids"][1]["volume"] = 0
+        data["asks"] = []
+        h.client._handle_push_order_book(data)
+        depth = h.data[0]
+        assert [str(b.price) for b in depth.bids[:2]] == ["345.200", "344.800"]
+        assert depth.bids[2].size == 0
+        assert all(a.size == 0 for a in depth.asks)
+
+    def test_depth10_and_deltas_share_sequence(self, h):
+        h.client._subscribed_order_books[IID] = 10
+        h.client._subscribed_book_depth.add(IID)
+        h.client._handle_push_order_book(book_push(levels=2))
+        assert [type(d) for d in h.data] == [OrderBookDeltas, OrderBookDepth10]
+        assert h.data[0].deltas[0].sequence == h.data[1].sequence == 1
+
+
+class TestOrderBookDepthSubscription:
+    def test_depth_shares_book_stream_with_quotes(self, h):
+        cmd = MagicMock(instrument_id=IID)
+        h.run(h.client._subscribe_order_book_depth(cmd))
+        h.rust.subscribe.assert_called_once_with([(1, "00700")], [FUTU_SUB_TYPE_ORDER_BOOK], True)
+        h.run(h.client._subscribe_quote_ticks(IID))
+        assert h.rust.subscribe.call_count == 1  # stream reused
+        h.run(h.client._unsubscribe_order_book_depth(cmd))
+        assert h.rust.subscribe.call_count == 1  # quotes still need it
+        h.run(h.client._unsubscribe_quote_ticks(IID))
+        assert h.rust.subscribe.call_count == 2
+        assert h.rust.subscribe.call_args.args == ([(1, "00700")], [FUTU_SUB_TYPE_ORDER_BOOK], False)
+
+    def test_depth_subscription_restored_after_reconnect(self, h):
+        h.run(h.client._subscribe_order_book_depth(MagicMock(instrument_id=IID)))
+        h.rust.subscribe.reset_mock()
+        h.run(h.client._restore_subscriptions())
+        h.rust.subscribe.assert_called_once_with([(1, "00700")], [FUTU_SUB_TYPE_ORDER_BOOK], True)
+
+    def test_depth_subscribe_failure_not_recorded(self, h):
+        h.rust.subscribe.side_effect = RuntimeError("no quota")
+        h.run(h.client._subscribe_order_book_depth(MagicMock(instrument_id=IID)))
+        assert IID not in h.client._subscribed_book_depth
 
 
 class TestTickerPush:

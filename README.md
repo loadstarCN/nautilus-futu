@@ -7,8 +7,9 @@ Futu OpenD adapter for [NautilusTrader](https://github.com/nautechsystems/nautil
 - **独立安装包** — 不依赖 NautilusTrader 主仓库，自主控制版本发布
 - **Rust 协议层** — 用 Rust 实现 Futu OpenD TCP 二进制协议（含 RSA/AES 加密），高性能低延迟
 - **无 protobuf 冲突** — 不依赖 `futu-api` Python 包，Rust 侧用 prost 处理 protobuf
-- **完整交易生命周期** — 下单 / 改单 / 撤单 / 条件单，订单与成交推送映射为 Nautilus 事件，支持对账
-- **行情** — 真实买卖一档报价（来自盘口）、逐笔成交、L2 盘口、K 线推送（完成 K 线 / 可选修订）、分页历史 K 线
+- **完整交易生命周期** — 下单 / 改单 / 撤单 / 条件单 / 订单列表，订单与成交推送映射为 Nautilus 事件，支持对账（含历史订单/成交回溯）
+- **行情** — 真实买卖一档报价（来自盘口）、逐笔成交、L2 盘口（增量或 `OrderBookDepth10` 十档快照）、K 线推送（完成 K 线 / 可选修订）、分页历史 K 线
+- **市场状态** — 午休、收市竞价、盘前盘后等市场状态映射为 `InstrumentStatus` 事件
 - **连接管理** — 行情与交易共用一条 TCP 连接，断线检测、自动重连并恢复订阅，请求超时保护
 
 ## 支持市场
@@ -87,6 +88,8 @@ node.run()
 self.subscribe_quote_ticks(instrument_id)        # 买卖一档（来自盘口推送）
 self.subscribe_trade_ticks(instrument_id)        # 逐笔成交
 self.subscribe_order_book_deltas(instrument_id)  # L2 盘口（最多 10 档）
+self.subscribe_order_book_depth(instrument_id)   # OrderBookDepth10 十档快照（与盘口共用一个订阅）
+self.subscribe_instrument_status(instrument_id)  # 市场状态：开盘 / 午休 / 收市竞价 / 收盘 ...
 self.subscribe_bars(BarType.from_str("00700.HKEX-1-MINUTE-LAST-EXTERNAL"))
 self.request_bars(bar_type, start=..., end=...)  # 历史 K 线（自动分页）
 
@@ -94,6 +97,7 @@ self.submit_order(self.order_factory.limit(...))            # 限价
 self.submit_order(self.order_factory.market(...))           # 市价
 self.submit_order(self.order_factory.stop_limit(...))       # 止损限价
 self.submit_order(self.order_factory.trailing_stop_market(...))  # 跟踪止损
+self.submit_order_list(order_list)                          # 逐笔下单（OCO/OUO 需策略开启 manage_contingent_orders）
 self.modify_order(order, price=...)
 self.cancel_all_orders(instrument_id)
 ```
@@ -101,6 +105,13 @@ self.cancel_all_orders(instrument_id)
 支持的订单类型：`LIMIT`、`MARKET`、`STOP_MARKET`、`STOP_LIMIT`、`MARKET_IF_TOUCHED`、
 `LIMIT_IF_TOUCHED`、`TRAILING_STOP_MARKET`、`TRAILING_STOP_LIMIT`；有效期 `DAY` / `GTC`。
 美股盘前盘后成交通过 `FutuExecClientConfig.fill_outside_rth` 或订单 tag `FUTU_RTH:1` 开启。
+
+富途没有原生的括号单 / OTO 条件单，直接提交的 bracket 订单列表会被拒绝（以免止损单在开仓单成交前生效）。
+请给子订单设置 `emulation_trigger`（如 `TriggerType.BID_ASK`），由 NautilusTrader 的 OrderEmulator 在母单成交后再释放子订单。
+
+`subscribe_instrument_status` 的 `InstrumentStatus.action` 映射：连续交易 → `TRADING`，午休 / 期货休市 → `PAUSE`，
+开盘前竞价 / 美股盘前 → `PRE_OPEN`，港股收市竞价 (CAS) → `PRE_CLOSE`，美股盘后 / 夜盘 → `POST_CLOSE`，收盘 → `CLOSE`；
+富途原始状态名（如 `REST`、`HK_CAS`）放在 `trading_event` 中。
 
 ### 直接使用 Rust 客户端
 
@@ -117,6 +128,10 @@ bars = client.get_history_kl(1, "00700", rehab_type=1, kl_type=2,
 channel = client.start_push([3013])                       # 盘口推送
 client.subscribe([(1, "00700")], [2], True)
 msg = client.poll_push(channel, 1000)                     # 断线时抛 ConnectionError
+
+# 历史订单 / 成交（时间为市场当地时间；省略时默认最近 90 天）
+fills = client.get_history_order_fill_list(1, acc_id, 1, begin_time="2026-09-01 00:00:00",
+                                           end_time="2026-09-24 23:59:59", code_list=["00700"])
 client.disconnect()
 ```
 
@@ -129,6 +144,7 @@ client.disconnect()
 | `reconnect` / `reconnect_interval` | 断线自动重连及间隔 |
 | `handle_revised_bars` | 为 True 时把未完成 K 线的每次更新以 `is_revision=True` 推送 |
 | `order_book_depth` | 盘口档位上限（港股/美股 10，A 股 5） |
+| `market_status_interval` | 市场状态轮询间隔秒数，默认 10（仅在订阅了 instrument status 时轮询） |
 | `account_type` | `CASH` 或 `MARGIN`，需与富途账户类型一致 |
 | `set_specific_venue` | 把 FUTU 账户注册为所有 venue 的账户（同节点跑其它适配器时关闭） |
 | `account_refresh_interval` | 定时刷新资金秒数（0 关闭；订单/成交推送后总会刷新） |
@@ -143,6 +159,9 @@ client.disconnect()
 - Futu 的人民币币种为 `CNH`，沪深品种与资金均使用 `CNH`。
 - 历史 K 线受富途 30 天额度限制，`request_bars` 无 `limit` 时按时间范围全部拉取。
 - 成交手续费不在成交推送中，`OrderFilled.commission` 为 0，可用 `PyFutuClient.get_order_fee` 查询。
+- 对账回溯：`LiveExecEngineConfig(reconciliation_lookback_mins=...)` 早于当天时，会额外拉取历史订单 / 成交，
+  使节点离线期间的成交也能对账；部分环境（如模拟盘）不提供历史成交时仅记录警告，当天数据照常对账。
+- OpenD 不推送市场状态变化，`subscribe_instrument_status` 通过 `get_global_state` 轮询实现，状态变化最多延迟一个轮询间隔。
 
 ## 项目结构
 

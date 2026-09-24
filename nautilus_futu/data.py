@@ -14,6 +14,7 @@ from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import Bar, BarType, DataType, OrderBookDeltas
 from nautilus_trader.model.enums import BarAggregation, BookType
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
+from nautilus_trader.model.instruments import FuturesContract
 
 from nautilus_futu.common import (
     futu_security_to_instrument_id,
@@ -43,9 +44,12 @@ from nautilus_futu.parsing.market_data import (
     parse_futu_bars,
     parse_futu_quote_tick,
     parse_futu_trade_tick,
+    parse_order_book_depth10,
     parse_order_book_to_quote_tick,
     parse_push_order_book,
+    seconds_to_ns,
 )
+from nautilus_futu.parsing.status import market_state_field, parse_futu_instrument_status
 from nautilus_futu.providers import FutuInstrumentProvider
 
 # Push protocols this client consumes
@@ -70,7 +74,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
     Quote ticks are derived from the level-1 of the order book stream
     (``SubType_OrderBook``), trade ticks from the ticker stream and bars from
     the K-line streams.  A single order book subscription is shared between
-    quote-tick and order-book consumers.
+    quote-tick, order-book-delta and ``OrderBookDepth10`` consumers.
 
     Parameters
     ----------
@@ -134,13 +138,18 @@ class FutuLiveDataClient(LiveMarketDataClient):
         self._quote_fallback_basic: set[InstrumentId] = set()
         self._subscribed_trade_ticks: set[InstrumentId] = set()
         self._subscribed_order_books: dict[InstrumentId, int] = {}  # instrument -> depth
+        self._subscribed_book_depth: set[InstrumentId] = set()  # OrderBookDepth10 consumers
         self._subscribed_bars: dict[tuple[InstrumentId, int], BarType] = {}  # (instrument, kl_type)
         self._partial_bars: dict[BarType, Bar] = {}
         self._last_emitted_bar_ts: dict[BarType, int] = {}
         self._book_sequence: dict[InstrumentId, int] = {}
+        # Instrument status: instrument -> `get_global_state` key, last emitted state
+        self._subscribed_status: dict[InstrumentId, str] = {}
+        self._last_market_state: dict[InstrumentId, int] = {}
 
         self._push_task: asyncio.Task | None = None
         self._bar_flush_task: asyncio.Task | None = None
+        self._status_task: asyncio.Task | None = None
         self._push_channel_id: int | None = None
         self._restored_generation: int = -1
         self._use_async_push = hasattr(client, "poll_push_async")
@@ -164,6 +173,8 @@ class FutuLiveDataClient(LiveMarketDataClient):
 
             self._push_task = self.create_task(self._run_push_loop())
             self._bar_flush_task = self.create_task(self._run_bar_flush_loop())
+            if self._subscribed_status and self._status_task is None:
+                self._status_task = self.create_task(self._run_market_status_loop())
             self._log.info(f"Push loop started (channel_id={self._push_channel_id})")
         except Exception as e:
             self._log.error(f"Failed to connect to Futu OpenD: {e}")
@@ -172,7 +183,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
     async def _disconnect(self) -> None:
         """Disconnect from Futu OpenD."""
         self._log.info("Disconnecting from Futu OpenD...")
-        for attr in ("_push_task", "_bar_flush_task"):
+        for attr in ("_push_task", "_bar_flush_task", "_status_task"):
             task = getattr(self, attr)
             if task is not None:
                 task.cancel()
@@ -253,7 +264,11 @@ class FutuLiveDataClient(LiveMarketDataClient):
         """Re-subscribe every stream after a (possibly external) reconnect."""
         generation = self._conn.generation
         self._log.info(f"Restoring subscriptions (connection generation {generation})")
-        books = (set(self._subscribed_quote_ticks) - self._quote_fallback_basic) | set(self._subscribed_order_books)
+        books = (
+            (set(self._subscribed_quote_ticks) - self._quote_fallback_basic)
+            | set(self._subscribed_order_books)
+            | self._subscribed_book_depth
+        )
         total = 0
         for instrument_id in books:
             if await self._futu_subscribe(instrument_id, FUTU_SUB_TYPE_ORDER_BOOK, True):
@@ -305,7 +320,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 self._handle_data(tick)
 
     def _handle_push_order_book(self, data: dict) -> None:
-        """Handle order book push (proto 3013): L2 deltas and/or level-1 quote tick."""
+        """Handle order book push (proto 3013): level-1 quote tick, L2 deltas and/or depth-10 snapshot."""
         instrument_id = futu_security_to_instrument_id(data["market"], data["code"])
         instrument = self._instrument_for(instrument_id)
         ts_init = self._clock.timestamp_ns()
@@ -316,13 +331,18 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 self._handle_data(tick)
 
         depth = self._subscribed_order_books.get(instrument_id)
+        wants_depth10 = instrument_id in self._subscribed_book_depth
+        if depth is None and not wants_depth10:
+            return
+        sequence = self._book_sequence.get(instrument_id, 0) + 1
+        self._book_sequence[instrument_id] = sequence
         if depth is not None:
-            sequence = self._book_sequence.get(instrument_id, 0) + 1
-            self._book_sequence[instrument_id] = sequence
             deltas = parse_push_order_book(
                 data, instrument_id, ts_init, instrument, depth=depth, sequence=sequence,
             )
             self._handle_data(deltas)
+        if wants_depth10:
+            self._handle_data(parse_order_book_depth10(data, instrument_id, ts_init, instrument, sequence=sequence))
 
     def _handle_push_kl(self, data: dict) -> None:
         """Handle K-line push (proto 3007).
@@ -384,6 +404,45 @@ class FutuLiveDataClient(LiveMarketDataClient):
         log_futu_notify(self._log, data)
 
     # ------------------------------------------------------------------
+    # Instrument status (market state polling)
+    # ------------------------------------------------------------------
+
+    async def _run_market_status_loop(self) -> None:
+        """Poll OpenD market states while instrument-status subscriptions exist.
+
+        OpenD does not push market-state changes, so ``get_global_state`` is
+        polled every ``market_status_interval`` seconds; one request covers
+        every subscribed instrument.
+        """
+        try:
+            while self._subscribed_status:
+                try:
+                    await self._poll_market_status()
+                except asyncio.CancelledError:
+                    raise
+                except ConnectionError as e:
+                    self._log.debug(f"Market status poll skipped: {e}")
+                except Exception as e:
+                    self._log.warning(f"Market status poll failed: {e}")
+                await asyncio.sleep(self._config.market_status_interval)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if self._status_task is asyncio.current_task():
+                self._status_task = None
+
+    async def _poll_market_status(self) -> None:
+        state = await asyncio.to_thread(self._client.get_global_state)
+        ts_init = self._clock.timestamp_ns()
+        ts_event = seconds_to_ns(state.get("time"), ts_init)
+        for instrument_id, field in list(self._subscribed_status.items()):
+            value = state.get(field)
+            if value is None or self._last_market_state.get(instrument_id) == value:
+                continue
+            self._last_market_state[instrument_id] = int(value)
+            self._handle_data(parse_futu_instrument_status(instrument_id, int(value), ts_event, ts_init))
+
+    # ------------------------------------------------------------------
     # Subscriptions
     # ------------------------------------------------------------------
 
@@ -401,7 +460,11 @@ class FutuLiveDataClient(LiveMarketDataClient):
         wants_book_quotes = (
             instrument_id in self._subscribed_quote_ticks and instrument_id not in self._quote_fallback_basic
         )
-        return wants_book_quotes or instrument_id in self._subscribed_order_books
+        return (
+            wants_book_quotes
+            or instrument_id in self._subscribed_order_books
+            or instrument_id in self._subscribed_book_depth
+        )
 
     async def _subscribe_quote_ticks(self, command) -> None:
         """Subscribe to quote tick updates (level-1 of the order book stream).
@@ -451,6 +514,13 @@ class FutuLiveDataClient(LiveMarketDataClient):
         """Subscribe to order book snapshots (served from the same delta stream)."""
         await self._subscribe_order_book(command)
 
+    async def _subscribe_order_book_depth(self, command) -> None:
+        """Subscribe to ``OrderBookDepth10`` snapshots (up to 10 levels, 5 for A-shares)."""
+        instrument_id = getattr(command, "instrument_id", command)
+        if self._book_needed(instrument_id) or await self._futu_subscribe(instrument_id, FUTU_SUB_TYPE_ORDER_BOOK, True):
+            self._subscribed_book_depth.add(instrument_id)
+            self._log.info(f"Subscribed to order book depth for {instrument_id}")
+
     async def _subscribe_bars(self, command) -> None:
         """Subscribe to bar updates."""
         bar_type = getattr(command, "bar_type", command)
@@ -463,6 +533,37 @@ class FutuLiveDataClient(LiveMarketDataClient):
         if await self._futu_subscribe(instrument_id, sub_type, True):
             self._subscribed_bars[(instrument_id, kl_type)] = bar_type
             self._log.info(f"Subscribed to bars for {bar_type}")
+
+    async def _subscribe_instrument_status(self, command) -> None:
+        """Subscribe to market status changes (lunch break, auctions, close...).
+
+        The current status is emitted right away, then on every change.
+        """
+        instrument_id = getattr(command, "instrument_id", command)
+        is_future = isinstance(self._instrument_for(instrument_id), FuturesContract)
+        field = market_state_field(instrument_id, is_future)
+        if field is None:
+            self._log.error(f"No Futu market state for venue {instrument_id.venue}; cannot subscribe status")
+            return
+        self._subscribed_status[instrument_id] = field
+        self._last_market_state.pop(instrument_id, None)
+        self._log.info(f"Subscribed to instrument status for {instrument_id} ({field})")
+        if self._status_task is None:
+            self._status_task = self.create_task(self._run_market_status_loop())
+        else:
+            try:
+                await self._poll_market_status()  # initial status without waiting for the next poll
+            except Exception as e:
+                self._log.warning(f"Market status poll failed: {e}")
+
+    async def _unsubscribe_instrument_status(self, command) -> None:
+        """Unsubscribe from market status changes (the poll loop stops with the last one)."""
+        instrument_id = getattr(command, "instrument_id", command)
+        self._subscribed_status.pop(instrument_id, None)
+        self._last_market_state.pop(instrument_id, None)
+        if not self._subscribed_status and self._status_task is not None:
+            self._status_task.cancel()
+            self._status_task = None
 
     async def _unsubscribe_quote_ticks(self, command) -> None:
         """Unsubscribe from quote tick updates."""
@@ -484,7 +585,12 @@ class FutuLiveDataClient(LiveMarketDataClient):
     async def _unsubscribe_order_book(self, command) -> None:
         instrument_id = getattr(command, "instrument_id", command)
         self._subscribed_order_books.pop(instrument_id, None)
-        self._book_sequence.pop(instrument_id, None)
+        await self._release_book_stream(instrument_id)
+
+    async def _release_book_stream(self, instrument_id: InstrumentId) -> None:
+        """Unsubscribe the order book stream once no consumer needs it."""
+        if instrument_id not in self._subscribed_order_books and instrument_id not in self._subscribed_book_depth:
+            self._book_sequence.pop(instrument_id, None)
         if not self._book_needed(instrument_id):
             await self._futu_subscribe(instrument_id, FUTU_SUB_TYPE_ORDER_BOOK, False)
 
@@ -495,6 +601,12 @@ class FutuLiveDataClient(LiveMarketDataClient):
     async def _unsubscribe_order_book_snapshots(self, command) -> None:
         """Unsubscribe from order book snapshots."""
         await self._unsubscribe_order_book(command)
+
+    async def _unsubscribe_order_book_depth(self, command) -> None:
+        """Unsubscribe from ``OrderBookDepth10`` snapshots."""
+        instrument_id = getattr(command, "instrument_id", command)
+        self._subscribed_book_depth.discard(instrument_id)
+        await self._release_book_stream(instrument_id)
 
     async def _unsubscribe_bars(self, command) -> None:
         """Unsubscribe from bar updates."""

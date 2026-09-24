@@ -8,14 +8,26 @@ to the cached order, mimicking the execution engine) and a mocked Rust client.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
+from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import CancelAllOrders, CancelOrder, ModifyOrder, SubmitOrder
-from nautilus_trader.model.enums import AccountType, OrderSide, OrderStatus, TimeInForce
+from nautilus_trader.execution.messages import (
+    CancelAllOrders,
+    CancelOrder,
+    GenerateFillReports,
+    GenerateOrderStatusReport,
+    GenerateOrderStatusReports,
+    ModifyOrder,
+    SubmitOrder,
+    SubmitOrderList,
+)
+from nautilus_trader.model.enums import AccountType, ContingencyType, OrderSide, OrderStatus, TimeInForce
 from nautilus_trader.model.events import (
     OrderAccepted,
     OrderCanceled,
@@ -28,6 +40,7 @@ from nautilus_trader.model.events import (
 )
 from nautilus_trader.model.identifiers import AccountId, ClientOrderId, StrategyId, TraderId, VenueOrderId
 from nautilus_trader.model.objects import Currency, Price, Quantity
+from nautilus_trader.model.orders import LimitOrder
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
@@ -46,10 +59,12 @@ from nautilus_futu.constants import (
     FUTU_TRD_MARKET_HK,
     FUTU_TRD_MARKET_US,
     FUTU_TRD_SEC_MARKET_HK,
+    FUTU_TRD_SEC_MARKET_US,
     FUTU_TRD_SIDE_BUY,
 )
 from nautilus_futu.execution import (
     FutuLiveExecutionClient,
+    history_query_range,
     parse_funds_to_balance,
     parse_funds_to_balances,
     parse_funds_to_margins,
@@ -629,3 +644,296 @@ class TestPushDefensive:
     def test_fill_missing_order_id(self, h):
         h.client._handle_push_fill({"trd_env": 0, "acc_id": ACC_ID, "fill": {"fill_id": 1}})
         assert h.events == []
+
+
+# ─────────────────────────────────────────────────────────
+# Reports / reconciliation lookback
+# ─────────────────────────────────────────────────────────
+
+# 2024-06-14 13:20:00 UTC = 21:20 in Hong Kong, 09:20 in New York
+NOW_NS = 1_718_371_200 * 1_000_000_000
+
+
+class TestHistoryQueryRange:
+    def test_no_start_means_today_only(self):
+        assert history_query_range(None, None, NOW_NS, FUTU_TRD_MARKET_HK) is None
+
+    def test_start_within_today_needs_no_history(self):
+        start = datetime(2024, 6, 14, 2, 0, tzinfo=UTC)  # 10:00 HKT, same trading day
+        assert history_query_range(start, None, NOW_NS, FUTU_TRD_MARKET_HK) is None
+
+    def test_start_before_today_uses_market_local_time(self):
+        start = datetime(2024, 6, 11, 1, 30, tzinfo=UTC)
+        assert history_query_range(start, None, NOW_NS, FUTU_TRD_MARKET_HK) == (
+            "2024-06-11 09:30:00",
+            "2024-06-14 21:20:00",
+        )
+
+    def test_us_market_uses_eastern_time_and_explicit_end(self):
+        start = datetime(2024, 6, 13, 13, 30, tzinfo=UTC)  # 09:30 EDT the previous day
+        end = datetime(2024, 6, 13, 20, 0, tzinfo=UTC)
+        assert history_query_range(start, end, NOW_NS, FUTU_TRD_MARKET_US) == (
+            "2024-06-13 09:30:00",
+            "2024-06-13 16:00:00",
+        )
+
+    def test_naive_start_is_utc(self):
+        start = datetime(2024, 6, 11, 1, 30)
+        assert history_query_range(start, None, NOW_NS, FUTU_TRD_MARKET_HK)[0] == "2024-06-11 09:30:00"
+
+
+def _order_dict(order_id, code="00700", sec_market=FUTU_TRD_SEC_MARKET_HK, status=FUTU_ORDER_STATUS_FILLED_ALL, remark=""):
+    return {
+        "trd_side": FUTU_TRD_SIDE_BUY,
+        "order_type": FUTU_ORDER_TYPE_NORMAL,
+        "order_status": status,
+        "order_id": order_id,
+        "code": code,
+        "qty": 100.0,
+        "price": 300.0,
+        "fill_qty": 100.0,
+        "fill_avg_price": 300.0,
+        "sec_market": sec_market,
+        "create_timestamp": 1718000000.0,
+        "update_timestamp": 1718000001.0,
+        "time_in_force": FUTU_TIF_DAY,
+        "remark": remark,
+        "last_err_msg": "",
+    }
+
+
+def _fill_dict(fill_id, order_id, code="00700", sec_market=FUTU_TRD_SEC_MARKET_HK):
+    return {
+        "trd_side": FUTU_TRD_SIDE_BUY,
+        "fill_id": fill_id,
+        "order_id": order_id,
+        "code": code,
+        "qty": 100.0,
+        "price": 300.0,
+        "sec_market": sec_market,
+        "create_timestamp": 1718000002.0,
+        "status": 0,
+    }
+
+
+def _three_days_ago():
+    return datetime.now(UTC) - timedelta(days=3)
+
+
+class TestReconciliationReports:
+    def test_fill_reports_today_only_without_start(self, h):
+        h.rust.get_order_fill_list.return_value = [_fill_dict(1, 555)]
+        cmd = GenerateFillReports(instrument_id=None, venue_order_id=None, start=None, end=None, command_id=UUID4(), ts_init=0)
+        reports = h.run(h.client.generate_fill_reports(cmd))
+        assert [r.trade_id.value for r in reports] == ["1"]  # same fill from both markets reported once
+        assert h.rust.get_order_fill_list.call_count == 2  # HK and US queried
+        assert not h.rust.get_history_order_fill_list.called
+
+    def test_fill_reports_merge_history_for_lookback(self, h):
+        h.client._trd_market_auth_list = [FUTU_TRD_MARKET_HK]
+        h.rust.get_order_fill_list.return_value = [_fill_dict(2, 556)]
+        h.rust.get_history_order_fill_list.return_value = [_fill_dict(1, 555), _fill_dict(2, 556)]
+        cmd = GenerateFillReports(
+            instrument_id=None, venue_order_id=None, start=_three_days_ago(), end=None, command_id=UUID4(), ts_init=0,
+        )
+        reports = h.run(h.client.generate_fill_reports(cmd))
+        assert sorted(r.trade_id.value for r in reports) == ["1", "2"]  # deduplicated
+        args = h.rust.get_history_order_fill_list.call_args.args
+        assert args[0:3] == (0, ACC_ID, FUTU_TRD_MARKET_HK)
+        assert len(args[3]) == len("YYYY-MM-DD HH:MM:SS")
+        assert args[5] is None  # no code filter without an instrument
+
+    def test_history_fill_failure_still_reports_today(self, h):
+        h.client._trd_market_auth_list = [FUTU_TRD_MARKET_HK]
+        h.rust.get_order_fill_list.return_value = [_fill_dict(2, 556)]
+        h.rust.get_history_order_fill_list.side_effect = RuntimeError("not supported in simulate")
+        cmd = GenerateFillReports(
+            instrument_id=None, venue_order_id=None, start=_three_days_ago(), end=None, command_id=UUID4(), ts_init=0,
+        )
+        reports = h.run(h.client.generate_fill_reports(cmd))
+        assert [r.trade_id.value for r in reports] == ["2"]
+
+    def test_fill_reports_filter_by_instrument(self, h):
+        h.rust.get_order_fill_list.return_value = [
+            _fill_dict(1, 555),
+            _fill_dict(2, 556, code="AAPL", sec_market=FUTU_TRD_SEC_MARKET_US),
+        ]
+        cmd = GenerateFillReports(
+            instrument_id=HK_INSTRUMENT.id, venue_order_id=None, start=_three_days_ago(), end=None,
+            command_id=UUID4(), ts_init=0,
+        )
+        reports = h.run(h.client.generate_fill_reports(cmd))
+        assert [r.trade_id.value for r in reports] == ["1"]
+        assert reports[0].instrument_id == HK_INSTRUMENT.id
+        assert h.rust.get_history_order_fill_list.call_args.args[5] == ["00700"]
+
+    def test_instrument_filter_tolerates_missing_sec_market(self, h):
+        fill = _fill_dict(1, 555)
+        fill["sec_market"] = None
+        assert FutuLiveExecutionClient._matches_instrument(fill, HK_INSTRUMENT.id)
+        assert not FutuLiveExecutionClient._matches_instrument(fill, US_INSTRUMENT.id)
+
+    def test_order_reports_merge_history_today_wins(self, h):
+        h.client._trd_market_auth_list = [FUTU_TRD_MARKET_HK]
+        h.rust.get_order_list.return_value = [_order_dict(555, status=FUTU_ORDER_STATUS_SUBMITTED)]
+        h.rust.get_history_order_list.return_value = [
+            _order_dict(555, status=FUTU_ORDER_STATUS_CANCELLED_ALL),  # stale copy of today's order
+            _order_dict(554),
+        ]
+        cmd = GenerateOrderStatusReports(
+            instrument_id=None, start=_three_days_ago(), end=None, open_only=False, command_id=UUID4(), ts_init=0,
+        )
+        reports = h.run(h.client.generate_order_status_reports(cmd))
+        by_id = {r.venue_order_id.value: r for r in reports}
+        assert set(by_id) == {"554", "555"}
+        assert by_id["555"].order_status == OrderStatus.ACCEPTED
+        assert by_id["554"].order_status == OrderStatus.FILLED
+
+    def test_open_only_never_queries_history(self, h):
+        h.rust.get_order_list.return_value = [
+            _order_dict(555, status=FUTU_ORDER_STATUS_SUBMITTED),
+            _order_dict(554),
+        ]
+        cmd = GenerateOrderStatusReports(
+            instrument_id=None, start=_three_days_ago(), end=None, open_only=True, command_id=UUID4(), ts_init=0,
+        )
+        reports = h.run(h.client.generate_order_status_reports(cmd))
+        assert {r.venue_order_id.value for r in reports} == {"555"}
+        assert not h.rust.get_history_order_list.called
+
+    def test_order_reports_filter_by_instrument(self, h):
+        h.rust.get_order_list.return_value = [
+            _order_dict(555),
+            _order_dict(556, code="AAPL", sec_market=FUTU_TRD_SEC_MARKET_US),
+        ]
+        cmd = GenerateOrderStatusReports(
+            instrument_id=US_INSTRUMENT.id, start=None, end=None, open_only=False, command_id=UUID4(), ts_init=0,
+        )
+        reports = h.run(h.client.generate_order_status_reports(cmd))
+        assert [r.venue_order_id.value for r in reports] == ["556"]
+
+    def test_single_report_from_today(self, h):
+        order = h.add_limit_order()
+        h.accept(order)
+        h.rust.get_order_list.return_value = [_order_dict(555, status=FUTU_ORDER_STATUS_SUBMITTED)]
+        cmd = GenerateOrderStatusReport(
+            instrument_id=order.instrument_id, client_order_id=order.client_order_id, venue_order_id=None,
+            command_id=UUID4(), ts_init=0,
+        )
+        report = h.run(h.client.generate_order_status_report(cmd))
+        assert report is not None
+        assert report.venue_order_id == VenueOrderId("555")
+        assert not h.rust.get_history_order_list.called  # found in today's list
+
+    def test_single_report_falls_back_to_history_for_old_order(self, h):
+        """A cached order created days ago that is not in today's list is looked up in the history."""
+        created = datetime.now(UTC) - timedelta(days=5)
+        order = LimitOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            instrument_id=HK_INSTRUMENT.id,
+            client_order_id=ClientOrderId("O-OLD"),
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str("300.000"),
+            init_id=UUID4(),
+            ts_init=int(created.timestamp() * 1_000_000_000),
+        )
+        h.cache.add_order(order)
+        h.rust.get_order_list.return_value = []
+        h.rust.get_history_order_list.return_value = [_order_dict(555, remark="O-OLD")]
+        cmd = GenerateOrderStatusReport(
+            instrument_id=HK_INSTRUMENT.id, client_order_id=ClientOrderId("O-OLD"), venue_order_id=None,
+            command_id=UUID4(), ts_init=0,
+        )
+        report = h.run(h.client.generate_order_status_report(cmd))
+        assert report is not None
+        assert report.client_order_id == ClientOrderId("O-OLD")
+        assert report.venue_order_id == VenueOrderId("555")
+        args = h.rust.get_history_order_list.call_args.args
+        assert args[4] == (created - timedelta(days=1)).astimezone(ZoneInfo("Asia/Hong_Kong")).strftime("%Y-%m-%d %H:%M:%S")
+        assert args[6] == ["00700"]
+
+    def test_single_report_unknown_order_skips_history(self, h):
+        h.rust.get_order_list.return_value = []
+        cmd = GenerateOrderStatusReport(
+            instrument_id=HK_INSTRUMENT.id, client_order_id=ClientOrderId("O-NONE"), venue_order_id=None,
+            command_id=UUID4(), ts_init=0,
+        )
+        assert h.run(h.client.generate_order_status_report(cmd)) is None
+        assert not h.rust.get_history_order_list.called
+
+
+# ─────────────────────────────────────────────────────────
+# Order lists
+# ─────────────────────────────────────────────────────────
+
+
+def _order_factory(h):
+    return OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=h.clock)
+
+
+def _submit_list(h, order_list):
+    for order in order_list.orders:
+        h.cache.add_order(order)
+    cmd = SubmitOrderList(
+        trader_id=TRADER_ID, strategy_id=STRATEGY_ID, order_list=order_list, command_id=UUID4(), ts_init=0,
+    )
+    h.run(h.client._submit_order_list(cmd))
+
+
+class TestSubmitOrderList:
+    def test_independent_orders_are_placed_one_by_one(self, h):
+        factory = _order_factory(h)
+        orders = [
+            factory.limit(HK_INSTRUMENT.id, OrderSide.BUY, Quantity.from_int(100), Price.from_str("300.000")),
+            factory.limit(HK_INSTRUMENT.id, OrderSide.BUY, Quantity.from_int(100), Price.from_str("299.000")),
+        ]
+        h.rust.place_order.side_effect = [{"order_id": 1}, {"order_id": 2}]
+        _submit_list(h, factory.create_list(orders))
+        assert h.rust.place_order.call_count == 2
+        assert [c.args[7] for c in h.rust.place_order.call_args_list] == [300.0, 299.0]
+        assert len(h.events_of(OrderSubmitted)) == 2
+        assert not h.events_of(OrderRejected)
+        assert h.cache.client_order_id(VenueOrderId("2")) == orders[1].client_order_id
+
+    def test_bracket_is_rejected_without_placing_anything(self, h):
+        factory = _order_factory(h)
+        bracket = factory.bracket(
+            instrument_id=HK_INSTRUMENT.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100),
+            sl_trigger_price=Price.from_str("290.000"),
+            tp_price=Price.from_str("320.000"),
+        )
+        _submit_list(h, bracket)
+        assert not h.rust.place_order.called
+        rejected = h.events_of(OrderRejected)
+        assert len(rejected) == 3
+        assert "emulation_trigger" in rejected[0].reason
+        assert all(o.status == OrderStatus.REJECTED for o in bracket.orders)
+
+    def test_oco_orders_are_placed(self, h):
+        factory = _order_factory(h)
+        tp_id, sl_id = ClientOrderId("O-TP"), ClientOrderId("O-SL")
+
+        def leg(client_order_id, price, linked):
+            return LimitOrder(
+                trader_id=TRADER_ID,
+                strategy_id=STRATEGY_ID,
+                instrument_id=HK_INSTRUMENT.id,
+                client_order_id=client_order_id,
+                order_side=OrderSide.SELL,
+                quantity=Quantity.from_int(100),
+                price=Price.from_str(price),
+                init_id=UUID4(),
+                ts_init=0,
+                contingency_type=ContingencyType.OCO,
+                linked_order_ids=[linked],
+            )
+
+        orders = [leg(tp_id, "320.000", sl_id), leg(sl_id, "290.000", tp_id)]
+        h.rust.place_order.side_effect = [{"order_id": 1}, {"order_id": 2}]
+        _submit_list(h, factory.create_list(orders))
+        assert h.rust.place_order.call_count == 2
+        assert not h.events_of(OrderRejected)

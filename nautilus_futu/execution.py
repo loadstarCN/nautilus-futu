@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.providers import InstrumentProvider
+from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.execution.reports import (
     FillReport,
     OrderStatusReport,
@@ -17,6 +20,7 @@ from nautilus_trader.execution.reports import (
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.enums import (
     AccountType,
+    ContingencyType,
     LiquiditySide,
     OmsType,
     OrderSide,
@@ -53,6 +57,7 @@ from nautilus_futu.constants import (
     FUTU_TRD_MARKET_CN,
     FUTU_TRD_MARKET_HKCC,
     FUTU_TRD_MARKET_TO_CURRENCY,
+    FUTU_TRD_MARKET_TO_TZ,
     FUTU_VENUE,
     VENUE_TO_FUTU_TRD_MARKET,
     VENUE_TO_FUTU_TRD_SEC_MARKET,
@@ -81,6 +86,42 @@ _SEEN_FILLS_MAX = 10_000
 
 # Backwards-compatible aliases
 _TRD_MARKET_CURRENCY = FUTU_TRD_MARKET_TO_CURRENCY
+
+_FUTU_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+# ---------------------------------------------------------------------------
+# History query window (module-level so it is unit-testable without a client)
+# ---------------------------------------------------------------------------
+
+
+def history_query_range(
+    start: datetime | None,
+    end: datetime | None,
+    now_ns: int,
+    trd_market: int,
+) -> tuple[str, str] | None:
+    """Bounds for a history order/fill query covering ``[start, end]``.
+
+    Today's orders and fills come from the (cheaper) today-lists, so history is
+    only needed when ``start`` reaches before the current trading day in the
+    market's local time.  Returns ``None`` otherwise, or the
+    ``(begin_time, end_time)`` strings in market local time that OpenD expects.
+    """
+    if start is None:
+        return None
+    tz = ZoneInfo(FUTU_TRD_MARKET_TO_TZ.get(trd_market, "Asia/Hong_Kong"))
+    now_local = datetime.fromtimestamp(now_ns / 1_000_000_000, tz)
+    start_local = _as_utc(start).astimezone(tz)
+    day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    if start_local >= day_start:
+        return None
+    end_local = _as_utc(end).astimezone(tz) if end is not None else now_local
+    return start_local.strftime(_FUTU_TIME_FORMAT), end_local.strftime(_FUTU_TIME_FORMAT)
+
+
+def _as_utc(dt: datetime) -> datetime:
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +771,55 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
     async def _submit_order(self, command: Any) -> None:
         """Submit a new order."""
-        order: Order = command.order
+        await self._place_order(command.order)
+
+    async def _submit_order_list(self, command: Any) -> None:
+        """Submit the orders of an order list one by one.
+
+        Futu has no native order lists or contingent orders.  Independent
+        orders and OCO/OUO groups are placed individually (OCO/OUO are then
+        enforced by the strategy's ``manage_contingent_orders``).  OTO/bracket
+        lists are rejected: placing child orders before the parent fills could
+        e.g. sell short, so they must be held by the OrderEmulator instead
+        (give the child orders an ``emulation_trigger``).
+        """
+        orders: list[Order] = list(command.order_list.orders)
+        if any(o.contingency_type == ContingencyType.OTO or o.parent_order_id is not None for o in orders):
+            reason = (
+                "Futu does not support OTO/bracket orders; set an emulation_trigger on the "
+                "child orders so the OrderEmulator releases them when the parent fills"
+            )
+            self._log.error(f"Cannot submit {command.order_list.id}: {reason}")
+            for order in orders:
+                self._reject_locally(order, reason)
+            return
+        if any(o.contingency_type in (ContingencyType.OCO, ContingencyType.OUO) for o in orders):
+            self._log.warning(
+                f"{command.order_list.id}: OCO/OUO contingencies are not enforced by Futu; "
+                "they rely on the strategy's `manage_contingent_orders`",
+            )
+        for order in orders:
+            await self._place_order(order)
+
+    def _reject_locally(self, order: Order, reason: str) -> None:
+        """Reject an order that was never sent to OpenD."""
+        ts_now = self._clock.timestamp_ns()
+        self.generate_order_submitted(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            ts_event=ts_now,
+        )
+        self.generate_order_rejected(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            reason=reason,
+            ts_event=ts_now,
+        )
+
+    async def _place_order(self, order: Order) -> None:
+        """Place one order on OpenD (OrderSubmitted, then OrderRejected on failure)."""
         instrument_id = order.instrument_id
         market, code = instrument_id_to_futu_security(instrument_id)
         sec_market = VENUE_TO_FUTU_TRD_SEC_MARKET.get(instrument_id.venue)
@@ -946,21 +1035,100 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             return list(self._trd_market_auth_list)
         return [self._trd_market_for(instrument_id)]
 
-    async def _fetch_orders(self, markets: list[int]) -> list[dict]:
+    async def _fetch_orders(
+        self,
+        markets: list[int],
+        start: datetime | None = None,
+        end: datetime | None = None,
+        codes: list[str] | None = None,
+    ) -> list[dict]:
+        """Today's orders, plus history orders when ``start`` reaches before today.
+
+        Entries from the today-list win over history entries for the same order
+        (they carry the latest status).
+        """
         orders: list[dict] = []
         seen: set[str] = set()
+
+        def add(order_dicts) -> None:
+            for order_dict in order_dicts or []:
+                key = str(order_dict.get("order_id"))
+                if key not in seen:
+                    seen.add(key)
+                    orders.append(order_dict)
+
         for market in markets:
             try:
-                for order_dict in await asyncio.to_thread(
-                    self._client.get_order_list, self._trd_env, self._acc_id, market,
-                ):
-                    key = str(order_dict.get("order_id"))
-                    if key not in seen:
-                        seen.add(key)
-                        orders.append(order_dict)
+                add(await asyncio.to_thread(self._client.get_order_list, self._trd_env, self._acc_id, market))
             except Exception as e:
                 self._log.warning(f"Failed to query market {market} orders: {e}")
+            window = history_query_range(start, end, self._clock.timestamp_ns(), market)
+            if window is None:
+                continue
+            try:
+                add(
+                    await asyncio.to_thread(
+                        self._client.get_history_order_list,
+                        self._trd_env, self._acc_id, market, None, window[0], window[1], codes,
+                    )
+                )
+            except Exception as e:
+                self._log.warning(f"Failed to query market {market} history orders {window}: {e}")
         return orders
+
+    async def _fetch_fills(
+        self,
+        markets: list[int],
+        start: datetime | None = None,
+        end: datetime | None = None,
+        codes: list[str] | None = None,
+    ) -> list[dict]:
+        """Today's fills, plus history fills when ``start`` reaches before today."""
+        fills: list[dict] = []
+        seen: set[str] = set()
+
+        def add(fill_dicts) -> None:
+            for fill_dict in fill_dicts or []:
+                key = str(fill_dict.get("fill_id"))
+                if key not in seen:
+                    seen.add(key)
+                    fills.append(fill_dict)
+
+        for market in markets:
+            try:
+                add(await asyncio.to_thread(self._client.get_order_fill_list, self._trd_env, self._acc_id, market))
+            except Exception as e:
+                self._log.warning(f"Failed to query market {market} fills: {e}")
+            window = history_query_range(start, end, self._clock.timestamp_ns(), market)
+            if window is None:
+                continue
+            try:
+                add(
+                    await asyncio.to_thread(
+                        self._client.get_history_order_fill_list,
+                        self._trd_env, self._acc_id, market, window[0], window[1], codes,
+                    )
+                )
+            except Exception as e:
+                # OpenD does not serve history fills for every environment
+                # (e.g. paper trading); today's fills are still reported.
+                self._log.warning(f"Failed to query market {market} history fills {window}: {e}")
+        return fills
+
+    @staticmethod
+    def _matches_instrument(item: dict, instrument_id: InstrumentId | None) -> bool:
+        """Whether an order/fill dict belongs to ``instrument_id`` (NYSE/NASDAQ agnostic)."""
+        if instrument_id is None:
+            return True
+        market, code = instrument_id_to_futu_security(instrument_id)
+        if item.get("code") != code:
+            return False
+        sec_market = item.get("sec_market")
+        return sec_market is None or sec_market_to_qot_market(sec_market) == market
+
+    @staticmethod
+    def _codes_for(instrument_id: InstrumentId | None) -> list[str] | None:
+        return [instrument_id.symbol.value] if instrument_id is not None else None
 
     def _report_instrument(self, order_dict: dict):
         market = sec_market_to_qot_market(order_dict.get("sec_market"))
@@ -968,34 +1136,61 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         return self._instrument_for(instrument_id)
 
     async def generate_order_status_report(self, command) -> OrderStatusReport | None:
-        """Generate an order status report for a specific order."""
+        """Generate an order status report for a specific order.
+
+        Searches today's orders first and falls back to the order history when
+        the cached order was created before today.
+        """
         client_order_id = command.client_order_id
         venue_order_id = command.venue_order_id
         if venue_order_id is None and client_order_id is not None:
             venue_order_id = self._cache.venue_order_id(client_order_id)
 
-        orders = await self._fetch_orders(self._markets_for(command.instrument_id))
-        ts_init = self._clock.timestamp_ns()
-        for order_dict in orders:
-            matches_venue = venue_order_id is not None and str(order_dict.get("order_id")) == venue_order_id.value
-            matches_client = (
-                client_order_id is not None
-                and client_order_id_from_remark(order_dict.get("remark")) == client_order_id
-            )
-            if matches_venue or matches_client:
-                return parse_futu_order_to_report(
-                    order_dict, self.account_id_str, self._report_instrument(order_dict), ts_init,
-                )
-        return None
+        def find(order_dicts: list[dict]) -> dict | None:
+            for order_dict in order_dicts:
+                if venue_order_id is not None and str(order_dict.get("order_id")) == venue_order_id.value:
+                    return order_dict
+                if client_order_id is not None and client_order_id_from_remark(order_dict.get("remark")) == client_order_id:
+                    return order_dict
+            return None
+
+        markets = self._markets_for(command.instrument_id)
+        found = find(await self._fetch_orders(markets))
+        if found is None:
+            cached = self._cache.order(client_order_id) if client_order_id is not None else None
+            if cached is not None:
+                # Start a day before the order was created so the market-local
+                # day boundary can never hide it.
+                start = unix_nanos_to_dt(cached.ts_init) - timedelta(days=1)
+                found = find(await self._fetch_orders(markets, start=start, codes=self._codes_for(command.instrument_id)))
+        if found is None:
+            return None
+        return parse_futu_order_to_report(
+            found, self.account_id_str, self._report_instrument(found), self._clock.timestamp_ns(),
+        )
 
     async def generate_order_status_reports(self, command) -> list[OrderStatusReport]:
-        """Generate order status reports across the authorized markets."""
+        """Generate order status reports across the authorized markets.
+
+        ``command.start`` before today pulls closed orders from the order
+        history as well (reconciliation lookback); ``open_only`` only needs
+        today's list, which always contains every working order.
+        """
         open_only = bool(getattr(command, "open_only", False))
-        orders = await self._fetch_orders(self._markets_for(command.instrument_id))
+        instrument_id = command.instrument_id
+        start = None if open_only else getattr(command, "start", None)
+        orders = await self._fetch_orders(
+            self._markets_for(instrument_id),
+            start=start,
+            end=getattr(command, "end", None),
+            codes=self._codes_for(instrument_id),
+        )
         ts_init = self._clock.timestamp_ns()
         reports: list[OrderStatusReport] = []
         for order_dict in orders:
             if open_only and order_dict.get("order_status") not in FUTU_ORDER_STATUS_ACTIVE:
+                continue
+            if not self._matches_instrument(order_dict, instrument_id):
                 continue
             try:
                 reports.append(
@@ -1009,40 +1204,39 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         return reports
 
     async def generate_fill_reports(self, command) -> list[FillReport]:
-        """Generate fill reports across the authorized markets."""
+        """Generate fill reports across the authorized markets.
+
+        ``command.start`` before today pulls fills from the fill history as
+        well, so fills that happened while the node was offline reconcile.
+        """
         venue_order_id = command.venue_order_id
+        instrument_id = command.instrument_id
+        fills = await self._fetch_fills(
+            self._markets_for(instrument_id),
+            start=getattr(command, "start", None),
+            end=getattr(command, "end", None),
+            codes=self._codes_for(instrument_id),
+        )
         ts_init = self._clock.timestamp_ns()
         reports: list[FillReport] = []
-        seen: set[str] = set()
-
-        for market in self._markets_for(command.instrument_id):
+        for fill_dict in fills:
             try:
-                fills = await asyncio.to_thread(
-                    self._client.get_order_fill_list, self._trd_env, self._acc_id, market,
+                if venue_order_id is not None and str(fill_dict.get("order_id")) != venue_order_id.value:
+                    continue
+                if not self._matches_instrument(fill_dict, instrument_id):
+                    continue
+                order_vid = VenueOrderId(str(fill_dict.get("order_id") or 0))
+                reports.append(
+                    parse_futu_fill_to_report(
+                        fill_dict,
+                        self.account_id_str,
+                        self._report_instrument(fill_dict),
+                        client_order_id=self._cache.client_order_id(order_vid),
+                        ts_init=ts_init,
+                    )
                 )
             except Exception as e:
-                self._log.warning(f"Failed to query market {market} fills: {e}")
-                continue
-            for fill_dict in fills:
-                try:
-                    if venue_order_id is not None and str(fill_dict.get("order_id")) != venue_order_id.value:
-                        continue
-                    fill_id = str(fill_dict.get("fill_id"))
-                    if fill_id in seen:
-                        continue
-                    seen.add(fill_id)
-                    order_vid = VenueOrderId(str(fill_dict.get("order_id") or 0))
-                    reports.append(
-                        parse_futu_fill_to_report(
-                            fill_dict,
-                            self.account_id_str,
-                            self._report_instrument(fill_dict),
-                            client_order_id=self._cache.client_order_id(order_vid),
-                            ts_init=ts_init,
-                        )
-                    )
-                except Exception as e:
-                    self._log.warning(f"Failed to parse fill {fill_dict.get('fill_id')}: {e}")
+                self._log.warning(f"Failed to parse fill {fill_dict.get('fill_id')}: {e}")
 
         self._log.info(f"Generated {len(reports)} fill reports")
         return reports

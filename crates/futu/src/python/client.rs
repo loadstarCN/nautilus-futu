@@ -1231,7 +1231,11 @@ impl PyFutuClient {
     // ── Trade: get_history_order_list ──────────────────────────────────
     /// Get historical order list.
     /// Returns list of dicts with order details.
-    #[pyo3(signature = (trd_env, acc_id, trd_market, filter_status_list=None))]
+    ///
+    /// `begin_time`/`end_time` (`YYYY-MM-DD HH:MM:SS`, market local time) are
+    /// required by OpenD; a missing bound defaults to a 90-day window ending now.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (trd_env, acc_id, trd_market, filter_status_list=None, begin_time=None, end_time=None, code_list=None))]
     fn get_history_order_list(
         &self,
         py: Python<'_>,
@@ -1239,14 +1243,20 @@ impl PyFutuClient {
         acc_id: u64,
         trd_market: i32,
         filter_status_list: Option<Vec<i32>>,
+        begin_time: Option<String>,
+        end_time: Option<String>,
+        code_list: Option<Vec<String>>,
     ) -> PyResult<Vec<PyObject>> {
         let client = self.get_client()?;
         let client = &*client;
+        let filter = crate::trade::query::history_filter_conditions(
+            begin_time, end_time, code_list.unwrap_or_default(), crate::trade::query::unix_now_secs(),
+        );
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
                 crate::trade::query::get_history_order_list(
-                    client, trd_env, acc_id, trd_market, None,
+                    client, trd_env, acc_id, trd_market, Some(filter),
                     filter_status_list.unwrap_or_default(),
                 ).await
             }).map_err(|e| e.to_string())
@@ -1274,6 +1284,7 @@ impl PyFutuClient {
                 dict.set_item("update_timestamp", order.update_timestamp)?;
                 dict.set_item("time_in_force", order.time_in_force)?;
                 dict.set_item("remark", &order.remark)?;
+                dict.set_item("last_err_msg", &order.last_err_msg)?;
                 dict.set_item("fill_outside_rth", order.fill_outside_rth)?;
                 dict.set_item("aux_price", order.aux_price)?;
                 dict.set_item("trail_type", order.trail_type)?;
@@ -1289,20 +1300,30 @@ impl PyFutuClient {
     // ── Trade: get_history_order_fill_list ───────────────────────────────
     /// Get historical order fill list.
     /// Returns list of dicts with fill details.
+    ///
+    /// Time bounds as for `get_history_order_list` (default: last 90 days).
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (trd_env, acc_id, trd_market, begin_time=None, end_time=None, code_list=None))]
     fn get_history_order_fill_list(
         &self,
         py: Python<'_>,
         trd_env: i32,
         acc_id: u64,
         trd_market: i32,
+        begin_time: Option<String>,
+        end_time: Option<String>,
+        code_list: Option<Vec<String>>,
     ) -> PyResult<Vec<PyObject>> {
         let client = self.get_client()?;
         let client = &*client;
+        let filter = crate::trade::query::history_filter_conditions(
+            begin_time, end_time, code_list.unwrap_or_default(), crate::trade::query::unix_now_secs(),
+        );
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
                 crate::trade::query::get_history_order_fill_list(
-                    client, trd_env, acc_id, trd_market, None,
+                    client, trd_env, acc_id, trd_market, Some(filter),
                 ).await
             }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Get history order fill list failed: {}", e)))?;

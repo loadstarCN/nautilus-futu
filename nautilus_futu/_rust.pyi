@@ -142,10 +142,27 @@ class PyFutuClient:
     def get_order_fill_list(self, trd_env: int, acc_id: int, trd_market: int) -> list[dict[str, Any]]: ...
     def get_position_list(self, trd_env: int, acc_id: int, trd_market: int) -> list[dict[str, Any]]: ...
     def get_funds(self, trd_env: int, acc_id: int, trd_market: int, currency: int | None = None) -> dict[str, Any]: ...
+    # History queries: ``begin_time``/``end_time`` are ``YYYY-MM-DD HH:MM:SS``
+    # in market local time; a missing bound defaults to a 90-day window.
     def get_history_order_list(
-        self, trd_env: int, acc_id: int, trd_market: int, filter_status_list: list[int] | None = None,
+        self,
+        trd_env: int,
+        acc_id: int,
+        trd_market: int,
+        filter_status_list: list[int] | None = None,
+        begin_time: str | None = None,
+        end_time: str | None = None,
+        code_list: list[str] | None = None,
     ) -> list[dict[str, Any]]: ...
-    def get_history_order_fill_list(self, trd_env: int, acc_id: int, trd_market: int) -> list[dict[str, Any]]: ...
+    def get_history_order_fill_list(
+        self,
+        trd_env: int,
+        acc_id: int,
+        trd_market: int,
+        begin_time: str | None = None,
+        end_time: str | None = None,
+        code_list: list[str] | None = None,
+    ) -> list[dict[str, Any]]: ...
     def get_max_trd_qtys(
         self,
         trd_env: int,

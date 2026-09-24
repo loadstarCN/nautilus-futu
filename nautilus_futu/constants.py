@@ -88,6 +88,17 @@ VENUE_TO_FUTU_TRD_MARKET = {
     SZSE_VENUE: FUTU_TRD_MARKET_CN,
 }
 
+# Trading market -> IANA time zone of its trading day.  History order/fill
+# query bounds are sent in this local time (US Eastern for US, Beijing/HK
+# time for the Asian markets).
+FUTU_TRD_MARKET_TO_TZ: dict[int, str] = {
+    FUTU_TRD_MARKET_HK: "Asia/Hong_Kong",
+    FUTU_TRD_MARKET_US: "America/New_York",
+    FUTU_TRD_MARKET_CN: "Asia/Shanghai",
+    FUTU_TRD_MARKET_HKCC: "Asia/Shanghai",
+    FUTU_TRD_MARKET_FUTURES: "Asia/Hong_Kong",
+}
+
 # Futu TrdAccType values
 FUTU_ACC_TYPE_CASH = 1
 FUTU_ACC_TYPE_MARGIN = 2

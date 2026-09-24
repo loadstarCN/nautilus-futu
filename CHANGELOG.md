@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `PyFutuClient.get_history_order_list` / `get_history_order_fill_list` sent no
+  time range, which OpenD requires for history queries.  They now take
+  `begin_time`/`end_time` (market local time) and `code_list`, defaulting to the
+  last 90 days like the official SDK; history orders also carry `last_err_msg`.
+- `generate_order_status_reports` / `generate_fill_reports` honour the command's
+  `instrument_id` (they previously returned every order/fill of the market).
+
+### Added
+
+- Reconciliation lookback: when `start` reaches before the current trading day
+  (e.g. `reconciliation_lookback_mins`), order and fill reports merge the order /
+  fill history with today's lists, so fills made while the node was offline
+  reconcile.  A single-order status query falls back to the history for cached
+  orders created on an earlier day.
+- `subscribe_order_book_depth`: `OrderBookDepth10` snapshots (with per-level
+  order counts) from the shared order book stream.
+- `subscribe_instrument_status`: OpenD market states (lunch break, closing
+  auction, pre/after market, futures sessions...) mapped to `InstrumentStatus`,
+  polled every `market_status_interval` seconds (default 10) while subscribed.
+- `submit_order_list`: independent orders and OCO/OUO groups are placed one by
+  one; OTO/bracket lists are rejected with a hint to use `emulation_trigger`
+  (Futu has no native contingent orders).
+
 ## 0.5.1 (2026-09-12)
 
 Second review round after 0.5.0.
