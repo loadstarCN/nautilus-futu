@@ -6,26 +6,38 @@
 
 - `PyFutuClient.get_history_order_list` / `get_history_order_fill_list` sent no
   time range, which OpenD requires for history queries.  They now take
-  `begin_time`/`end_time` (market local time) and `code_list`, defaulting to the
-  last 90 days like the official SDK; history orders also carry `last_err_msg`.
+  `begin_time`/`end_time` (market local time) and `code_list`.  Missing bounds
+  follow the official SDK: the last 90 days, or 90 days from the one bound
+  given.  History orders also carry `last_err_msg`.
 - `generate_order_status_reports` / `generate_fill_reports` honour the command's
   `instrument_id` (they previously returned every order/fill of the market).
+- Fill reports skip fills the venue cancelled (`status == 1`), as the push path
+  already did.
+- Cancels and modifies no longer fail with "no venue_order_id" when they arrive
+  before the order's acceptance push: the venue order id indexed at placement is
+  used, and a request that arrives while `place_order` is still in flight is
+  applied once the order is placed.
 
 ### Added
 
 - Reconciliation lookback: when `start` reaches before the current trading day
   (e.g. `reconciliation_lookback_mins`), order and fill reports merge the order /
   fill history with today's lists, so fills made while the node was offline
-  reconcile.  A single-order status query falls back to the history for cached
-  orders created on an earlier day.
+  reconcile (venue-cancelled fills are skipped).  A single-order status query
+  falls back to the history only for cached orders created on an earlier day.
 - `subscribe_order_book_depth`: `OrderBookDepth10` snapshots (with per-level
   order counts) from the shared order book stream.
 - `subscribe_instrument_status`: OpenD market states (lunch break, closing
-  auction, pre/after market, futures sessions...) mapped to `InstrumentStatus`,
-  polled every `market_status_interval` seconds (default 10) while subscribed.
+  auction, pre/after market, US overnight, futures sessions...) mapped to
+  `InstrumentStatus`, polled every `market_status_interval` seconds (default 10)
+  while subscribed.  HK futures and index options follow the futures market
+  state.  Options report a daily close as `POST_CLOSE` until they expire,
+  because NautilusTrader treats `CLOSE` on an option-chain instrument as expiry.
 - `submit_order_list`: independent orders and OCO/OUO groups are placed one by
-  one; OTO/bracket lists are rejected with a hint to use `emulation_trigger`
-  (Futu has no native contingent orders).
+  one after every leg is validated and marked SUBMITTED (so the strategy's
+  `manage_contingent_orders` sees all legs); if an OCO/OUO leg cannot be placed
+  the remaining legs are canceled.  OTO/bracket lists are rejected with a hint
+  to use `emulation_trigger` (Futu has no native contingent orders).
 
 ## 0.5.1 (2026-09-12)
 

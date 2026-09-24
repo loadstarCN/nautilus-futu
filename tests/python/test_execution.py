@@ -252,6 +252,15 @@ class Harness:
     def run(self, coro):
         return self.loop.run_until_complete(coro)
 
+    def close(self):
+        """Cancel leftover background tasks (debounced account refreshes) and close the loop."""
+        pending = asyncio.all_tasks(self.loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        self.loop.close()
+
     def order_push(self, order_id=555, status=FUTU_ORDER_STATUS_SUBMITTED, remark="", **extra):
         order = {
             "trd_side": FUTU_TRD_SIDE_BUY,
@@ -300,7 +309,7 @@ class Harness:
 def h():
     harness = Harness()
     yield harness
-    harness.loop.close()
+    harness.close()
 
 
 class TestSubmitOrder:
@@ -616,7 +625,7 @@ class TestAccountType:
         try:
             assert harness.client.account_type == AccountType.MARGIN
         finally:
-            harness.loop.close()
+            harness.close()
 
     def test_default_is_cash(self, h):
         assert h.client.account_type == AccountType.CASH
@@ -937,3 +946,216 @@ class TestSubmitOrderList:
         _submit_list(h, factory.create_list(orders))
         assert h.rust.place_order.call_count == 2
         assert not h.events_of(OrderRejected)
+
+
+# ─────────────────────────────────────────────────────────
+# Review follow-ups: cancelled fills, fallback gating, placement races
+# ─────────────────────────────────────────────────────────
+
+
+class TestCancelledFillsInReports:
+    def test_venue_cancelled_fills_are_not_reported(self, h):
+        h.client._trd_market_auth_list = [FUTU_TRD_MARKET_HK]
+        cancelled_today = dict(_fill_dict(3, 557), status=1)
+        cancelled_history = dict(_fill_dict(1, 555), status=1)
+        h.rust.get_order_fill_list.return_value = [cancelled_today, _fill_dict(2, 556)]
+        h.rust.get_history_order_fill_list.return_value = [cancelled_history]
+        cmd = GenerateFillReports(
+            instrument_id=None, venue_order_id=None, start=_three_days_ago(), end=None, command_id=UUID4(), ts_init=0,
+        )
+        reports = h.run(h.client.generate_fill_reports(cmd))
+        assert [r.trade_id.value for r in reports] == ["2"]
+
+
+class TestSingleReportHistoryGating:
+    def test_order_created_today_never_hits_history(self, h):
+        today = LimitOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            instrument_id=HK_INSTRUMENT.id,
+            client_order_id=ClientOrderId("O-TODAY"),
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str("300.000"),
+            init_id=UUID4(),
+            ts_init=h.clock.timestamp_ns(),
+        )
+        h.cache.add_order(today)
+        h.rust.get_order_list.return_value = []
+        cmd = GenerateOrderStatusReport(
+            instrument_id=HK_INSTRUMENT.id, client_order_id=today.client_order_id, venue_order_id=None,
+            command_id=UUID4(), ts_init=0,
+        )
+        assert h.run(h.client.generate_order_status_report(cmd)) is None
+        assert not h.rust.get_history_order_list.called
+        assert h.rust.get_order_list.call_count == 1
+
+    def test_old_order_fallback_does_not_refetch_today(self, h):
+        created = datetime.now(UTC) - timedelta(days=5)
+        old = LimitOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            instrument_id=HK_INSTRUMENT.id,
+            client_order_id=ClientOrderId("O-OLD2"),
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str("300.000"),
+            init_id=UUID4(),
+            ts_init=int(created.timestamp() * 1_000_000_000),
+        )
+        h.cache.add_order(old)
+        h.rust.get_order_list.return_value = []
+        h.rust.get_history_order_list.return_value = [_order_dict(555, remark="O-OLD2")]
+        cmd = GenerateOrderStatusReport(
+            instrument_id=HK_INSTRUMENT.id, client_order_id=old.client_order_id, venue_order_id=None,
+            command_id=UUID4(), ts_init=0,
+        )
+        assert h.run(h.client.generate_order_status_report(cmd)) is not None
+        assert h.rust.get_order_list.call_count == 1
+        assert h.rust.get_history_order_list.call_count == 1
+
+
+def _oco_pair(tp_price="320.000", sl_price="290.000", tp_kwargs=None):
+    tp_id, sl_id = ClientOrderId("O-TP"), ClientOrderId("O-SL")
+
+    def leg(client_order_id, price, linked, **kwargs):
+        return LimitOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            instrument_id=HK_INSTRUMENT.id,
+            client_order_id=client_order_id,
+            order_side=OrderSide.SELL,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str(price),
+            init_id=UUID4(),
+            ts_init=0,
+            contingency_type=ContingencyType.OCO,
+            linked_order_ids=[linked],
+            **kwargs,
+        )
+
+    return [leg(tp_id, tp_price, sl_id, **(tp_kwargs or {})), leg(sl_id, sl_price, tp_id)]
+
+
+def _cancel_cmd(order):
+    return CancelOrder(
+        trader_id=TRADER_ID, strategy_id=STRATEGY_ID, instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id, venue_order_id=None, command_id=UUID4(), ts_init=0,
+    )
+
+
+class TestOrderListPlacementRaces:
+    def test_all_legs_submitted_before_any_is_placed(self, h):
+        tp, sl = _oco_pair()
+        seen_status = []
+
+        def place(*args):
+            seen_status.append(sl.status)  # SL must already be SUBMITTED while TP is placed
+            return {"order_id": 100 + len(seen_status)}
+
+        h.rust.place_order.side_effect = place
+        _submit_list(h, _order_factory(h).create_list([tp, sl]))
+        assert seen_status[0] == OrderStatus.SUBMITTED
+        assert h.rust.place_order.call_count == 2
+
+    def test_failed_oco_leg_cancels_remaining_legs(self, h):
+        tp, sl = _oco_pair()
+        h.rust.place_order.side_effect = RuntimeError("Place order failed: insufficient position")
+        _submit_list(h, _order_factory(h).create_list([tp, sl]))
+        assert h.rust.place_order.call_count == 1  # SL never reaches OpenD
+        assert tp.status == OrderStatus.REJECTED
+        assert sl.status == OrderStatus.CANCELED
+
+    def test_independent_list_keeps_placing_after_a_failure(self, h):
+        factory = _order_factory(h)
+        orders = [
+            factory.limit(HK_INSTRUMENT.id, OrderSide.BUY, Quantity.from_int(100), Price.from_str("300.000")),
+            factory.limit(HK_INSTRUMENT.id, OrderSide.BUY, Quantity.from_int(100), Price.from_str("299.000")),
+        ]
+        h.rust.place_order.side_effect = [RuntimeError("rejected"), {"order_id": 2}]
+        _submit_list(h, factory.create_list(orders))
+        assert h.rust.place_order.call_count == 2
+        assert orders[0].status == OrderStatus.REJECTED
+        assert orders[1].status == OrderStatus.SUBMITTED
+
+    def test_invalid_leg_rejects_whole_list_before_placing(self, h):
+        tp, sl = _oco_pair(tp_kwargs={"time_in_force": TimeInForce.IOC})
+        _submit_list(h, _order_factory(h).create_list([tp, sl]))
+        assert not h.rust.place_order.called
+        assert tp.status == OrderStatus.REJECTED
+        assert sl.status == OrderStatus.REJECTED
+
+    def test_cancel_for_queued_leg_skips_placing_it(self, h):
+        """The contingency manager cancels SL while TP is being placed (e.g. TP filled)."""
+        tp, sl = _oco_pair()
+
+        def place(*args):
+            fut = asyncio.run_coroutine_threadsafe(h.client._cancel_order(_cancel_cmd(sl)), h.loop)
+            fut.result(timeout=5)
+            return {"order_id": 101}
+
+        h.rust.place_order.side_effect = place
+        _submit_list(h, _order_factory(h).create_list([tp, sl]))
+        assert h.rust.place_order.call_count == 1
+        assert not h.rust.modify_order.called
+        assert sl.status == OrderStatus.CANCELED
+        assert not h.events_of(OrderCancelRejected)
+
+    def test_cancel_during_inflight_place_is_applied_after_placement(self, h):
+        order = h.add_limit_order(submitted=False)
+
+        def place(*args):
+            fut = asyncio.run_coroutine_threadsafe(h.client._cancel_order(_cancel_cmd(order)), h.loop)
+            fut.result(timeout=5)
+            assert not h.rust.modify_order.called  # deferred, not rejected
+            return {"order_id": 555}
+
+        h.rust.place_order.side_effect = place
+        cmd = SubmitOrder(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, order=order, command_id=UUID4(), ts_init=0)
+        h.run(h.client._submit_order(cmd))
+        args = h.rust.modify_order.call_args.args
+        assert args[3] == 555
+        assert args[4] == FUTU_MODIFY_ORDER_OP_CANCEL
+        assert not h.events_of(OrderCancelRejected)
+        assert not h.client._unplaced and not h.client._deferred_cancels
+
+    def test_modify_during_inflight_place_is_applied_after_placement(self, h):
+        order = h.add_limit_order(submitted=False)
+        modify = ModifyOrder(
+            trader_id=TRADER_ID, strategy_id=STRATEGY_ID, instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id, venue_order_id=None,
+            quantity=None, price=Price.from_str("305.000"), trigger_price=None,
+            command_id=UUID4(), ts_init=0,
+        )
+
+        def place(*args):
+            asyncio.run_coroutine_threadsafe(h.client._modify_order(modify), h.loop).result(timeout=5)
+            assert not h.rust.modify_order.called
+            return {"order_id": 555}
+
+        h.rust.place_order.side_effect = place
+        cmd = SubmitOrder(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, order=order, command_id=UUID4(), ts_init=0)
+        h.run(h.client._submit_order(cmd))
+        args = h.rust.modify_order.call_args.args
+        assert args[3] == 555
+        assert args[4] == FUTU_MODIFY_ORDER_OP_NORMAL
+        assert args[6] == 305.0
+        assert not h.events_of(OrderModifyRejected)
+
+    def test_cancel_before_accept_uses_indexed_venue_id(self, h):
+        order = h.add_limit_order(submitted=False)
+        cmd = SubmitOrder(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, order=order, command_id=UUID4(), ts_init=0)
+        h.run(h.client._submit_order(cmd))
+        assert order.status == OrderStatus.SUBMITTED and order.venue_order_id is None
+        h.run(h.client._cancel_order(_cancel_cmd(order)))
+        assert h.rust.modify_order.call_args.args[3] == 555
+        assert not h.events_of(OrderCancelRejected)
+
+    def test_cancel_of_closed_order_is_skipped(self, h):
+        order = h.add_limit_order()
+        h.accept(order)
+        h.client._handle_push_order(h.order_push(status=FUTU_ORDER_STATUS_CANCELLED_ALL))
+        assert order.status == OrderStatus.CANCELED
+        h.run(h.client._cancel_order(_cancel_cmd(order)))
+        assert not h.rust.modify_order.called
+        assert not h.events_of(OrderCancelRejected)

@@ -97,7 +97,7 @@ self.submit_order(self.order_factory.limit(...))            # 限价
 self.submit_order(self.order_factory.market(...))           # 市价
 self.submit_order(self.order_factory.stop_limit(...))       # 止损限价
 self.submit_order(self.order_factory.trailing_stop_market(...))  # 跟踪止损
-self.submit_order_list(order_list)                          # 逐笔下单（OCO/OUO 需策略开启 manage_contingent_orders）
+self.submit_order_list(order_list)                          # 逐腿下单（OCO/OUO 需策略开启 manage_contingent_orders）
 self.modify_order(order, price=...)
 self.cancel_all_orders(instrument_id)
 ```
@@ -108,10 +108,14 @@ self.cancel_all_orders(instrument_id)
 
 富途没有原生的括号单 / OTO 条件单，直接提交的 bracket 订单列表会被拒绝（以免止损单在开仓单成交前生效）。
 请给子订单设置 `emulation_trigger`（如 `TriggerType.BID_ASK`），由 NautilusTrader 的 OrderEmulator 在母单成交后再释放子订单。
+OCO/OUO 订单列表会先校验全部订单腿并统一标记为 SUBMITTED，再逐腿下单：某一腿下单失败时，其余未下的腿直接撤销；
+下单过程中策略发来的撤单 / 改单会在该腿拿到富途订单号后再执行，不会被拒绝。
 
 `subscribe_instrument_status` 的 `InstrumentStatus.action` 映射：连续交易 → `TRADING`，午休 / 期货休市 → `PAUSE`，
-开盘前竞价 / 美股盘前 → `PRE_OPEN`，港股收市竞价 (CAS) → `PRE_CLOSE`，美股盘后 / 夜盘 → `POST_CLOSE`，收盘 → `CLOSE`；
-富途原始状态名（如 `REST`、`HK_CAS`）放在 `trading_event` 中。
+开盘前竞价 / 美股盘前 → `PRE_OPEN`，港股收市竞价 (CAS) → `PRE_CLOSE`，美股盘后 / 夜盘 → `POST_CLOSE`，收盘 → `CLOSE`
+（期权到期前的每日收盘报 `POST_CLOSE`，因为 NautilusTrader 会把期权链合约收到的 `CLOSE` 当作到期并移出期权链）；
+富途原始状态名（如 `REST`、`HK_CAS`）放在 `trading_event` 中。港股期货和恒指 / 国指等指数期权使用期货市场状态
+（日盘 / 夜盘），港股股票期权使用股票市场状态。
 
 ### 直接使用 Rust 客户端
 
@@ -129,7 +133,7 @@ channel = client.start_push([3013])                       # 盘口推送
 client.subscribe([(1, "00700")], [2], True)
 msg = client.poll_push(channel, 1000)                     # 断线时抛 ConnectionError
 
-# 历史订单 / 成交（时间为市场当地时间；省略时默认最近 90 天）
+# 历史订单 / 成交（时间为市场当地时间；两端都省略时为最近 90 天，只给一端时向另一端推 90 天）
 fills = client.get_history_order_fill_list(1, acc_id, 1, begin_time="2026-09-01 00:00:00",
                                            end_time="2026-09-24 23:59:59", code_list=["00700"])
 client.disconnect()

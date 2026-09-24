@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,6 +19,7 @@ from nautilus_futu.data import FutuLiveDataClient
 from nautilus_futu.parsing.instruments import parse_futu_instrument
 from nautilus_futu.parsing.status import (
     FUTU_MARKET_STATES,
+    follows_futures_session,
     market_state_field,
     parse_futu_instrument_status,
 )
@@ -27,6 +30,16 @@ HK_FUT = parse_futu_instrument(
     {"market": 1, "code": "HSImain", "lot_size": 50, "sec_type": 10, "last_trade_timestamp": 1790000000.0},
 )
 US = parse_futu_instrument({"market": 11, "code": "AAPL", "lot_size": 1, "sec_type": 3})
+EXPIRY_TS = 1_900_000_000.0  # 2030-03-17
+STOCK_OPT = parse_futu_instrument({
+    "market": 1, "code": "TCH300328C400000", "sec_type": 8, "lot_size": 100, "option_type": 1,
+    "strike_price": 400.0, "strike_timestamp": EXPIRY_TS, "option_owner_code": "00700",
+})
+INDEX_OPT = parse_futu_instrument({
+    "market": 1, "code": "HSI300328C20000", "sec_type": 8, "lot_size": 50, "option_type": 1,
+    "strike_price": 20000.0, "strike_timestamp": EXPIRY_TS, "option_owner_code": "800000",
+})
+PROTO = Path(__file__).resolve().parents[2] / "crates" / "futu" / "proto" / "Qot_Common.proto"
 
 # QotMarketState values
 MORNING, REST, AFTERNOON, CLOSED, HK_CAS, PRE_MARKET = 3, 4, 5, 6, 19, 8
@@ -61,8 +74,31 @@ class TestMarketStateMapping:
         assert status.trading_event == "UNKNOWN_99"
 
     def test_every_proto_state_is_mapped(self):
-        # Qot_Common.QotMarketState: 0-6, 8-36 (7 is unused)
-        assert set(FUTU_MARKET_STATES) == set(range(0, 7)) | set(range(8, 37))
+        enum = re.search(r"enum QotMarketState\s*\{(.*?)\}", PROTO.read_text(encoding="utf-8"), re.S).group(1)
+        proto_states = {int(v) for v in re.findall(r"QotMarketState_\w+\s*=\s*(\d+)", enum)}
+        assert 37 in proto_states
+        assert set(FUTU_MARKET_STATES) == proto_states
+
+    def test_us_overnight_is_post_close(self):
+        assert parse_futu_instrument_status(US.id, 37, 0, 0).action == MarketStatusAction.POST_CLOSE
+
+    def test_option_daily_close_is_not_expiry(self):
+        """NautilusTrader expires option-chain instruments on CLOSE; a daily close must not look like that."""
+        before_expiry = int(EXPIRY_TS * 1e9) - 1
+        status = parse_futu_instrument_status(STOCK_OPT.id, CLOSED, 0, before_expiry, instrument=STOCK_OPT)
+        assert status.action == MarketStatusAction.POST_CLOSE
+        assert status.trading_event == "CLOSED"
+        expired = parse_futu_instrument_status(STOCK_OPT.id, CLOSED, 0, int(EXPIRY_TS * 1e9), instrument=STOCK_OPT)
+        assert expired.action == MarketStatusAction.CLOSE
+        # other instruments keep CLOSE
+        assert parse_futu_instrument_status(HK.id, CLOSED, 0, 0, instrument=HK).action == MarketStatusAction.CLOSE
+
+    def test_hkfe_derivatives_follow_futures_sessions(self):
+        assert follows_futures_session(HK_FUT)
+        assert follows_futures_session(INDEX_OPT)
+        assert not follows_futures_session(STOCK_OPT)
+        assert not follows_futures_session(HK)
+        assert not follows_futures_session(None)
 
     def test_state_fields(self):
         assert market_state_field(HK.id) == "market_hk"
@@ -105,9 +141,8 @@ class Harness:
         self.run(asyncio.sleep(secs))
 
     def close(self):
-        self.run(self.client._unsubscribe_instrument_status(HK.id))
-        self.run(self.client._unsubscribe_instrument_status(HK_FUT.id))
-        self.run(self.client._unsubscribe_instrument_status(US.id))
+        for instrument_id in list(self.client._subscribed_status):
+            self.run(self.client._unsubscribe_instrument_status(instrument_id))
         self.settle(0.02)
         self.loop.close()
 
@@ -168,6 +203,31 @@ class TestInstrumentStatusSubscription:
         h.run(h.client._subscribe_instrument_status(HK.id))
         h.settle()
         assert [s.action for s in h.data] == [MarketStatusAction.TRADING]
+
+    def test_index_option_reads_futures_state(self, h):
+        h.cache.add_instrument(INDEX_OPT)
+        h.run(h.client._subscribe_instrument_status(INDEX_OPT.id))
+        h.settle()
+        assert h.data[0].trading_event == "FUTURE_DAY_OPEN"
+
+    def test_option_status_never_closes_chain_before_expiry(self, h):
+        h.cache.add_instrument(STOCK_OPT)
+        h.state["market_hk"] = CLOSED
+        h.run(h.client._subscribe_instrument_status(STOCK_OPT.id))
+        h.settle()
+        assert h.data[0].action == MarketStatusAction.POST_CLOSE
+
+    def test_field_resolved_when_instrument_loaded_later(self, h):
+        late_future = InstrumentId.from_str("MHImain.HKEX")
+        h.run(h.client._subscribe_instrument_status(late_future))
+        h.settle()
+        assert h.data[-1].trading_event == "MORNING"  # not cached yet: securities market
+        h.cache.add_instrument(parse_futu_instrument(
+            {"market": 1, "code": "MHImain", "lot_size": 10, "sec_type": 10, "last_trade_timestamp": 1790000000.0},
+        ))
+        h.settle()
+        assert h.data[-1].instrument_id == late_future
+        assert h.data[-1].trading_event == "FUTURE_DAY_OPEN"
 
     def test_unknown_venue_rejected(self, h):
         h.run(h.client._subscribe_instrument_status(InstrumentId.from_str("X.XNAS")))

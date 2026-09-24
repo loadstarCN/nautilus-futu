@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import re
+
 from nautilus_trader.model.data import InstrumentStatus
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.instruments import FuturesContract, Instrument, OptionContract
 
 from nautilus_futu.constants import (
     HKEX_VENUE,
@@ -58,7 +61,21 @@ FUTU_MARKET_STATES: dict[int, tuple[str, MarketStatusAction]] = {
     34: ("OVERNIGHT_END", _A.CLOSE),
     35: ("TRADE_AT_LAST", _A.PRE_CLOSE),
     36: ("TRADE_AUCTION", _A.PRE_CLOSE),
+    37: ("OVERNIGHT", _A.POST_CLOSE),
 }
+
+# HK stock codes are five digits; HKEX options on anything else (index codes
+# such as 800000, futures) are HKFE products that follow the futures sessions.
+_HK_STOCK_CODE = re.compile(r"^\d{5}$")
+
+
+def follows_futures_session(instrument: Instrument | None) -> bool:
+    """Whether an instrument trades on futures sessions (HKFE futures and index options)."""
+    if isinstance(instrument, FuturesContract):
+        return True
+    if isinstance(instrument, OptionContract) and instrument.id.venue == HKEX_VENUE:
+        return not _HK_STOCK_CODE.match(instrument.underlying or "")
+    return False
 
 
 def market_state_field(instrument_id: InstrumentId, is_future: bool = False) -> str | None:
@@ -82,9 +99,21 @@ def parse_futu_instrument_status(
     market_state: int,
     ts_event: int,
     ts_init: int,
+    instrument: Instrument | None = None,
 ) -> InstrumentStatus:
-    """Build an ``InstrumentStatus`` from a Futu ``QotMarketState`` value."""
+    """Build an ``InstrumentStatus`` from a Futu ``QotMarketState`` value.
+
+    NautilusTrader treats ``CLOSE`` on an option-chain instrument as expiry and
+    drops it from the chain, so for options that have not expired yet a daily
+    session end is reported as ``POST_CLOSE`` instead.
+    """
     name, action = FUTU_MARKET_STATES.get(market_state, (f"UNKNOWN_{market_state}", _A.NONE))
+    if (
+        action == _A.CLOSE
+        and isinstance(instrument, OptionContract)
+        and (instrument.expiration_ns == 0 or ts_init < instrument.expiration_ns)
+    ):
+        action = _A.POST_CLOSE
     return InstrumentStatus(
         instrument_id=instrument_id,
         action=action,

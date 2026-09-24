@@ -38,22 +38,79 @@ pub fn format_utc_datetime(unix_secs: i64) -> String {
     )
 }
 
+/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS` or `YYYY-MM-DD HH:MM:SS.ms` as
+/// wall-clock seconds (the inverse of [`format_utc_datetime`]; fractions are
+/// dropped).  Returns `None` for anything else.
+pub fn parse_datetime_secs(value: &str) -> Option<i64> {
+    let mut parts = value.trim().splitn(2, ' ');
+    let mut date = parts.next()?.split('-');
+    let year: i64 = date.next()?.parse().ok()?;
+    let month: i64 = date.next()?.parse().ok()?;
+    let day: i64 = date.next()?.parse().ok()?;
+    if date.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let mut secs = 0;
+    if let Some(time) = parts.next() {
+        let time = time.trim().split('.').next()?;
+        let mut hms = time.split(':');
+        let hour: i64 = hms.next()?.parse().ok()?;
+        let minute: i64 = hms.next()?.parse().ok()?;
+        let second: i64 = hms.next()?.parse().ok()?;
+        if hms.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+            return None;
+        }
+        secs = hour * 3600 + minute * 60 + second;
+    }
+    Some(days_from_civil(year, month, day) * SECS_PER_DAY + secs)
+}
+
 /// Filter conditions for history order/fill queries.
 ///
-/// OpenD rejects history queries without `beginTime`/`endTime`, so a missing
-/// bound is filled in relative to `now_unix_secs`: the end defaults to one day
-/// ahead (covers every market's local time) and the begin to
-/// [`HISTORY_DEFAULT_LOOKBACK_DAYS`] before the end.
+/// OpenD rejects history queries without `beginTime`/`endTime`, so missing
+/// bounds are filled in like the official futu-api SDK does, with a
+/// [`HISTORY_DEFAULT_LOOKBACK_DAYS`] window:
+/// - neither given: the window ends one day after `now_unix_secs` (covers every
+///   market's local time);
+/// - only `end_time`: the window starts that many days before it;
+/// - only `begin_time`: the window ends that many days after it, but no later
+///   than the default end.
+///
+/// The arithmetic is done on wall-clock values, so it is independent of the
+/// market time zone the bounds are expressed in.
 pub fn history_filter_conditions(
     begin_time: Option<String>,
     end_time: Option<String>,
     code_list: Vec<String>,
     now_unix_secs: i64,
 ) -> crate::generated::trd_common::TrdFilterConditions {
-    let end_time = end_time.unwrap_or_else(|| format_utc_datetime(now_unix_secs + SECS_PER_DAY));
-    let begin_time = begin_time.unwrap_or_else(|| {
-        format_utc_datetime(now_unix_secs + SECS_PER_DAY - HISTORY_DEFAULT_LOOKBACK_DAYS * SECS_PER_DAY)
-    });
+    let window = HISTORY_DEFAULT_LOOKBACK_DAYS * SECS_PER_DAY;
+    let default_end = now_unix_secs + SECS_PER_DAY;
+    let (begin_time, end_time) = match (begin_time, end_time) {
+        (Some(begin), Some(end)) => (begin, end),
+        (None, Some(end)) => {
+            let end_secs = parse_datetime_secs(&end).unwrap_or(default_end);
+            (format_utc_datetime(end_secs - window), end)
+        }
+        (Some(begin), None) => {
+            let end_secs = parse_datetime_secs(&begin)
+                .map(|b| (b + window).min(default_end))
+                .unwrap_or(default_end);
+            (begin, format_utc_datetime(end_secs))
+        }
+        (None, None) => (format_utc_datetime(default_end - window), format_utc_datetime(default_end)),
+    };
     crate::generated::trd_common::TrdFilterConditions {
         code_list,
         begin_time: Some(begin_time),
@@ -484,6 +541,38 @@ mod tests {
         assert_eq!(filter.end_time.as_deref(), Some("2024-06-15 21:20:00"));
         assert_eq!(filter.begin_time.as_deref(), Some("2024-03-17 21:20:00"));
         assert!(filter.code_list.is_empty());
+    }
+
+    #[test]
+    fn test_parse_datetime_secs_roundtrip() {
+        assert_eq!(super::parse_datetime_secs("1970-01-01"), Some(0));
+        assert_eq!(super::parse_datetime_secs("2000-02-29 00:00:00"), Some(951_782_400));
+        assert_eq!(super::parse_datetime_secs("2024-06-14 21:20:00.123"), Some(1_718_400_000));
+        assert_eq!(super::parse_datetime_secs("1969-12-31 23:59:59"), Some(-1));
+        for secs in [-86_401_i64, 0, 951_782_400, 1_718_400_000, 4_102_444_799] {
+            assert_eq!(super::parse_datetime_secs(&super::format_utc_datetime(secs)), Some(secs));
+        }
+        for bad in ["", "2024-13-01", "2024-01-32", "2024-01-01 24:00:00", "2024/01/01", "2024-01-01 10:00"] {
+            assert_eq!(super::parse_datetime_secs(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_history_filter_end_only_counts_back_from_end() {
+        let now = 1_718_400_000; // 2024-06-14 21:20:00 UTC
+        let filter = super::history_filter_conditions(None, Some("2024-01-31 23:59:59".to_string()), vec![], now);
+        assert_eq!(filter.begin_time.as_deref(), Some("2023-11-02 23:59:59"));
+        assert_eq!(filter.end_time.as_deref(), Some("2024-01-31 23:59:59"));
+    }
+
+    #[test]
+    fn test_history_filter_begin_only_counts_forward_capped_at_now() {
+        let now = 1_718_400_000; // 2024-06-14 21:20:00 UTC
+        let old = super::history_filter_conditions(Some("2024-01-01".to_string()), None, vec![], now);
+        assert_eq!(old.begin_time.as_deref(), Some("2024-01-01"));
+        assert_eq!(old.end_time.as_deref(), Some("2024-03-31 00:00:00"));
+        let recent = super::history_filter_conditions(Some("2024-06-01 00:00:00".to_string()), None, vec![], now);
+        assert_eq!(recent.end_time.as_deref(), Some("2024-06-15 21:20:00"));
     }
 
     #[test]

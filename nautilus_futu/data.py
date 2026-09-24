@@ -14,7 +14,6 @@ from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import Bar, BarType, DataType, OrderBookDeltas
 from nautilus_trader.model.enums import BarAggregation, BookType
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
-from nautilus_trader.model.instruments import FuturesContract
 
 from nautilus_futu.common import (
     futu_security_to_instrument_id,
@@ -49,7 +48,11 @@ from nautilus_futu.parsing.market_data import (
     parse_push_order_book,
     seconds_to_ns,
 )
-from nautilus_futu.parsing.status import market_state_field, parse_futu_instrument_status
+from nautilus_futu.parsing.status import (
+    follows_futures_session,
+    market_state_field,
+    parse_futu_instrument_status,
+)
 from nautilus_futu.providers import FutuInstrumentProvider
 
 # Push protocols this client consumes
@@ -143,8 +146,8 @@ class FutuLiveDataClient(LiveMarketDataClient):
         self._partial_bars: dict[BarType, Bar] = {}
         self._last_emitted_bar_ts: dict[BarType, int] = {}
         self._book_sequence: dict[InstrumentId, int] = {}
-        # Instrument status: instrument -> `get_global_state` key, last emitted state
-        self._subscribed_status: dict[InstrumentId, str] = {}
+        # Instrument status subscriptions and the last market state emitted for each
+        self._subscribed_status: set[InstrumentId] = set()
         self._last_market_state: dict[InstrumentId, int] = {}
 
         self._push_task: asyncio.Task | None = None
@@ -431,16 +434,24 @@ class FutuLiveDataClient(LiveMarketDataClient):
             if self._status_task is asyncio.current_task():
                 self._status_task = None
 
+    def _market_state_field(self, instrument_id: InstrumentId) -> str | None:
+        """Resolved per poll so an instrument loaded after subscribing still maps correctly."""
+        return market_state_field(instrument_id, follows_futures_session(self._instrument_for(instrument_id)))
+
     async def _poll_market_status(self) -> None:
         state = await asyncio.to_thread(self._client.get_global_state)
         ts_init = self._clock.timestamp_ns()
         ts_event = seconds_to_ns(state.get("time"), ts_init)
-        for instrument_id, field in list(self._subscribed_status.items()):
-            value = state.get(field)
+        for instrument_id in list(self._subscribed_status):
+            field = self._market_state_field(instrument_id)
+            value = state.get(field) if field is not None else None
             if value is None or self._last_market_state.get(instrument_id) == value:
                 continue
             self._last_market_state[instrument_id] = int(value)
-            self._handle_data(parse_futu_instrument_status(instrument_id, int(value), ts_event, ts_init))
+            status = parse_futu_instrument_status(
+                instrument_id, int(value), ts_event, ts_init, instrument=self._instrument_for(instrument_id),
+            )
+            self._handle_data(status)
 
     # ------------------------------------------------------------------
     # Subscriptions
@@ -540,12 +551,11 @@ class FutuLiveDataClient(LiveMarketDataClient):
         The current status is emitted right away, then on every change.
         """
         instrument_id = getattr(command, "instrument_id", command)
-        is_future = isinstance(self._instrument_for(instrument_id), FuturesContract)
-        field = market_state_field(instrument_id, is_future)
+        field = self._market_state_field(instrument_id)
         if field is None:
             self._log.error(f"No Futu market state for venue {instrument_id.venue}; cannot subscribe status")
             return
-        self._subscribed_status[instrument_id] = field
+        self._subscribed_status.add(instrument_id)
         self._last_market_state.pop(instrument_id, None)
         self._log.info(f"Subscribed to instrument status for {instrument_id} ({field})")
         if self._status_task is None:
@@ -559,7 +569,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
     async def _unsubscribe_instrument_status(self, command) -> None:
         """Unsubscribe from market status changes (the poll loop stops with the last one)."""
         instrument_id = getattr(command, "instrument_id", command)
-        self._subscribed_status.pop(instrument_id, None)
+        self._subscribed_status.discard(instrument_id)
         self._last_market_state.pop(instrument_id, None)
         if not self._subscribed_status and self._status_task is not None:
             self._status_task.cancel()
