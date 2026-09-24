@@ -111,7 +111,9 @@ self.cancel_all_orders(instrument_id)
 OCO/OUO 订单列表会先校验全部订单腿并统一标记为 SUBMITTED，再逐腿下单：某一腿被拒或在下单前被撤销时，
 与它关联、尚未下单的腿直接撤销（不关联的腿照常下单）；尚未下单的腿收到改单时直接按新数量 / 价格下单。
 单笔订单同样适用：下单请求进行中收到的撤单 / 改单会在拿到富途订单号后执行，`cancel_all_orders` 也会撤销在途订单。
-下单请求超时等"结果未知"的失败不会被当作拒单：订单保持 SUBMITTED，待富途推送或在途订单检查确认。
+下单请求超时等"结果未知"的失败不会被当作拒单：订单保持 SUBMITTED，适配器按 `remark` 到富途订单列表里查找它
+（富途推送或 NautilusTrader 的在途订单检查也能确认）；期间的撤单 / 改单在确认后执行，始终找不到的订单才会被拒绝。
+连接已断开时提交的订单（请求根本没发出）仍会立即被拒绝。
 
 `subscribe_instrument_status` 的 `InstrumentStatus.action` 映射：连续交易 → `TRADING`，午休 / 期货休市 → `PAUSE`，
 开盘前竞价 / 美股盘前 → `PRE_OPEN`，港股收市竞价 (CAS) → `PRE_CLOSE`，美股盘后 / 夜盘 → `POST_CLOSE`，收盘 → `CLOSE`

@@ -181,6 +181,9 @@ pub enum ConnectionError {
     Decryption(String),
     #[error("connection disconnected")]
     Disconnected,
+    /// The link was already down, so the request was never sent.
+    #[error("not connected (request not sent)")]
+    NotConnected,
     #[error("request timed out after {0}s (proto_id={1})")]
     Timeout(u64, u32),
 }

@@ -24,9 +24,22 @@
 - `OrderAccepted` is emitted once per order even when several pushes arrive
   before the execution engine has applied the first one.
 - A `place_order` failure after the request was sent (timeout, lost link) no
-  longer reports the order as rejected, since OpenD may have accepted it: the
-  order stays SUBMITTED until an order push (matched by `remark`) or the
-  in-flight check resolves it, and requests made meanwhile are applied then.
+  longer reports the order as rejected, since OpenD may have accepted it.  The
+  order stays SUBMITTED and the client looks it up in OpenD's order list (by
+  `remark`) until its fate is known; an order push or a status report (in-flight
+  check, reconciliation) resolves it just as well.  Cancels/modifies made
+  meanwhile are applied once, and a modify applied before placement is reported
+  when the order is identified.  An order that is never found is rejected; one
+  that OpenD works although NautilusTrader already closed it is canceled.
+  Requests refused because the link was already down (the Rust client now
+  reports "not connected (request not sent)") and OpenD refusals are still
+  rejected immediately.
+- Fill pushes that arrive before the order they belong to is identified are
+  kept and replayed instead of being dropped.
+- A refused repeat cancel of an order whose earlier cancel went through (e.g.
+  cancel-all plus the OCO manager) no longer produces `OrderCancelRejected`; an
+  order accepted only to recover from a refused modify/cancel is reported as
+  rejected (not canceled) if the venue later fails it.
 
 ### Added
 
@@ -47,7 +60,8 @@
   one after every leg is validated and marked SUBMITTED (so the strategy's
   `manage_contingent_orders` sees all legs).  When an OCO/OUO leg is rejected or
   canceled before placement, the not yet placed legs linked to it are canceled
-  instead of placed; a modify for a queued leg is placed directly.  OTO/bracket
+  instead of placed; a modify for a queued leg is placed directly; legs the
+  engine closed while earlier legs were placed are skipped.  OTO/bracket
   lists are rejected with a hint to use `emulation_trigger` (Futu has no native
   contingent orders).
 

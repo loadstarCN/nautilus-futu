@@ -125,3 +125,36 @@ class TestConnectionLifecycle:
 
         asyncio.run(run())
         client.disconnect()
+
+
+class TestPlaceOrderErrorClassification:
+    """``place_order`` errors from the real client must tell "not sent" from "maybe sent"."""
+
+    def test_request_on_dead_link_is_definitive(self, server):
+        from nautilus_futu.execution import is_ambiguous_order_error
+
+        client = PyFutuClient()
+        _connect(client, server)
+        server.drop_connections()
+        assert _wait(lambda: not client.is_connected())
+        with pytest.raises(Exception) as excinfo:
+            client.place_order(0, 1, 1, 1, 1, "00700", 100.0, 300.0)
+        assert "not connected" in str(excinfo.value).lower()
+        assert not is_ambiguous_order_error(excinfo.value)
+        assert not any(p == 2202 for p, _ in server.received)
+
+    def test_timed_out_request_is_ambiguous(self):
+        from nautilus_futu.execution import is_ambiguous_order_error
+
+        srv = FakeOpenD(ignore_protos={2202}).start()
+        try:
+            client = PyFutuClient()
+            _connect(client, srv, timeout=1)
+            with pytest.raises(Exception) as excinfo:
+                client.place_order(0, 1, 1, 1, 1, "00700", 100.0, 300.0)
+            assert "timed out" in str(excinfo.value)
+            assert is_ambiguous_order_error(excinfo.value)
+            assert any(p == 2202 for p, _ in srv.received)  # the request did reach OpenD
+            client.disconnect()
+        finally:
+            srv.stop()

@@ -97,13 +97,29 @@ _UNKNOWN = "unknown"  # the request may have reached OpenD (timeout, lost link)
 # Error texts of failures that happen after the request was sent: OpenD may
 # have accepted the order, so it must not be reported as rejected.
 _AMBIGUOUS_ERRORS = ("timed out", "disconnected", "receive error", "decode error", "decryption error")
+# Error texts that prove the order was not placed
+_DEFINITIVE_ERRORS = ("not connected", "server error")
+
+# After an unclear placement, look the order up in OpenD's order list after
+# these delays (seconds); it counts as never placed once it is missing from
+# that many successful lookups.
+_RESOLVE_DELAYS = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0)
+_RESOLVE_NOT_FOUND_LIMIT = 3
+
+# Fill pushes for orders not identified yet (their order push or place_order
+# reply has not arrived) are kept for replay, up to this many orders
+_UNMATCHED_FILLS_MAX = 1_000
+
+# A cancel refused this soon after an earlier cancel of the same order went
+# through is a duplicate (e.g. cancel-all plus the OCO manager): no rejection
+_DUPLICATE_CANCEL_WINDOW_NS = 30 * 1_000_000_000
 
 
 def is_ambiguous_order_error(error: BaseException) -> bool:
     """Whether a ``place_order`` failure leaves the order's fate unknown."""
     text = str(error).lower()
-    if "not connected" in text:
-        return False  # nothing was sent
+    if any(marker in text for marker in _DEFINITIVE_ERRORS):
+        return False  # nothing was sent, or OpenD answered with a refusal
     return isinstance(error, ConnectionError | TimeoutError) or any(marker in text for marker in _AMBIGUOUS_ERRORS)
 
 # Backwards-compatible aliases
@@ -299,7 +315,15 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         self._uncertain: set[ClientOrderId] = set()
         self._deferred_cancels: set[ClientOrderId] = set()
         self._deferred_modifies: dict[ClientOrderId, dict[str, Any]] = {}
+        # Values an unclearly placed order was sent with (a modify applied
+        # before placement), reported once OpenD reveals the order
+        self._placed_values: dict[ClientOrderId, dict[str, Any]] = {}
         self._accepted_ids: OrderedDict[ClientOrderId, None] = OrderedDict()
+        # Accepted locally only to leave PENDING_UPDATE/PENDING_CANCEL after a
+        # refused modify/cancel, before the venue acknowledged the order
+        self._provisional_accepts: set[ClientOrderId] = set()
+        self._cancel_sent: OrderedDict[ClientOrderId, int] = OrderedDict()
+        self._unmatched_fills: OrderedDict[str, list[dict]] = OrderedDict()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -324,7 +348,13 @@ class FutuLiveExecutionClient(LiveExecutionClient):
     def _ts_or_now(self, seconds: float | None) -> int:
         return seconds_to_ns(seconds, self._clock.timestamp_ns())
 
-    def _ensure_accepted(self, order: Order, venue_order_id: VenueOrderId, ts_event: int) -> None:
+    def _ensure_accepted(
+        self,
+        order: Order,
+        venue_order_id: VenueOrderId,
+        ts_event: int,
+        provisional: bool = False,
+    ) -> None:
         """Emit OrderAccepted once for an order the venue acknowledged.
 
         Also covers orders the strategy moved to PENDING_UPDATE/PENDING_CANCEL
@@ -342,9 +372,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             OrderStatus.PENDING_CANCEL,
         ):
             return
-        self._accepted_ids[client_order_id] = None
-        while len(self._accepted_ids) > _ACCEPTED_MAX:
-            self._accepted_ids.popitem(last=False)
+        self._mark_accepted(client_order_id)
+        if provisional:
+            self._provisional_accepts.add(client_order_id)
         self.generate_order_accepted(
             strategy_id=order.strategy_id,
             instrument_id=order.instrument_id,
@@ -353,8 +383,30 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             ts_event=ts_event,
         )
 
+    def _mark_accepted(self, client_order_id: ClientOrderId) -> None:
+        self._accepted_ids[client_order_id] = None
+        while len(self._accepted_ids) > _ACCEPTED_MAX:
+            self._accepted_ids.popitem(last=False)
+
     def _never_accepted(self, order: Order) -> bool:
         return order.venue_order_id is None and order.client_order_id not in self._accepted_ids
+
+    def _index_venue_id(self, client_order_id: ClientOrderId, venue_order_id: VenueOrderId) -> None:
+        """Index venue id -> client id and replay fill pushes that arrived before it was known."""
+        if self._cache.client_order_id(venue_order_id) is None:
+            try:
+                self._cache.add_venue_order_id(client_order_id, venue_order_id)
+            except Exception as e:
+                self._log.debug(f"add_venue_order_id({client_order_id}, {venue_order_id}): {e}")
+        for data in self._unmatched_fills.pop(venue_order_id.value, None) or []:
+            self._log.info(f"Replaying fill push for {client_order_id} ({venue_order_id}) received before its order")
+            self._handle_push_fill(data)
+
+    def _buffer_unmatched_fill(self, order_id: Any, data: dict) -> None:
+        pending = self._unmatched_fills.setdefault(str(order_id), [])
+        pending.append(data)
+        while len(self._unmatched_fills) > _UNMATCHED_FILLS_MAX:
+            self._unmatched_fills.popitem(last=False)
 
     def _remember_fill(self, fill_id: str) -> bool:
         """Return False if the fill was already processed."""
@@ -641,10 +693,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 return None
             if self._cache.order(client_order_id) is None:
                 return None
-            try:
-                self._cache.add_venue_order_id(client_order_id, venue_order_id)
-            except Exception as e:
-                self._log.debug(f"add_venue_order_id({client_order_id}, {venue_order_id}): {e}")
+            self._index_venue_id(client_order_id, venue_order_id)
         return self._cache.order(client_order_id)
 
     def _handle_push_order(self, data: dict) -> None:
@@ -678,7 +727,11 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             ts_event = self._ts_or_now(order_data.get("update_timestamp"))
             reason = order_data.get("last_err_msg") or f"Futu order status {order_status_int}"
 
-            self._on_venue_order_known(order, venue_order_id, nt_status)
+            self._on_venue_id_learned(order, venue_order_id, order_status_int, via_report=False)
+            order = self._cache.order(order.client_order_id) or order
+            provisional = order.client_order_id in self._provisional_accepts
+            if nt_status in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED):
+                self._provisional_accepts.discard(order.client_order_id)  # the venue acknowledged it
 
             if nt_status == OrderStatus.ACCEPTED:
                 self._on_venue_accepted(order, order_data, venue_order_id, instrument, ts_event)
@@ -686,8 +739,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 # Fills arrive via 2218; make sure the order is ACCEPTED first
                 self._ensure_accepted(order, venue_order_id, ts_event)
             elif nt_status == OrderStatus.REJECTED:
+                self._provisional_accepts.discard(order.client_order_id)
                 if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED) or (
-                    not order.is_closed and self._never_accepted(order)
+                    not order.is_closed and (self._never_accepted(order) or provisional)
                 ):
                     self.generate_order_rejected(
                         strategy_id=order.strategy_id,
@@ -721,18 +775,76 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         except Exception as e:
             self._log.error(f"Unexpected error in _handle_push_order: {e}")
 
-    def _on_venue_order_known(self, order: Order, venue_order_id: VenueOrderId, nt_status: OrderStatus) -> None:
-        """A push identified an order whose place_order outcome was unknown: apply queued requests."""
+    def _on_venue_id_learned(
+        self,
+        order: Order,
+        venue_order_id: VenueOrderId,
+        futu_status: int | None,
+        via_report: bool,
+    ) -> None:
+        """An order push or status report revealed an order whose placement was unclear.
+
+        Applies the requests queued while its venue id was unknown.  On the
+        report path (in-flight check, the resolver) the execution engine emits
+        OrderAccepted itself when it reconciles the report, so the follow-up
+        work runs as a task after that.  An order OpenD is still working
+        although NautilusTrader already closed it (the in-flight check gave up)
+        is canceled at the venue.
+        """
         client_order_id = order.client_order_id
+        self._index_venue_id(client_order_id, venue_order_id)
         if client_order_id not in self._uncertain:
             return
         self._uncertain.discard(client_order_id)
-        self._log.info(f"Order {client_order_id} confirmed by OpenD as {venue_order_id} after an unclear placement")
-        if nt_status in (OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.FILLED):
+        placed = self._placed_values.pop(client_order_id, None)
+        self._log.info(f"Order {client_order_id} identified at OpenD as {venue_order_id} after an unclear placement")
+        if futu_status not in FUTU_ORDER_STATUS_ACTIVE:
             self._deferred_cancels.discard(client_order_id)
             self._deferred_modifies.pop(client_order_id, None)
             return
-        self.create_task(self._apply_deferred(order, venue_order_id))
+        if order.is_closed:
+            self._deferred_cancels.discard(client_order_id)
+            self._deferred_modifies.pop(client_order_id, None)
+            self._log.error(
+                f"Order {client_order_id} is working at OpenD as {venue_order_id} but was closed locally "
+                f"({order.status_string()}); canceling it at the venue",
+            )
+            self.create_task(self._send_cancel(order, venue_order_id, report_failure=False))
+            return
+        if via_report:
+            self._mark_accepted(client_order_id)
+            self.create_task(self._resume_after_unclear_placement(client_order_id, venue_order_id, placed))
+            return
+        self._ensure_accepted(order, venue_order_id, self._clock.timestamp_ns())
+        self._emit_placed_values(order, venue_order_id, placed)
+        self.create_task(self._apply_deferred(order, venue_order_id, base=placed))
+
+    async def _resume_after_unclear_placement(
+        self,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        placed: dict[str, Any] | None,
+    ) -> None:
+        order = self._cache.order(client_order_id)
+        if order is None:
+            return
+        self._emit_placed_values(order, venue_order_id, placed)
+        await self._apply_deferred(order, venue_order_id, base=placed)
+
+    def _emit_placed_values(self, order: Order, venue_order_id: VenueOrderId, placed: dict[str, Any] | None) -> None:
+        """The order went out with a modify applied before placement: report those values."""
+        if placed is None or order.is_closed:
+            return
+        self.generate_order_updated(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=venue_order_id,
+            quantity=placed["quantity"],
+            price=placed["price"],
+            trigger_price=placed["trigger_price"],
+            ts_event=self._clock.timestamp_ns(),
+        )
 
     def _on_venue_accepted(self, order: Order, order_data: dict, venue_order_id: VenueOrderId, instrument, ts_event: int) -> None:
         """A SUBMITTED status from Futu: initial acceptance or post-modify acknowledgement."""
@@ -787,7 +899,10 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
             order = self._resolve_order(order_id, None)
             if order is None:
-                self._log.debug(f"Fill push for unknown/external order_id={order_id} ignored")
+                # Possibly our order whose order push / place_order reply has not
+                # arrived yet: keep it for replay once the venue id is known.
+                self._log.debug(f"Fill push for unknown order_id={order_id} kept for replay")
+                self._buffer_unmatched_fill(order_id, data)
                 return
 
             fill_id = str(fill_data.get("fill_id") or fill_data.get("fill_id_ex") or "")
@@ -904,6 +1019,13 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
         for order in orders:
             client_order_id = order.client_order_id
+            current = self._cache.order(client_order_id) or order
+            if current.is_closed:
+                # e.g. resolved by the in-flight check while earlier legs were placed
+                self._log.info(f"Order {client_order_id} closed ({current.status_string()}) before it was placed")
+                self._forget_unplaced(client_order_id)
+                close_linked(order)
+                continue
             if client_order_id in doomed or client_order_id in self._deferred_cancels:
                 self._forget_unplaced(client_order_id)
                 if client_order_id in doomed:
@@ -928,6 +1050,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         self._uncertain.discard(client_order_id)
         self._deferred_cancels.discard(client_order_id)
         self._deferred_modifies.pop(client_order_id, None)
+        self._placed_values.pop(client_order_id, None)
 
     def _reject_locally(self, order: Order, reason: str) -> None:
         """Reject an order that was never sent to OpenD."""
@@ -957,6 +1080,17 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         if fields.get("trigger_price") is not None and params.get("aux_price") is not None:
             params["aux_price"] = float(fields["trigger_price"])
         return params
+
+    @staticmethod
+    def _placed_fields(order: Order, fields: dict[str, Any]) -> dict[str, Any]:
+        """Full quantity/price/trigger values of an order placed with ``fields`` applied."""
+        return {
+            "quantity": fields.get("quantity") or order.quantity,
+            "price": fields["price"] if fields.get("price") is not None else (order.price if order.has_price else None),
+            "trigger_price": fields["trigger_price"] if fields.get("trigger_price") is not None else (
+                order.trigger_price if order.has_trigger_price else None
+            ),
+        }
 
     async def _place_order(
         self,
@@ -1006,8 +1140,10 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 return reject(str(e))
 
         premodify = self._deferred_modifies.pop(client_order_id, None)
+        placed: dict[str, Any] | None = None
         if premodify is not None:
             params = self._modified_params(order, params, premodify)
+            placed = self._placed_fields(order, premodify)
 
         self._unplaced.add(client_order_id)
         try:
@@ -1031,18 +1167,24 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 params["trail_spread"],
             )
         except Exception as e:
-            if is_ambiguous_order_error(e):
+            if not is_ambiguous_order_error(e):
+                self._log.error(f"Failed to submit order {client_order_id}: {e}")
+                return reject(str(e))
+            known = self._cache.venue_order_id(client_order_id)
+            if known is None:
                 self._log.warning(
-                    f"Placement of {client_order_id} unclear ({e}); leaving it SUBMITTED until OpenD "
-                    "confirms it (order push) or the in-flight check resolves it",
+                    f"Placement of {client_order_id} unclear ({e}); leaving it SUBMITTED and looking it up "
+                    "at OpenD (order pushes and the in-flight check can also resolve it)",
                 )
                 self._unplaced.discard(client_order_id)
                 self._uncertain.add(client_order_id)
-                if premodify is not None:
-                    self._merge_deferred_modify(client_order_id, premodify)
+                if placed is not None:
+                    self._placed_values[client_order_id] = placed
+                self.create_task(self._resolve_unclear_placement(order))
                 return _UNKNOWN
-            self._log.error(f"Failed to submit order {client_order_id}: {e}")
-            return reject(str(e))
+            # An order push already identified the order while the request was in flight
+            self._log.warning(f"place_order for {client_order_id} failed ({e}) but OpenD already reported it as {known}")
+            result = {"order_id": known.value}
 
         order_id = (result or {}).get("order_id")
         if order_id is None:
@@ -1053,36 +1195,91 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         # Index venue id -> client id so pushes (which may already have arrived
         # and been matched through `remark`) resolve the order.  ACCEPTED is
         # generated from the order push, the single source of truth.
-        if self._cache.client_order_id(venue_order_id) is None:
-            try:
-                self._cache.add_venue_order_id(client_order_id, venue_order_id)
-            except Exception as e:
-                self._log.debug(f"add_venue_order_id after submit: {e}")
-        self._log.info(f"Order submitted: {client_order_id} -> {venue_order_id}")
         self._unplaced.discard(client_order_id)
+        self._index_venue_id(client_order_id, venue_order_id)
+        self._log.info(f"Order submitted: {client_order_id} -> {venue_order_id}")
 
         current = self._cache.order(client_order_id) or order
-        if premodify is not None:
+        if placed is not None:
             # The order went out with the modified values: resolve the pending update.
-            ts_now = self._clock.timestamp_ns()
-            self._ensure_accepted(current, venue_order_id, ts_now)
-            self.generate_order_updated(
-                strategy_id=order.strategy_id,
-                instrument_id=instrument_id,
-                client_order_id=client_order_id,
-                venue_order_id=venue_order_id,
-                quantity=premodify.get("quantity") or current.quantity,
-                price=premodify.get("price") if premodify.get("price") is not None else (current.price if current.has_price else None),
-                trigger_price=premodify.get("trigger_price") if premodify.get("trigger_price") is not None else (
-                    current.trigger_price if current.has_trigger_price else None
-                ),
-                ts_event=ts_now,
-            )
-        await self._apply_deferred(current, venue_order_id)
+            self._ensure_accepted(current, venue_order_id, self._clock.timestamp_ns())
+            self._emit_placed_values(current, venue_order_id, placed)
+        await self._apply_deferred(current, venue_order_id, base=placed)
         return _PLACED
 
-    async def _apply_deferred(self, order: Order, venue_order_id: VenueOrderId) -> None:
-        """Apply cancel/modify requests that arrived before the venue order id was known."""
+    async def _resolve_unclear_placement(self, order: Order) -> None:
+        """Look an unclearly placed order up at OpenD until its fate is known.
+
+        Found: the order is reported to the execution engine like the in-flight
+        check does, and queued requests are applied.  Missing from several
+        successful lookups: the request never reached OpenD, so it is rejected.
+        """
+        client_order_id = order.client_order_id
+        trd_market = self._trd_market_for(order.instrument_id)
+        not_found = 0
+        for delay in _RESOLVE_DELAYS:
+            await asyncio.sleep(delay)
+            if client_order_id not in self._uncertain:
+                return  # resolved by a push or a report
+            try:
+                order_dicts = await asyncio.to_thread(
+                    self._client.get_order_list, self._trd_env, self._acc_id, trd_market,
+                )
+            except Exception as e:
+                self._log.debug(f"Lookup of {client_order_id} failed: {e}")
+                continue
+            if client_order_id not in self._uncertain:
+                return
+            match = next(
+                (o for o in order_dicts or [] if client_order_id_from_remark(o.get("remark")) == client_order_id),
+                None,
+            )
+            if match is None:
+                not_found += 1
+                if not_found >= _RESOLVE_NOT_FOUND_LIMIT:
+                    break
+                continue
+            current = self._cache.order(client_order_id) or order
+            report = parse_futu_order_to_report(
+                match, self.account_id_str, self._report_instrument(match), self._clock.timestamp_ns(),
+            )
+            self._on_venue_id_learned(current, VenueOrderId(str(match["order_id"])), match.get("order_status"), via_report=True)
+            if not current.is_closed:
+                self._send_order_status_report(report)
+            return
+
+        if client_order_id not in self._uncertain:
+            return
+        self._forget_unplaced(client_order_id)
+        current = self._cache.order(client_order_id) or order
+        if current.is_closed:
+            return
+        if not_found >= _RESOLVE_NOT_FOUND_LIMIT:
+            self._log.warning(f"Order {client_order_id} not found at OpenD after an unclear placement; rejecting it")
+            self.generate_order_rejected(
+                strategy_id=current.strategy_id,
+                instrument_id=current.instrument_id,
+                client_order_id=client_order_id,
+                reason="not found at OpenD after an unclear placement",
+                ts_event=self._clock.timestamp_ns(),
+            )
+        else:
+            self._log.error(
+                f"Could not look up {client_order_id} at OpenD; its state is left to the in-flight check "
+                "and reconciliation",
+            )
+
+    async def _apply_deferred(
+        self,
+        order: Order,
+        venue_order_id: VenueOrderId,
+        base: dict[str, Any] | None = None,
+    ) -> None:
+        """Apply cancel/modify requests that arrived before the venue order id was known.
+
+        ``base`` holds the values the order was actually placed with when they
+        differ from the cached order (a modify applied before placement).
+        """
         client_order_id = order.client_order_id
         deferred_cancel = client_order_id in self._deferred_cancels
         deferred_modify = self._deferred_modifies.pop(client_order_id, None)
@@ -1093,7 +1290,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             await self._cancel_cached_order(order, venue_order_id)
         elif deferred_modify is not None:
             self._log.info(f"Applying modify requested before {client_order_id} was placed")
-            await self._send_modify(order, venue_order_id, deferred_modify)
+            await self._send_modify(order, venue_order_id, deferred_modify, base=base)
 
     def _merge_deferred_modify(self, client_order_id: ClientOrderId, fields: dict[str, Any]) -> None:
         """Merge a modify into the pending one (the latest value of each field wins)."""
@@ -1138,12 +1335,18 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             return
         await self._send_modify(order, venue_order_id, fields)
 
-    async def _send_modify(self, order: Order, venue_order_id: VenueOrderId, fields: dict[str, Any]) -> None:
-        quantity = fields.get("quantity") or order.quantity
-        price = fields.get("price") if fields.get("price") is not None else (order.price if order.has_price else None)
-        trigger_price = fields.get("trigger_price") if fields.get("trigger_price") is not None else (
-            order.trigger_price if order.has_trigger_price else None
-        )
+    async def _send_modify(
+        self,
+        order: Order,
+        venue_order_id: VenueOrderId,
+        fields: dict[str, Any],
+        base: dict[str, Any] | None = None,
+    ) -> None:
+        """Send a modify; fields it leaves out keep ``base`` (values placed) or the cached order's."""
+        current = base or self._placed_fields(order, {})
+        quantity = fields.get("quantity") or current["quantity"]
+        price = fields["price"] if fields.get("price") is not None else current["price"]
+        trigger_price = fields["trigger_price"] if fields.get("trigger_price") is not None else current["trigger_price"]
 
         # OrderPendingUpdate is applied by the strategy before the command is sent.
         try:
@@ -1162,7 +1365,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             self._log.error(f"Failed to modify order {order.client_order_id}: {e}")
             # The order exists at the venue: accept it first so the rejection can
             # return it from PENDING_UPDATE to ACCEPTED.
-            self._ensure_accepted(order, venue_order_id, self._clock.timestamp_ns())
+            self._ensure_accepted(order, venue_order_id, self._clock.timestamp_ns(), provisional=True)
             self.generate_order_modify_rejected(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
@@ -1216,7 +1419,11 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             )
             return
 
-        # OrderPendingCancel is applied by the strategy before the command is sent.
+        await self._send_cancel(order, venue_order_id)
+
+    async def _send_cancel(self, order: Order, venue_order_id: VenueOrderId, report_failure: bool = True) -> None:
+        """Send a cancel to OpenD (OrderPendingCancel is applied by the strategy beforehand)."""
+        client_order_id = order.client_order_id
         try:
             await asyncio.to_thread(
                 self._client.modify_order,
@@ -1228,20 +1435,30 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 None,
                 None,
             )
-            self._log.info(f"Cancel requested: {order.client_order_id} ({venue_order_id})")
         except Exception as e:
-            self._log.error(f"Failed to cancel order {order.client_order_id}: {e}")
+            sent_at = self._cancel_sent.get(client_order_id)
+            if sent_at is not None and self._clock.timestamp_ns() - sent_at < _DUPLICATE_CANCEL_WINDOW_NS:
+                self._log.info(f"Repeated cancel of {client_order_id} refused ({e}); an earlier cancel is in progress")
+                return
+            self._log.error(f"Failed to cancel order {client_order_id}: {e}")
+            if not report_failure:
+                return
             # The order exists at the venue: accept it first so the rejection can
             # return it from PENDING_CANCEL to ACCEPTED.
-            self._ensure_accepted(order, venue_order_id, self._clock.timestamp_ns())
+            self._ensure_accepted(order, venue_order_id, self._clock.timestamp_ns(), provisional=True)
             self.generate_order_cancel_rejected(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
+                client_order_id=client_order_id,
                 venue_order_id=venue_order_id,
                 reason=str(e),
                 ts_event=self._clock.timestamp_ns(),
             )
+            return
+        self._cancel_sent[client_order_id] = self._clock.timestamp_ns()
+        while len(self._cancel_sent) > _ACCEPTED_MAX:
+            self._cancel_sent.popitem(last=False)
+        self._log.info(f"Cancel requested: {client_order_id} ({venue_order_id})")
 
     async def _cancel_all_orders(self, command: Any) -> None:
         """Cancel the strategy's open and in-flight orders for the command's instrument (and side).
@@ -1424,9 +1641,21 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 )
         if found is None:
             return None
+        self._note_reported_order(found)
         return parse_futu_order_to_report(
             found, self.account_id_str, self._report_instrument(found), self._clock.timestamp_ns(),
         )
+
+    def _note_reported_order(self, order_dict: dict) -> None:
+        """A status report reveals an unclearly placed order (in-flight check, reconciliation)."""
+        client_order_id = client_order_id_from_remark(order_dict.get("remark"))
+        if client_order_id is None or client_order_id not in self._uncertain:
+            return
+        order = self._cache.order(client_order_id)
+        if order is not None and order_dict.get("order_id") is not None:
+            self._on_venue_id_learned(
+                order, VenueOrderId(str(order_dict["order_id"])), order_dict.get("order_status"), via_report=True,
+            )
 
     async def generate_order_status_reports(self, command) -> list[OrderStatusReport]:
         """Generate order status reports across the authorized markets.
@@ -1451,6 +1680,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 continue
             if not self._matches_instrument(order_dict, instrument_id):
                 continue
+            self._note_reported_order(order_dict)
             try:
                 reports.append(
                     parse_futu_order_to_report(

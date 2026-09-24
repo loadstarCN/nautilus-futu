@@ -122,7 +122,7 @@ impl FutuClient {
     /// Send a request and wait for the response (bounded by the configured request timeout).
     pub async fn request(&self, proto_id: u32, body: &[u8]) -> Result<FutuMessage, ConnectionError> {
         if !self.is_connected() {
-            return Err(ConnectionError::Disconnected);
+            return Err(ConnectionError::NotConnected);
         }
         // Register BEFORE sending to avoid race with recv loop
         let serial_no = self.conn.next_serial();
@@ -363,8 +363,8 @@ mod tests {
             .expect("disconnect detected within 3s")
             .expect("watch alive");
         assert!(!client.is_connected());
-        // Requests now fail fast instead of hanging
-        assert!(matches!(client.request(3001, b"").await, Err(ConnectionError::Disconnected)));
+        // Requests now fail fast (without being sent) instead of hanging
+        assert!(matches!(client.request(3001, b"").await, Err(ConnectionError::NotConnected)));
     }
 
     #[tokio::test]
