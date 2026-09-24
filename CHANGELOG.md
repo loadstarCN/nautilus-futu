@@ -16,7 +16,17 @@
 - Cancels and modifies no longer fail with "no venue_order_id" when they arrive
   before the order's acceptance push: the venue order id indexed at placement is
   used, and a request that arrives while `place_order` is still in flight is
-  applied once the order is placed.
+  applied once the order is placed (several modifies are merged field by field).
+  Such orders are accepted when the venue acknowledges the request, so they no
+  longer stay stuck in PENDING_UPDATE/PENDING_CANCEL.
+- `cancel_all_orders` (and therefore `market_exit`) also cancels in-flight
+  SUBMITTED orders, including orders still being placed.
+- `OrderAccepted` is emitted once per order even when several pushes arrive
+  before the execution engine has applied the first one.
+- A `place_order` failure after the request was sent (timeout, lost link) no
+  longer reports the order as rejected, since OpenD may have accepted it: the
+  order stays SUBMITTED until an order push (matched by `remark`) or the
+  in-flight check resolves it, and requests made meanwhile are applied then.
 
 ### Added
 
@@ -31,13 +41,15 @@
   auction, pre/after market, US overnight, futures sessions...) mapped to
   `InstrumentStatus`, polled every `market_status_interval` seconds (default 10)
   while subscribed.  HK futures and index options follow the futures market
-  state.  Options report a daily close as `POST_CLOSE` until they expire,
+  state (instruments missing from the cache are loaded on subscribe).  Options report a daily close as `POST_CLOSE` until they expire,
   because NautilusTrader treats `CLOSE` on an option-chain instrument as expiry.
 - `submit_order_list`: independent orders and OCO/OUO groups are placed one by
   one after every leg is validated and marked SUBMITTED (so the strategy's
-  `manage_contingent_orders` sees all legs); if an OCO/OUO leg cannot be placed
-  the remaining legs are canceled.  OTO/bracket lists are rejected with a hint
-  to use `emulation_trigger` (Futu has no native contingent orders).
+  `manage_contingent_orders` sees all legs).  When an OCO/OUO leg is rejected or
+  canceled before placement, the not yet placed legs linked to it are canceled
+  instead of placed; a modify for a queued leg is placed directly.  OTO/bracket
+  lists are rejected with a hint to use `emulation_trigger` (Futu has no native
+  contingent orders).
 
 ## 0.5.1 (2026-09-12)
 

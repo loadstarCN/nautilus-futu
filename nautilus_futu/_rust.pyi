@@ -143,7 +143,8 @@ class PyFutuClient:
     def get_position_list(self, trd_env: int, acc_id: int, trd_market: int) -> list[dict[str, Any]]: ...
     def get_funds(self, trd_env: int, acc_id: int, trd_market: int, currency: int | None = None) -> dict[str, Any]: ...
     # History queries: ``begin_time``/``end_time`` are ``YYYY-MM-DD HH:MM:SS``
-    # in market local time; a missing bound defaults to a 90-day window.
+    # in market local time.  Neither given: the last 90 days; only end_time:
+    # the 90 days before it; only begin_time: 90 days from it (capped at now).
     def get_history_order_list(
         self,
         trd_env: int,

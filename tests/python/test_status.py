@@ -229,6 +229,19 @@ class TestInstrumentStatusSubscription:
         assert h.data[-1].instrument_id == late_future
         assert h.data[-1].trading_event == "FUTURE_DAY_OPEN"
 
+    def test_uncached_future_is_loaded_on_subscribe(self, h):
+        hhi = InstrumentId.from_str("HHImain.HKEX")
+        h.rust.get_static_info.return_value = [
+            {"market": 1, "code": "HHImain", "lot_size": 50, "sec_type": 10, "last_trade_timestamp": 1790000000.0},
+        ]
+        h.run(h.client._subscribe_instrument_status(hhi))
+        h.settle()
+        h.rust.get_static_info.assert_called_once_with([(1, "HHImain")])
+        published = [d for d in h.data if not isinstance(d, InstrumentStatus)]
+        assert [i.id for i in published] == [hhi]  # published so the DataEngine caches it
+        statuses = [d for d in h.data if isinstance(d, InstrumentStatus)]
+        assert statuses[0].trading_event == "FUTURE_DAY_OPEN"
+
     def test_unknown_venue_rejected(self, h):
         h.run(h.client._subscribe_instrument_status(InstrumentId.from_str("X.XNAS")))
         assert h.client._status_task is None

@@ -1233,7 +1233,10 @@ impl PyFutuClient {
     /// Returns list of dicts with order details.
     ///
     /// `begin_time`/`end_time` (`YYYY-MM-DD HH:MM:SS`, market local time) are
-    /// required by OpenD; a missing bound defaults to a 90-day window ending now.
+    /// required by OpenD.  Missing bounds follow the official SDK: neither
+    /// given -> the last 90 days (ending one day after now); only `end_time` ->
+    /// the 90 days before it; only `begin_time` -> 90 days from it, at most
+    /// until one day after now.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (trd_env, acc_id, trd_market, filter_status_list=None, begin_time=None, end_time=None, code_list=None))]
     fn get_history_order_list(
@@ -1301,7 +1304,7 @@ impl PyFutuClient {
     /// Get historical order fill list.
     /// Returns list of dicts with fill details.
     ///
-    /// Time bounds as for `get_history_order_list` (default: last 90 days).
+    /// Time bounds and defaults as for `get_history_order_list`.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (trd_env, acc_id, trd_market, begin_time=None, end_time=None, code_list=None))]
     fn get_history_order_fill_list(

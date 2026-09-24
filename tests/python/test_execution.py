@@ -65,6 +65,7 @@ from nautilus_futu.constants import (
 from nautilus_futu.execution import (
     FutuLiveExecutionClient,
     history_query_range,
+    is_ambiguous_order_error,
     parse_funds_to_balance,
     parse_funds_to_balances,
     parse_funds_to_margins,
@@ -1159,3 +1160,274 @@ class TestOrderListPlacementRaces:
         h.run(h.client._cancel_order(_cancel_cmd(order)))
         assert not h.rust.modify_order.called
         assert not h.events_of(OrderCancelRejected)
+
+
+# ─────────────────────────────────────────────────────────
+# Review round 2: cancel-all, acceptance, linked legs, merged modifies, timeouts
+# ─────────────────────────────────────────────────────────
+
+TIMEOUT_ERROR = RuntimeError("Place order failed: connection error: request timed out after 15s (proto_id=2202)")
+
+
+def _linked_legs(*specs):
+    """Build LimitOrders from (client_order_id, price, contingency, linked_ids) specs."""
+    return [
+        LimitOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            instrument_id=HK_INSTRUMENT.id,
+            client_order_id=ClientOrderId(cid),
+            order_side=OrderSide.SELL,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str(price),
+            init_id=UUID4(),
+            ts_init=0,
+            contingency_type=contingency,
+            linked_order_ids=[ClientOrderId(x) for x in linked] or None,
+        )
+        for cid, price, contingency, linked in specs
+    ]
+
+
+def _modify_cmd(order, quantity=None, price=None):
+    return ModifyOrder(
+        trader_id=TRADER_ID, strategy_id=STRATEGY_ID, instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id, venue_order_id=None,
+        quantity=quantity, price=price, trigger_price=None, command_id=UUID4(), ts_init=0,
+    )
+
+
+def _cancel_all_cmd():
+    return CancelAllOrders(
+        trader_id=TRADER_ID, strategy_id=STRATEGY_ID, instrument_id=HK_INSTRUMENT.id,
+        order_side=OrderSide.NO_ORDER_SIDE, command_id=UUID4(), ts_init=0,
+    )
+
+
+class TestAmbiguousErrors:
+    @pytest.mark.parametrize(
+        "error",
+        [
+            TIMEOUT_ERROR,
+            RuntimeError("Place order failed: connection error: connection disconnected"),
+            RuntimeError("Place order failed: connection error: receive error: eof"),
+            RuntimeError("Place order failed: decode error: invalid wire type"),
+            ConnectionError("Disconnected from Futu OpenD"),
+        ],
+    )
+    def test_ambiguous(self, error):
+        assert is_ambiguous_order_error(error)
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RuntimeError("Place order failed: server error (retType=-1): insufficient buying power"),
+            RuntimeError("Not connected"),
+            ConnectionError("Not connected to Futu OpenD"),
+            ValueError("bad"),
+        ],
+    )
+    def test_definitive(self, error):
+        assert not is_ambiguous_order_error(error)
+
+
+class TestCancelAllInflight:
+    def test_cancel_all_cancels_placed_but_unaccepted_order(self, h):
+        order = h.add_limit_order(submitted=False)
+        h.run(h.client._submit_order(SubmitOrder(
+            trader_id=TRADER_ID, strategy_id=STRATEGY_ID, order=order, command_id=UUID4(), ts_init=0,
+        )))
+        assert order.status == OrderStatus.SUBMITTED
+        h.run(h.client._cancel_all_orders(_cancel_all_cmd()))
+        args = h.rust.modify_order.call_args.args
+        assert args[3] == 555 and args[4] == FUTU_MODIFY_ORDER_OP_CANCEL
+
+    def test_cancel_all_during_list_placement(self, h):
+        tp, sl = _oco_pair()
+
+        def place(*args):
+            asyncio.run_coroutine_threadsafe(h.client._cancel_all_orders(_cancel_all_cmd()), h.loop).result(timeout=5)
+            return {"order_id": 101}
+
+        h.rust.place_order.side_effect = place
+        _submit_list(h, _order_factory(h).create_list([tp, sl]))
+        assert h.rust.place_order.call_count == 1  # SL canceled before placement
+        assert sl.status == OrderStatus.CANCELED
+        args = h.rust.modify_order.call_args.args  # TP canceled right after placement
+        assert args[3] == 101 and args[4] == FUTU_MODIFY_ORDER_OP_CANCEL
+
+
+class TestAcceptanceAfterEarlyRequests:
+    def test_modify_before_ack_accepts_order(self, h):
+        order = h.add_limit_order(submitted=False)
+        h.run(h.client._submit_order(SubmitOrder(
+            trader_id=TRADER_ID, strategy_id=STRATEGY_ID, order=order, command_id=UUID4(), ts_init=0,
+        )))
+        h.pending_update(order)
+        h.run(h.client._modify_order(_modify_cmd(order, price=Price.from_str("305.000"))))
+        assert order.status == OrderStatus.ACCEPTED
+        assert order.venue_order_id == VenueOrderId("555")
+        assert order.price == Price.from_str("305.000")
+        # the late acknowledgement push neither re-accepts nor re-updates
+        h.client._handle_push_order(h.order_push(price=305.0))
+        assert len(h.events_of(OrderAccepted)) == 1
+        assert len(h.events_of(OrderUpdated)) == 1
+
+    def test_deferred_modify_leaves_order_accepted(self, h):
+        order = h.add_limit_order(submitted=False)
+
+        def place(*args):
+            h.loop.call_soon_threadsafe(h.pending_update, order)
+            fut = asyncio.run_coroutine_threadsafe(
+                h.client._modify_order(_modify_cmd(order, price=Price.from_str("305.000"))), h.loop,
+            )
+            fut.result(timeout=5)
+            return {"order_id": 555}
+
+        h.rust.place_order.side_effect = place
+        h.run(h.client._submit_order(SubmitOrder(
+            trader_id=TRADER_ID, strategy_id=STRATEGY_ID, order=order, command_id=UUID4(), ts_init=0,
+        )))
+        assert order.status == OrderStatus.ACCEPTED
+        assert order.price == Price.from_str("305.000")
+
+    def test_failed_cancel_of_unaccepted_order_returns_to_accepted(self, h):
+        order = h.add_limit_order(submitted=False)
+        h.run(h.client._submit_order(SubmitOrder(
+            trader_id=TRADER_ID, strategy_id=STRATEGY_ID, order=order, command_id=UUID4(), ts_init=0,
+        )))
+        h.pending_cancel(order)
+        h.rust.modify_order.side_effect = RuntimeError("Modify order failed: server error (retType=-1): busy")
+        h.run(h.client._cancel_order(_cancel_cmd(order)))
+        assert len(h.events_of(OrderCancelRejected)) == 1
+        assert order.status == OrderStatus.ACCEPTED  # not stuck in PENDING_CANCEL
+
+    def test_failed_modify_of_unaccepted_order_returns_to_accepted(self, h):
+        order = h.add_limit_order(submitted=False)
+        h.run(h.client._submit_order(SubmitOrder(
+            trader_id=TRADER_ID, strategy_id=STRATEGY_ID, order=order, command_id=UUID4(), ts_init=0,
+        )))
+        h.pending_update(order)
+        h.rust.modify_order.side_effect = RuntimeError("Modify order failed: server error (retType=-1): busy")
+        h.run(h.client._modify_order(_modify_cmd(order, price=Price.from_str("305.000"))))
+        assert len(h.events_of(OrderModifyRejected)) == 1
+        assert order.status == OrderStatus.ACCEPTED
+
+    def test_accepted_emitted_once_while_events_are_queued(self, h):
+        order = h.add_limit_order()
+        h.cache.add_venue_order_id(order.client_order_id, VenueOrderId("555"))
+        queued: list = []
+        h.msgbus.deregister(endpoint="ExecEngine.process", handler=h._on_event)
+        h.msgbus.register(endpoint="ExecEngine.process", handler=queued.append)  # engine has not applied yet
+        h.client._handle_push_order(h.order_push())
+        h.client._handle_push_fill(h.fill_push(qty=40.0))
+        assert [type(e) for e in queued] == [OrderAccepted, OrderFilled]
+
+
+class TestLinkedLegs:
+    def test_failure_only_cancels_linked_legs(self, h):
+        oco, none = ContingencyType.OCO, ContingencyType.NO_CONTINGENCY
+        legs = _linked_legs(
+            ("X", "310.000", none, []),
+            ("TP1", "320.000", oco, ["SL1"]),
+            ("SL1", "290.000", oco, ["TP1"]),
+            ("TP2", "330.000", oco, ["SL2"]),
+            ("SL2", "280.000", oco, ["TP2"]),
+        )
+        h.rust.place_order.side_effect = [
+            RuntimeError("server error (retType=-1): rejected"),  # X (independent)
+            RuntimeError("server error (retType=-1): rejected"),  # TP1
+            {"order_id": 4},  # TP2
+            {"order_id": 5},  # SL2
+        ]
+        _submit_list(h, _order_factory(h).create_list(legs))
+        status = {o.client_order_id.value: o.status for o in legs}
+        assert status == {
+            "X": OrderStatus.REJECTED,
+            "TP1": OrderStatus.REJECTED,
+            "SL1": OrderStatus.CANCELED,  # linked to the failed TP1
+            "TP2": OrderStatus.SUBMITTED,  # other group keeps going
+            "SL2": OrderStatus.SUBMITTED,
+        }
+        assert h.rust.place_order.call_count == 4
+
+    def test_leg_canceled_before_placement_cancels_its_linked_legs(self, h):
+        oco = ContingencyType.OCO
+        a, b, c = _linked_legs(
+            ("A", "320.000", oco, ["B", "C"]),
+            ("B", "310.000", oco, ["A", "C"]),
+            ("C", "290.000", oco, ["A", "B"]),
+        )
+
+        def place(*args):
+            asyncio.run_coroutine_threadsafe(h.client._cancel_order(_cancel_cmd(b)), h.loop).result(timeout=5)
+            return {"order_id": 101}
+
+        h.rust.place_order.side_effect = place
+        _submit_list(h, _order_factory(h).create_list([a, b, c]))
+        assert h.rust.place_order.call_count == 1  # only A reached OpenD
+        assert b.status == OrderStatus.CANCELED
+        assert c.status == OrderStatus.CANCELED
+
+
+class TestDeferredModifies:
+    def test_queued_leg_is_placed_with_modified_quantity(self, h):
+        tp, sl = _oco_pair()
+
+        def place(*args):
+            if h.rust.place_order.call_count == 1:  # while TP is placed, the OUO manager resizes SL
+                h.loop.call_soon_threadsafe(h.pending_update, sl)
+                asyncio.run_coroutine_threadsafe(
+                    h.client._modify_order(_modify_cmd(sl, quantity=Quantity.from_int(60))), h.loop,
+                ).result(timeout=5)
+            return {"order_id": 100 + h.rust.place_order.call_count}
+
+        h.rust.place_order.side_effect = place
+        _submit_list(h, _order_factory(h).create_list([tp, sl]))
+        assert [c.args[6] for c in h.rust.place_order.call_args_list] == [100.0, 60.0]
+        assert not h.rust.modify_order.called  # no place-then-modify window
+        assert sl.quantity == Quantity.from_int(60)
+        assert sl.status == OrderStatus.ACCEPTED
+
+    def test_multiple_deferred_modifies_are_merged(self, h):
+        order = h.add_limit_order(submitted=False, qty=200)
+
+        def place(*args):
+            for cmd in (_modify_cmd(order, price=Price.from_str("305.000")), _modify_cmd(order, quantity=Quantity.from_int(100))):
+                asyncio.run_coroutine_threadsafe(h.client._modify_order(cmd), h.loop).result(timeout=5)
+            return {"order_id": 555}
+
+        h.rust.place_order.side_effect = place
+        h.run(h.client._submit_order(SubmitOrder(
+            trader_id=TRADER_ID, strategy_id=STRATEGY_ID, order=order, command_id=UUID4(), ts_init=0,
+        )))
+        args = h.rust.modify_order.call_args.args
+        assert h.rust.modify_order.call_count == 1
+        assert (args[5], args[6]) == (100.0, 305.0)
+
+
+class TestAmbiguousPlacement:
+    def test_timeout_leaves_order_submitted(self, h):
+        order = h.add_limit_order(submitted=False)
+        h.rust.place_order.side_effect = TIMEOUT_ERROR
+        h.run(h.client._submit_order(SubmitOrder(
+            trader_id=TRADER_ID, strategy_id=STRATEGY_ID, order=order, command_id=UUID4(), ts_init=0,
+        )))
+        assert not h.events_of(OrderRejected)
+        assert order.status == OrderStatus.SUBMITTED
+
+    def test_timeout_keeps_oco_sibling_and_push_resolves_order(self, h):
+        tp, sl = _oco_pair()
+        h.rust.place_order.side_effect = [TIMEOUT_ERROR, {"order_id": 102}]
+        _submit_list(h, _order_factory(h).create_list([tp, sl]))
+        assert h.rust.place_order.call_count == 2  # protective SL still placed
+        assert tp.status == OrderStatus.SUBMITTED
+
+        # a cancel requested meanwhile waits for OpenD to reveal TP's order id
+        h.run(h.client._cancel_order(_cancel_cmd(tp)))
+        assert not h.rust.modify_order.called
+        h.client._handle_push_order(h.order_push(order_id=101, remark="O-TP"))
+        h.run(asyncio.sleep(0.05))
+        assert tp.status == OrderStatus.ACCEPTED
+        args = h.rust.modify_order.call_args.args
+        assert args[3] == 101 and args[4] == FUTU_MODIFY_ORDER_OP_CANCEL

@@ -434,9 +434,12 @@ class FutuLiveDataClient(LiveMarketDataClient):
             if self._status_task is asyncio.current_task():
                 self._status_task = None
 
+    def _status_instrument(self, instrument_id: InstrumentId):
+        return self._instrument_for(instrument_id) or self._instrument_provider.find(instrument_id)
+
     def _market_state_field(self, instrument_id: InstrumentId) -> str | None:
         """Resolved per poll so an instrument loaded after subscribing still maps correctly."""
-        return market_state_field(instrument_id, follows_futures_session(self._instrument_for(instrument_id)))
+        return market_state_field(instrument_id, follows_futures_session(self._status_instrument(instrument_id)))
 
     async def _poll_market_status(self) -> None:
         state = await asyncio.to_thread(self._client.get_global_state)
@@ -449,7 +452,7 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 continue
             self._last_market_state[instrument_id] = int(value)
             status = parse_futu_instrument_status(
-                instrument_id, int(value), ts_event, ts_init, instrument=self._instrument_for(instrument_id),
+                instrument_id, int(value), ts_event, ts_init, instrument=self._status_instrument(instrument_id),
             )
             self._handle_data(status)
 
@@ -551,6 +554,10 @@ class FutuLiveDataClient(LiveMarketDataClient):
         The current status is emitted right away, then on every change.
         """
         instrument_id = getattr(command, "instrument_id", command)
+        if self._status_instrument(instrument_id) is None and market_state_field(instrument_id) is not None:
+            # The instrument type decides between the securities and the futures
+            # market state (HK futures share the HKEX venue with stocks).
+            await self._load_status_instrument(instrument_id)
         field = self._market_state_field(instrument_id)
         if field is None:
             self._log.error(f"No Futu market state for venue {instrument_id.venue}; cannot subscribe status")
@@ -565,6 +572,20 @@ class FutuLiveDataClient(LiveMarketDataClient):
                 await self._poll_market_status()  # initial status without waiting for the next poll
             except Exception as e:
                 self._log.warning(f"Market status poll failed: {e}")
+
+    async def _load_status_instrument(self, instrument_id: InstrumentId) -> None:
+        try:
+            await self._instrument_provider.load_async(instrument_id)
+        except Exception as e:
+            self._log.warning(f"Could not load {instrument_id} for its market status: {e}")
+        instrument = self._instrument_provider.find(instrument_id)
+        if instrument is not None:
+            self._handle_data(instrument)  # publish so it reaches the cache
+        else:
+            self._log.warning(
+                f"{instrument_id} is not loaded; its status follows the securities market "
+                "(load the instrument for futures sessions)",
+            )
 
     async def _unsubscribe_instrument_status(self, command) -> None:
         """Unsubscribe from market status changes (the poll loop stops with the last one)."""

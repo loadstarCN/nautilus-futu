@@ -85,6 +85,27 @@ _ACCOUNT_REFRESH_DEBOUNCE_SECS = 1.0
 # Remember this many recent fill IDs to drop duplicate fill pushes
 _SEEN_FILLS_MAX = 10_000
 
+# Remember this many recently accepted orders so OrderAccepted is emitted once
+# even while earlier events are still queued in the execution engine
+_ACCEPTED_MAX = 10_000
+
+# Outcomes of a place_order attempt
+_PLACED = "placed"
+_REJECTED = "rejected"
+_UNKNOWN = "unknown"  # the request may have reached OpenD (timeout, lost link)
+
+# Error texts of failures that happen after the request was sent: OpenD may
+# have accepted the order, so it must not be reported as rejected.
+_AMBIGUOUS_ERRORS = ("timed out", "disconnected", "receive error", "decode error", "decryption error")
+
+
+def is_ambiguous_order_error(error: BaseException) -> bool:
+    """Whether a ``place_order`` failure leaves the order's fate unknown."""
+    text = str(error).lower()
+    if "not connected" in text:
+        return False  # nothing was sent
+    return isinstance(error, ConnectionError | TimeoutError) or any(marker in text for marker in _AMBIGUOUS_ERRORS)
+
 # Backwards-compatible aliases
 _TRD_MARKET_CURRENCY = FUTU_TRD_MARKET_TO_CURRENCY
 
@@ -271,11 +292,14 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         self._refresh_scheduled = False
         self._seen_fill_ids: OrderedDict[str, None] = OrderedDict()
         # Orders whose placement has not completed (queued list legs or a
-        # place_order request in flight) and cancel/modify commands that
-        # arrived before their venue order id was known.
+        # place_order request in flight), orders whose place_order outcome is
+        # unknown (timeout), and cancel/modify requests that arrived before
+        # their venue order id was known (modifies merged field by field).
         self._unplaced: set[ClientOrderId] = set()
+        self._uncertain: set[ClientOrderId] = set()
         self._deferred_cancels: set[ClientOrderId] = set()
-        self._deferred_modifies: dict[ClientOrderId, Any] = {}
+        self._deferred_modifies: dict[ClientOrderId, dict[str, Any]] = {}
+        self._accepted_ids: OrderedDict[ClientOrderId, None] = OrderedDict()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -299,6 +323,38 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
     def _ts_or_now(self, seconds: float | None) -> int:
         return seconds_to_ns(seconds, self._clock.timestamp_ns())
+
+    def _ensure_accepted(self, order: Order, venue_order_id: VenueOrderId, ts_event: int) -> None:
+        """Emit OrderAccepted once for an order the venue acknowledged.
+
+        Also covers orders the strategy moved to PENDING_UPDATE/PENDING_CANCEL
+        before the acknowledgement arrived (both may transition to ACCEPTED);
+        otherwise OrderUpdated/OrderCancelRejected would try to return them to
+        SUBMITTED, which NautilusTrader's order state machine does not allow.
+        """
+        client_order_id = order.client_order_id
+        if client_order_id in self._accepted_ids or order.venue_order_id is not None:
+            return
+        if order.status not in (
+            OrderStatus.INITIALIZED,
+            OrderStatus.SUBMITTED,
+            OrderStatus.PENDING_UPDATE,
+            OrderStatus.PENDING_CANCEL,
+        ):
+            return
+        self._accepted_ids[client_order_id] = None
+        while len(self._accepted_ids) > _ACCEPTED_MAX:
+            self._accepted_ids.popitem(last=False)
+        self.generate_order_accepted(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=client_order_id,
+            venue_order_id=venue_order_id,
+            ts_event=ts_event,
+        )
+
+    def _never_accepted(self, order: Order) -> bool:
+        return order.venue_order_id is None and order.client_order_id not in self._accepted_ids
 
     def _remember_fill(self, fill_id: str) -> bool:
         """Return False if the fill was already processed."""
@@ -622,20 +678,17 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             ts_event = self._ts_or_now(order_data.get("update_timestamp"))
             reason = order_data.get("last_err_msg") or f"Futu order status {order_status_int}"
 
+            self._on_venue_order_known(order, venue_order_id, nt_status)
+
             if nt_status == OrderStatus.ACCEPTED:
                 self._on_venue_accepted(order, order_data, venue_order_id, instrument, ts_event)
             elif nt_status in (OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED):
                 # Fills arrive via 2218; make sure the order is ACCEPTED first
-                if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
-                    self.generate_order_accepted(
-                        strategy_id=order.strategy_id,
-                        instrument_id=instrument_id,
-                        client_order_id=order.client_order_id,
-                        venue_order_id=venue_order_id,
-                        ts_event=ts_event,
-                    )
+                self._ensure_accepted(order, venue_order_id, ts_event)
             elif nt_status == OrderStatus.REJECTED:
-                if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
+                if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED) or (
+                    not order.is_closed and self._never_accepted(order)
+                ):
                     self.generate_order_rejected(
                         strategy_id=order.strategy_id,
                         instrument_id=instrument_id,
@@ -668,16 +721,23 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         except Exception as e:
             self._log.error(f"Unexpected error in _handle_push_order: {e}")
 
+    def _on_venue_order_known(self, order: Order, venue_order_id: VenueOrderId, nt_status: OrderStatus) -> None:
+        """A push identified an order whose place_order outcome was unknown: apply queued requests."""
+        client_order_id = order.client_order_id
+        if client_order_id not in self._uncertain:
+            return
+        self._uncertain.discard(client_order_id)
+        self._log.info(f"Order {client_order_id} confirmed by OpenD as {venue_order_id} after an unclear placement")
+        if nt_status in (OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.FILLED):
+            self._deferred_cancels.discard(client_order_id)
+            self._deferred_modifies.pop(client_order_id, None)
+            return
+        self.create_task(self._apply_deferred(order, venue_order_id))
+
     def _on_venue_accepted(self, order: Order, order_data: dict, venue_order_id: VenueOrderId, instrument, ts_event: int) -> None:
         """A SUBMITTED status from Futu: initial acceptance or post-modify acknowledgement."""
-        if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
-            self.generate_order_accepted(
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                venue_order_id=venue_order_id,
-                ts_event=ts_event,
-            )
+        if self._never_accepted(order) or order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
+            self._ensure_accepted(order, venue_order_id, ts_event)
             return
 
         if order.status == OrderStatus.PENDING_UPDATE:
@@ -743,14 +803,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             else:
                 currency = qot_market_to_currency(sec_market_to_qot_market(fill_data.get("sec_market")))
 
-            if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
-                self.generate_order_accepted(
-                    strategy_id=order.strategy_id,
-                    instrument_id=instrument_id,
-                    client_order_id=order.client_order_id,
-                    venue_order_id=venue_order_id,
-                    ts_event=ts_event,
-                )
+            self._ensure_accepted(order, venue_order_id, ts_event)
 
             self.generate_order_filled(
                 strategy_id=order.strategy_id,
@@ -792,8 +845,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         leg is validated and marked SUBMITTED before the first one is placed,
         so the strategy's ``manage_contingent_orders`` sees all legs while
         they are being placed; its cancels/modifies for legs not yet placed
-        are applied once they are.  If an OCO/OUO leg cannot be placed, the
-        remaining legs are canceled instead of placed.
+        are applied before (or right after) placing them.  When an OCO/OUO leg
+        is rejected or canceled before placement, the not yet placed legs
+        linked to it are canceled instead of placed.
         """
         orders: list[Order] = list(command.order_list.orders)
         if any(o.contingency_type == ContingencyType.OTO or o.parent_order_id is not None for o in orders):
@@ -817,8 +871,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                     self._reject_locally(o, reason)
                 return
 
-        contingent = any(o.contingency_type in (ContingencyType.OCO, ContingencyType.OUO) for o in orders)
-        if contingent:
+        if any(o.contingency_type in (ContingencyType.OCO, ContingencyType.OUO) for o in orders):
             self._log.info(
                 f"{command.order_list.id}: OCO/OUO legs are placed one by one; "
                 "contingencies are enforced by the strategy's `manage_contingent_orders`",
@@ -834,13 +887,27 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 ts_event=ts_now,
             )
 
-        failed_leg: ClientOrderId | None = None
+        by_id = {o.client_order_id: o for o in orders}
+        doomed: dict[ClientOrderId, ClientOrderId] = {}  # unplaced leg -> closed leg it is linked to
+
+        def close_linked(leg: Order) -> None:
+            """OCO/OUO: a closed leg cancels its linked legs (transitively, as the manager would)."""
+            stack = [leg]
+            while stack:
+                closed = stack.pop()
+                if closed.contingency_type not in (ContingencyType.OCO, ContingencyType.OUO):
+                    continue
+                for linked_id in closed.linked_order_ids or []:
+                    if linked_id in by_id and linked_id != leg.client_order_id and linked_id not in doomed:
+                        doomed[linked_id] = leg.client_order_id
+                        stack.append(by_id[linked_id])
+
         for order in orders:
             client_order_id = order.client_order_id
-            if failed_leg is not None or client_order_id in self._deferred_cancels:
+            if client_order_id in doomed or client_order_id in self._deferred_cancels:
                 self._forget_unplaced(client_order_id)
-                if failed_leg is not None:
-                    self._log.warning(f"Canceling {client_order_id}: contingent leg {failed_leg} was not placed")
+                if client_order_id in doomed:
+                    self._log.warning(f"Canceling {client_order_id}: linked leg {doomed[client_order_id]} closed before it was placed")
                 else:
                     self._log.info(f"Order {client_order_id} canceled before it was placed")
                 self.generate_order_canceled(
@@ -850,13 +917,15 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                     venue_order_id=None,
                     ts_event=self._clock.timestamp_ns(),
                 )
+                close_linked(order)
                 continue
-            placed = await self._place_order(order, params[client_order_id], submitted=True)
-            if placed is None and contingent:
-                failed_leg = client_order_id
+            outcome = await self._place_order(order, params[client_order_id], submitted=True)
+            if outcome == _REJECTED:
+                close_linked(order)
 
     def _forget_unplaced(self, client_order_id: ClientOrderId) -> None:
         self._unplaced.discard(client_order_id)
+        self._uncertain.discard(client_order_id)
         self._deferred_cancels.discard(client_order_id)
         self._deferred_modifies.pop(client_order_id, None)
 
@@ -877,17 +946,32 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             ts_event=ts_now,
         )
 
+    @staticmethod
+    def _modified_params(order: Order, params: dict[str, Any], fields: dict[str, Any]) -> dict[str, Any]:
+        """``place_order`` parameters with a modify applied that arrived before placement."""
+        params = dict(params)
+        if fields.get("quantity") is not None:
+            params["qty"] = float(fields["quantity"])
+        if fields.get("price") is not None and params.get("price") is not None:
+            params["price"] = float(fields["price"])
+        if fields.get("trigger_price") is not None and params.get("aux_price") is not None:
+            params["aux_price"] = float(fields["trigger_price"])
+        return params
+
     async def _place_order(
         self,
         order: Order,
         params: dict[str, Any] | None = None,
         submitted: bool = False,
-    ) -> VenueOrderId | None:
-        """Place one order on OpenD; returns its venue order id, or None when rejected.
+    ) -> str:
+        """Place one order on OpenD; returns ``"placed"``, ``"rejected"`` or ``"unknown"``.
 
-        Emits OrderSubmitted (unless ``submitted``), then OrderRejected on
-        failure.  Cancels/modifies that arrived while the request was in
-        flight are applied once the venue order id is known.
+        Emits OrderSubmitted (unless ``submitted``), then OrderRejected when
+        OpenD refuses the order.  A failure after the request was sent
+        (timeout, lost link) leaves the order SUBMITTED: its pushes (matched by
+        ``remark``) or the in-flight order check resolve it later.  A modify
+        received before placement is placed directly; cancels/modifies that
+        arrive while the request is in flight are applied afterwards.
         """
         instrument_id = order.instrument_id
         client_order_id = order.client_order_id
@@ -903,7 +987,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 ts_event=self._clock.timestamp_ns(),
             )
 
-        def reject(reason: str) -> None:
+        def reject(reason: str) -> str:
             self._forget_unplaced(client_order_id)
             self.generate_order_rejected(
                 strategy_id=order.strategy_id,
@@ -912,14 +996,18 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 reason=reason,
                 ts_event=self._clock.timestamp_ns(),
             )
+            return _REJECTED
 
         if params is None:
             try:
                 params = build_futu_order_params(order, self._config.fill_outside_rth)
             except ValueError as e:
                 self._log.error(f"Cannot submit {client_order_id}: {e}")
-                reject(str(e))
-                return None
+                return reject(str(e))
+
+        premodify = self._deferred_modifies.pop(client_order_id, None)
+        if premodify is not None:
+            params = self._modified_params(order, params, premodify)
 
         self._unplaced.add(client_order_id)
         try:
@@ -943,15 +1031,23 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 params["trail_spread"],
             )
         except Exception as e:
+            if is_ambiguous_order_error(e):
+                self._log.warning(
+                    f"Placement of {client_order_id} unclear ({e}); leaving it SUBMITTED until OpenD "
+                    "confirms it (order push) or the in-flight check resolves it",
+                )
+                self._unplaced.discard(client_order_id)
+                self._uncertain.add(client_order_id)
+                if premodify is not None:
+                    self._merge_deferred_modify(client_order_id, premodify)
+                return _UNKNOWN
             self._log.error(f"Failed to submit order {client_order_id}: {e}")
-            reject(str(e))
-            return None
+            return reject(str(e))
 
         order_id = (result or {}).get("order_id")
         if order_id is None:
             self._log.error(f"place_order returned no order_id for {client_order_id}: {result}")
-            reject("Futu returned no order_id")
-            return None
+            return reject("Futu returned no order_id")
 
         venue_order_id = VenueOrderId(str(order_id))
         # Index venue id -> client id so pushes (which may already have arrived
@@ -963,22 +1059,56 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             except Exception as e:
                 self._log.debug(f"add_venue_order_id after submit: {e}")
         self._log.info(f"Order submitted: {client_order_id} -> {venue_order_id}")
-
         self._unplaced.discard(client_order_id)
+
+        current = self._cache.order(client_order_id) or order
+        if premodify is not None:
+            # The order went out with the modified values: resolve the pending update.
+            ts_now = self._clock.timestamp_ns()
+            self._ensure_accepted(current, venue_order_id, ts_now)
+            self.generate_order_updated(
+                strategy_id=order.strategy_id,
+                instrument_id=instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=venue_order_id,
+                quantity=premodify.get("quantity") or current.quantity,
+                price=premodify.get("price") if premodify.get("price") is not None else (current.price if current.has_price else None),
+                trigger_price=premodify.get("trigger_price") if premodify.get("trigger_price") is not None else (
+                    current.trigger_price if current.has_trigger_price else None
+                ),
+                ts_event=ts_now,
+            )
+        await self._apply_deferred(current, venue_order_id)
+        return _PLACED
+
+    async def _apply_deferred(self, order: Order, venue_order_id: VenueOrderId) -> None:
+        """Apply cancel/modify requests that arrived before the venue order id was known."""
+        client_order_id = order.client_order_id
         deferred_cancel = client_order_id in self._deferred_cancels
         deferred_modify = self._deferred_modifies.pop(client_order_id, None)
         self._deferred_cancels.discard(client_order_id)
+        order = self._cache.order(client_order_id) or order
         if deferred_cancel:
-            self._log.info(f"Applying cancel requested while {client_order_id} was being placed")
-            await self._cancel_cached_order(self._cache.order(client_order_id) or order, venue_order_id)
+            self._log.info(f"Applying cancel requested before {client_order_id} was placed")
+            await self._cancel_cached_order(order, venue_order_id)
         elif deferred_modify is not None:
-            self._log.info(f"Applying modify requested while {client_order_id} was being placed")
-            await self._modify_order(deferred_modify)
-        return venue_order_id
+            self._log.info(f"Applying modify requested before {client_order_id} was placed")
+            await self._send_modify(order, venue_order_id, deferred_modify)
+
+    def _merge_deferred_modify(self, client_order_id: ClientOrderId, fields: dict[str, Any]) -> None:
+        """Merge a modify into the pending one (the latest value of each field wins)."""
+        pending = self._deferred_modifies.setdefault(client_order_id, {})
+        for key, value in fields.items():
+            if value is not None:
+                pending[key] = value
 
     def _venue_order_id_for(self, order: Order, venue_order_id: VenueOrderId | None = None) -> VenueOrderId | None:
         """The venue order id from the command, the order, or the cache index set on placement."""
         return venue_order_id or order.venue_order_id or self._cache.venue_order_id(order.client_order_id)
+
+    def _awaiting_venue_id(self, order: Order) -> bool:
+        """Placement not finished (queued/in flight) or outcome not yet known."""
+        return order.client_order_id in self._unplaced or order.client_order_id in self._uncertain
 
     async def _modify_order(self, command: Any) -> None:
         """Modify an existing order."""
@@ -989,10 +1119,11 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         if order.is_closed:
             self._log.warning(f"Cannot modify order {order.client_order_id}: already closed ({order.status_string()})")
             return
+        fields = {"quantity": command.quantity, "price": command.price, "trigger_price": command.trigger_price}
         venue_order_id = self._venue_order_id_for(order, command.venue_order_id)
-        if venue_order_id is None and order.client_order_id in self._unplaced:
+        if venue_order_id is None and self._awaiting_venue_id(order):
             self._log.info(f"Deferring modify of {order.client_order_id} until it is placed")
-            self._deferred_modifies[order.client_order_id] = command
+            self._merge_deferred_modify(order.client_order_id, fields)
             return
         if venue_order_id is None:
             self._log.error(f"Cannot modify order {order.client_order_id} without venue_order_id")
@@ -1005,10 +1136,12 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 ts_event=self._clock.timestamp_ns(),
             )
             return
+        await self._send_modify(order, venue_order_id, fields)
 
-        quantity = command.quantity or order.quantity
-        price = command.price if command.price is not None else (order.price if order.has_price else None)
-        trigger_price = command.trigger_price if command.trigger_price is not None else (
+    async def _send_modify(self, order: Order, venue_order_id: VenueOrderId, fields: dict[str, Any]) -> None:
+        quantity = fields.get("quantity") or order.quantity
+        price = fields.get("price") if fields.get("price") is not None else (order.price if order.has_price else None)
+        trigger_price = fields.get("trigger_price") if fields.get("trigger_price") is not None else (
             order.trigger_price if order.has_trigger_price else None
         )
 
@@ -1027,6 +1160,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             )
         except Exception as e:
             self._log.error(f"Failed to modify order {order.client_order_id}: {e}")
+            # The order exists at the venue: accept it first so the rejection can
+            # return it from PENDING_UPDATE to ACCEPTED.
+            self._ensure_accepted(order, venue_order_id, self._clock.timestamp_ns())
             self.generate_order_modify_rejected(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
@@ -1037,6 +1173,8 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             )
             return
 
+        ts_now = self._clock.timestamp_ns()
+        self._ensure_accepted(order, venue_order_id, ts_now)
         self.generate_order_updated(
             strategy_id=order.strategy_id,
             instrument_id=order.instrument_id,
@@ -1045,7 +1183,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             quantity=quantity,
             price=price,
             trigger_price=trigger_price,
-            ts_event=self._clock.timestamp_ns(),
+            ts_event=ts_now,
         )
         self._log.info(f"Order modified: {order.client_order_id} ({venue_order_id})")
 
@@ -1062,7 +1200,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             self._log.debug(f"Cancel of {order.client_order_id} skipped: already closed ({order.status_string()})")
             return
         venue_order_id = self._venue_order_id_for(order, venue_order_id)
-        if venue_order_id is None and order.client_order_id in self._unplaced:
+        if venue_order_id is None and self._awaiting_venue_id(order):
             self._log.info(f"Deferring cancel of {order.client_order_id} until it is placed")
             self._deferred_cancels.add(order.client_order_id)
             return
@@ -1093,6 +1231,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             self._log.info(f"Cancel requested: {order.client_order_id} ({venue_order_id})")
         except Exception as e:
             self._log.error(f"Failed to cancel order {order.client_order_id}: {e}")
+            # The order exists at the venue: accept it first so the rejection can
+            # return it from PENDING_CANCEL to ACCEPTED.
+            self._ensure_accepted(order, venue_order_id, self._clock.timestamp_ns())
             self.generate_order_cancel_rejected(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
@@ -1103,15 +1244,19 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             )
 
     async def _cancel_all_orders(self, command: Any) -> None:
-        """Cancel the strategy's open orders for the command's instrument (and side)."""
+        """Cancel the strategy's open and in-flight orders for the command's instrument (and side).
+
+        In-flight (SUBMITTED) orders are included: NautilusTrader's
+        ``cancel_all_orders``/``market_exit`` rely on the client for them.
+        Orders still being placed are canceled before or right after placement.
+        """
         side = getattr(command, "order_side", OrderSide.NO_ORDER_SIDE)
-        open_orders = self._cache.orders_open(
-            instrument_id=command.instrument_id,
-            strategy_id=command.strategy_id,
-            side=side,
-        )
+        query = {"instrument_id": command.instrument_id, "strategy_id": command.strategy_id, "side": side}
+        orders: dict[ClientOrderId, Order] = {o.client_order_id: o for o in self._cache.orders_open(**query)}
+        for order in self._cache.orders_inflight(**query):
+            orders.setdefault(order.client_order_id, order)
         cancelled = 0
-        for order in open_orders:
+        for order in orders.values():
             if order.is_closed:
                 continue
             await self._cancel_cached_order(order, order.venue_order_id)
