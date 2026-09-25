@@ -26,16 +26,22 @@
 - A `place_order` failure after the request was sent (timeout, lost link) no
   longer reports the order as rejected, since OpenD may have accepted it.  The
   order stays SUBMITTED and the client looks it up in OpenD's order list (by
-  `remark`) until its fate is known; an order push or a status report (in-flight
-  check, reconciliation) resolves it just as well.  Cancels/modifies made
-  meanwhile are applied once, and a modify applied before placement is reported
-  when the order is identified.  An order that is never found is rejected; one
-  that OpenD works although NautilusTrader already closed it is canceled.
+  `remark`, refreshed from the Futu servers) until its fate is known; an order
+  push or a status report (in-flight check, reconciliation) resolves it just as
+  well, and a push identifying it while the request is still pending applies
+  queued requests right away.  Cancels/modifies made meanwhile are applied once,
+  and a modify applied before placement is reported when the order is
+  identified.  An order missing from several lookups is rejected, but not
+  sooner than 30 s after the failure; if OpenD later shows it (or any order
+  NautilusTrader closed meanwhile, such as a list leg rejected by the in-flight
+  check during its own request) working, it is canceled at the venue.
   Requests refused because the link was already down (the Rust client now
   reports "not connected (request not sent)") and OpenD refusals are still
   rejected immediately.
 - Fill pushes that arrive before the order they belong to is identified are
   kept and replayed instead of being dropped.
+- `PyFutuClient.get_order_list` takes `refresh_cache` (query the Futu servers
+  instead of OpenD's cache).
 - A refused repeat cancel of an order whose earlier cancel went through (e.g.
   cancel-all plus the OCO manager) no longer produces `OrderCancelRejected`; an
   order accepted only to recover from a refused modify/cancel is reported as

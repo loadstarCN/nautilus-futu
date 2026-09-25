@@ -661,20 +661,23 @@ impl PyFutuClient {
     }
 
     /// Get order list.
-    /// Returns list of dicts with order details.
+    /// Returns list of dicts with order details.  `refresh_cache=True` asks
+    /// OpenD to fetch the list from the Futu servers instead of its cache.
+    #[pyo3(signature = (trd_env, acc_id, trd_market, refresh_cache=None))]
     fn get_order_list(
         &self,
         py: Python<'_>,
         trd_env: i32,
         acc_id: u64,
         trd_market: i32,
+        refresh_cache: Option<bool>,
     ) -> PyResult<Vec<PyObject>> {
         let client = self.get_client()?;
         let client = &*client;
 
         let response = py.allow_threads(|| {
             self.runtime.block_on(async {
-                crate::trade::query::get_order_list(client, trd_env, acc_id, trd_market, None).await
+                crate::trade::query::get_order_list(client, trd_env, acc_id, trd_market, None, refresh_cache).await
             }).map_err(|e| e.to_string())
         }).map_err(|e| PyRuntimeError::new_err(format!("Get order list failed: {}", e)))?;
 

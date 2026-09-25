@@ -128,12 +128,16 @@ pub fn unix_now_secs() -> i64 {
 }
 
 /// Get the order list.
+///
+/// `refresh_cache = Some(true)` makes OpenD fetch the list from the Futu
+/// servers instead of answering from its cache (rate limited by OpenD).
 pub async fn get_order_list(
     client: &FutuClient,
     trd_env: i32,
     acc_id: u64,
     trd_market: i32,
     filter: Option<crate::generated::trd_common::TrdFilterConditions>,
+    refresh_cache: Option<bool>,
 ) -> Result<crate::generated::trd_get_order_list::Response, TradeError> {
     let header = crate::generated::trd_common::TrdHeader {
         trd_env,
@@ -144,6 +148,7 @@ pub async fn get_order_list(
     let c2s = crate::generated::trd_get_order_list::C2s {
         header,
         filter_conditions: filter,
+        refresh_cache,
         ..Default::default()
     };
     let request = crate::generated::trd_get_order_list::Request { c2s };

@@ -52,6 +52,9 @@ from nautilus_futu.constants import (
     FUTU_MODIFY_ORDER_OP_CANCEL,
     FUTU_MODIFY_ORDER_OP_NORMAL,
     FUTU_ORDER_STATUS_ACTIVE,
+    FUTU_ORDER_STATUS_TIMEOUT,
+    FUTU_ORDER_STATUS_UNKNOWN,
+    FUTU_ORDER_STATUS_UNSUBMITTED,
     FUTU_PROTO_NOTIFY,
     FUTU_PROTO_TRD_FILL,
     FUTU_PROTO_TRD_ORDER,
@@ -105,6 +108,14 @@ _DEFINITIVE_ERRORS = ("not connected", "server error")
 # that many successful lookups.
 _RESOLVE_DELAYS = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0)
 _RESOLVE_NOT_FOUND_LIMIT = 3
+# ... and not before this long after the failure (no sooner than
+# NautilusTrader's own in-flight check would give up with default settings)
+_RESOLVE_MIN_WAIT_SECS = 30.0
+
+# Futu statuses that do not tell whether the order reached the exchange
+_UNCLEAR_FUTU_STATUSES: frozenset[int] = frozenset(
+    {FUTU_ORDER_STATUS_UNSUBMITTED, FUTU_ORDER_STATUS_UNKNOWN, FUTU_ORDER_STATUS_TIMEOUT},
+)
 
 # Fill pushes for orders not identified yet (their order push or place_order
 # reply has not arrived) are kept for replay, up to this many orders
@@ -318,6 +329,9 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         # Values an unclearly placed order was sent with (a modify applied
         # before placement), reported once OpenD reveals the order
         self._placed_values: dict[ClientOrderId, dict[str, Any]] = {}
+        # Unclearly placed orders the resolver rejected: if OpenD turns out to
+        # work one after all, it is canceled at the venue
+        self._closed_unclear: OrderedDict[ClientOrderId, None] = OrderedDict()
         self._accepted_ids: OrderedDict[ClientOrderId, None] = OrderedDict()
         # Accepted locally only to leave PENDING_UPDATE/PENDING_CANCEL after a
         # refused modify/cancel, before the venue acknowledged the order
@@ -782,41 +796,58 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         futu_status: int | None,
         via_report: bool,
     ) -> None:
-        """An order push or status report revealed an order whose placement was unclear.
+        """An order push or status report revealed an order whose venue id was not known yet.
 
-        Applies the requests queued while its venue id was unknown.  On the
-        report path (in-flight check, the resolver) the execution engine emits
-        OrderAccepted itself when it reconciles the report, so the follow-up
-        work runs as a task after that.  An order OpenD is still working
-        although NautilusTrader already closed it (the in-flight check gave up)
-        is canceled at the venue.
+        Applies the requests queued meanwhile.  On the report path (in-flight
+        check, the resolver) the execution engine accepts the order itself
+        when it reconciles the report, so the follow-up work runs as a task
+        after that.  An order OpenD is working although NautilusTrader already
+        closed it (the in-flight check or the resolver gave up) is canceled at
+        the venue.
         """
         client_order_id = order.client_order_id
         self._index_venue_id(client_order_id, venue_order_id)
-        if client_order_id not in self._uncertain:
+        if client_order_id in self._unplaced:
+            # A push identified the order while place_order is still in flight:
+            # send the queued requests now instead of after the reply.
+            if not via_report and (client_order_id in self._deferred_cancels or client_order_id in self._deferred_modifies):
+                self.create_task(
+                    self._apply_deferred(order, venue_order_id, base=self._placed_values.get(client_order_id)),
+                )
             return
+        if client_order_id not in self._uncertain and client_order_id not in self._closed_unclear:
+            return
+        if futu_status in _UNCLEAR_FUTU_STATUSES:
+            return  # OpenD does not know the outcome yet either: keep waiting
         self._uncertain.discard(client_order_id)
+        self._closed_unclear.pop(client_order_id, None)
         placed = self._placed_values.pop(client_order_id, None)
+        active = futu_status in FUTU_ORDER_STATUS_ACTIVE
         self._log.info(f"Order {client_order_id} identified at OpenD as {venue_order_id} after an unclear placement")
-        if futu_status not in FUTU_ORDER_STATUS_ACTIVE:
-            self._deferred_cancels.discard(client_order_id)
-            self._deferred_modifies.pop(client_order_id, None)
-            return
         if order.is_closed:
             self._deferred_cancels.discard(client_order_id)
             self._deferred_modifies.pop(client_order_id, None)
-            self._log.error(
-                f"Order {client_order_id} is working at OpenD as {venue_order_id} but was closed locally "
-                f"({order.status_string()}); canceling it at the venue",
-            )
-            self.create_task(self._send_cancel(order, venue_order_id, report_failure=False))
+            if active:
+                self._log.error(
+                    f"Order {client_order_id} is working at OpenD as {venue_order_id} but was closed locally "
+                    f"({order.status_string()}); canceling it at the venue",
+                )
+                self.create_task(self._send_cancel(order, venue_order_id, report_failure=False))
+            return
+        nt_status = futu_order_status_to_nautilus(futu_status) if futu_status is not None else OrderStatus.ACCEPTED
+        if not via_report and placed is not None and nt_status != OrderStatus.REJECTED:
+            # The venue holds the values placed (a modify applied before placement)
+            self._ensure_accepted(order, venue_order_id, self._clock.timestamp_ns(), provisional=True)
+            self._emit_placed_values(order, venue_order_id, placed)
+        if not active:
+            self._deferred_cancels.discard(client_order_id)
+            self._deferred_modifies.pop(client_order_id, None)
             return
         if via_report:
-            self._mark_accepted(client_order_id)
+            if nt_status in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED):
+                self._mark_accepted(client_order_id)  # the engine accepts it from the report
             self.create_task(self._resume_after_unclear_placement(client_order_id, venue_order_id, placed))
             return
-        self._ensure_accepted(order, venue_order_id, self._clock.timestamp_ns())
-        self._emit_placed_values(order, venue_order_id, placed)
         self.create_task(self._apply_deferred(order, venue_order_id, base=placed))
 
     async def _resume_after_unclear_placement(
@@ -1144,6 +1175,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         if premodify is not None:
             params = self._modified_params(order, params, premodify)
             placed = self._placed_fields(order, premodify)
+            self._placed_values[client_order_id] = placed
 
         self._unplaced.add(client_order_id)
         try:
@@ -1178,8 +1210,6 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 )
                 self._unplaced.discard(client_order_id)
                 self._uncertain.add(client_order_id)
-                if placed is not None:
-                    self._placed_values[client_order_id] = placed
                 self.create_task(self._resolve_unclear_placement(order))
                 return _UNKNOWN
             # An order push already identified the order while the request was in flight
@@ -1196,13 +1226,25 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         # and been matched through `remark`) resolve the order.  ACCEPTED is
         # generated from the order push, the single source of truth.
         self._unplaced.discard(client_order_id)
+        self._placed_values.pop(client_order_id, None)
         self._index_venue_id(client_order_id, venue_order_id)
         self._log.info(f"Order submitted: {client_order_id} -> {venue_order_id}")
 
         current = self._cache.order(client_order_id) or order
+        if current.is_closed:
+            # Closed locally while the request was in flight (e.g. the in-flight
+            # check gave up on a queued list leg): it must not keep working.
+            self._deferred_cancels.discard(client_order_id)
+            self._deferred_modifies.pop(client_order_id, None)
+            self._log.error(
+                f"Order {client_order_id} was placed as {venue_order_id} but closed locally "
+                f"({current.status_string()}); canceling it at the venue",
+            )
+            await self._send_cancel(current, venue_order_id, report_failure=False)
+            return _PLACED
         if placed is not None:
             # The order went out with the modified values: resolve the pending update.
-            self._ensure_accepted(current, venue_order_id, self._clock.timestamp_ns())
+            self._ensure_accepted(current, venue_order_id, self._clock.timestamp_ns(), provisional=True)
             self._emit_placed_values(current, venue_order_id, placed)
         await self._apply_deferred(current, venue_order_id, base=placed)
         return _PLACED
@@ -1216,14 +1258,16 @@ class FutuLiveExecutionClient(LiveExecutionClient):
         """
         client_order_id = order.client_order_id
         trd_market = self._trd_market_for(order.instrument_id)
+        started_ns = self._clock.timestamp_ns()
         not_found = 0
         for delay in _RESOLVE_DELAYS:
             await asyncio.sleep(delay)
             if client_order_id not in self._uncertain:
                 return  # resolved by a push or a report
             try:
+                # refresh_cache: OpenD's cached list can lag behind the servers
                 order_dicts = await asyncio.to_thread(
-                    self._client.get_order_list, self._trd_env, self._acc_id, trd_market,
+                    self._client.get_order_list, self._trd_env, self._acc_id, trd_market, True,
                 )
             except Exception as e:
                 self._log.debug(f"Lookup of {client_order_id} failed: {e}")
@@ -1236,9 +1280,12 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             )
             if match is None:
                 not_found += 1
-                if not_found >= _RESOLVE_NOT_FOUND_LIMIT:
+                waited = (self._clock.timestamp_ns() - started_ns) / 1_000_000_000
+                if not_found >= _RESOLVE_NOT_FOUND_LIMIT and waited >= _RESOLVE_MIN_WAIT_SECS:
                     break
                 continue
+            if match.get("order_status") in _UNCLEAR_FUTU_STATUSES:
+                continue  # OpenD has it but does not know the outcome yet
             current = self._cache.order(client_order_id) or order
             report = parse_futu_order_to_report(
                 match, self.account_id_str, self._report_instrument(match), self._clock.timestamp_ns(),
@@ -1250,11 +1297,24 @@ class FutuLiveExecutionClient(LiveExecutionClient):
 
         if client_order_id not in self._uncertain:
             return
-        self._forget_unplaced(client_order_id)
         current = self._cache.order(client_order_id) or order
-        if current.is_closed:
+        waited = (self._clock.timestamp_ns() - started_ns) / 1_000_000_000
+        if not_found < _RESOLVE_NOT_FOUND_LIMIT or waited < _RESOLVE_MIN_WAIT_SECS:
+            # Not established: stay unclear so a later push or report still resolves it
+            self._log.error(
+                f"Could not establish whether {client_order_id} reached OpenD; its state is left to "
+                "order pushes, the in-flight check and reconciliation",
+            )
             return
-        if not_found >= _RESOLVE_NOT_FOUND_LIMIT:
+        # Never found: rejected, but remembered so it is canceled if OpenD shows it later
+        self._uncertain.discard(client_order_id)
+        self._deferred_cancels.discard(client_order_id)
+        self._deferred_modifies.pop(client_order_id, None)
+        self._placed_values.pop(client_order_id, None)
+        self._closed_unclear[client_order_id] = None
+        while len(self._closed_unclear) > _ACCEPTED_MAX:
+            self._closed_unclear.popitem(last=False)
+        if not current.is_closed:
             self._log.warning(f"Order {client_order_id} not found at OpenD after an unclear placement; rejecting it")
             self.generate_order_rejected(
                 strategy_id=current.strategy_id,
@@ -1262,11 +1322,6 @@ class FutuLiveExecutionClient(LiveExecutionClient):
                 client_order_id=client_order_id,
                 reason="not found at OpenD after an unclear placement",
                 ts_event=self._clock.timestamp_ns(),
-            )
-        else:
-            self._log.error(
-                f"Could not look up {client_order_id} at OpenD; its state is left to the in-flight check "
-                "and reconciliation",
             )
 
     async def _apply_deferred(
@@ -1322,6 +1377,10 @@ class FutuLiveExecutionClient(LiveExecutionClient):
             self._log.info(f"Deferring modify of {order.client_order_id} until it is placed")
             self._merge_deferred_modify(order.client_order_id, fields)
             return
+        pending = self._deferred_modifies.pop(order.client_order_id, None)
+        if venue_order_id is not None and pending:
+            # An older modify still queued for this order is superseded, not replayed later
+            fields = {**pending, **{k: v for k, v in fields.items() if v is not None}}
         if venue_order_id is None:
             self._log.error(f"Cannot modify order {order.client_order_id} without venue_order_id")
             self.generate_order_modify_rejected(
@@ -1649,7 +1708,7 @@ class FutuLiveExecutionClient(LiveExecutionClient):
     def _note_reported_order(self, order_dict: dict) -> None:
         """A status report reveals an unclearly placed order (in-flight check, reconciliation)."""
         client_order_id = client_order_id_from_remark(order_dict.get("remark"))
-        if client_order_id is None or client_order_id not in self._uncertain:
+        if client_order_id is None or (client_order_id not in self._uncertain and client_order_id not in self._closed_unclear):
             return
         order = self._cache.order(client_order_id)
         if order is not None and order_dict.get("order_id") is not None:

@@ -55,6 +55,7 @@ from nautilus_futu.constants import (
     FUTU_ORDER_STATUS_FILLED_ALL,
     FUTU_ORDER_STATUS_SUBMIT_FAILED,
     FUTU_ORDER_STATUS_SUBMITTED,
+    FUTU_ORDER_STATUS_TIMEOUT,
     FUTU_ORDER_TYPE_NORMAL,
     FUTU_TIF_DAY,
     FUTU_TIF_GTC,
@@ -1446,6 +1447,7 @@ class TestAmbiguousPlacement:
 @pytest.fixture
 def fast_resolver(monkeypatch):
     monkeypatch.setattr(execution_module, "_RESOLVE_DELAYS", (0.01,) * 7)
+    monkeypatch.setattr(execution_module, "_RESOLVE_MIN_WAIT_SECS", 0.0)
 
 
 def _submit_single(h, order):
@@ -1660,3 +1662,159 @@ class TestDuplicateCancel:
         h.run(h.client._cancel_order(_cancel_cmd(order)))
         assert h.rust.modify_order.call_count == 2
         assert not h.events_of(OrderCancelRejected)
+
+
+# ─────────────────────────────────────────────────────────
+# Review round 4: late confirmations, closed-while-in-flight legs, report acceptance
+# ─────────────────────────────────────────────────────────
+
+
+class TestLateConfirmation:
+    def test_order_rejected_by_resolver_is_canceled_if_opend_shows_it_later(self, h, fast_resolver):
+        order = h.add_limit_order(submitted=False)
+        h.rust.place_order.side_effect = TIMEOUT_ERROR
+        h.rust.get_order_list.return_value = []
+        _submit_single(h, order)
+        _settle(h, 0.2)
+        assert order.status == OrderStatus.REJECTED
+        # OpenD's servers acknowledge it after all
+        h.client._handle_push_order(h.order_push(order_id=777, remark="O-1"))
+        _settle(h)
+        args = h.rust.modify_order.call_args.args
+        assert args[3] == 777 and args[4] == FUTU_MODIFY_ORDER_OP_CANCEL
+        assert not h.events_of(OrderCancelRejected)
+
+    def test_resolver_uses_fresh_list_and_waits_before_rejecting(self, h, monkeypatch):
+        monkeypatch.setattr(execution_module, "_RESOLVE_DELAYS", (0.01,) * 7)  # min wait stays 30 s
+        order = h.add_limit_order(submitted=False)
+        h.rust.place_order.side_effect = TIMEOUT_ERROR
+        h.rust.get_order_list.return_value = []
+        _submit_single(h, order)
+        _settle(h, 0.2)
+        assert order.status == OrderStatus.SUBMITTED  # not rejected before NT's in-flight window
+        assert order.client_order_id in h.client._uncertain
+        assert all(c.args[3] is True for c in h.rust.get_order_list.call_args_list)  # refresh_cache
+
+    def test_resolver_keeps_waiting_on_unclear_futu_status(self, h, fast_resolver):
+        order = h.add_limit_order(submitted=False)
+        h.rust.place_order.side_effect = TIMEOUT_ERROR
+        h.rust.get_order_list.side_effect = [
+            [_order_dict(777, status=FUTU_ORDER_STATUS_TIMEOUT, remark="O-1")],
+            [_order_dict(777, status=FUTU_ORDER_STATUS_SUBMITTED, remark="O-1")],
+        ]
+        _submit_single(h, order)
+        _settle(h, 0.2)
+        assert [r.venue_order_id for r in h.reports] == [VenueOrderId("777")]
+        assert h.reports[0].order_status == OrderStatus.ACCEPTED
+        assert order.status != OrderStatus.REJECTED
+
+
+class TestLegClosedWhileInFlight:
+    def test_leg_closed_during_its_request_is_canceled_after_placement(self, h):
+        tp, sl = _oco_pair()
+
+        def place(*args):
+            if h.rust.place_order.call_count == 2:  # the in-flight check rejects SL during its own request
+                h.loop.call_soon_threadsafe(_reject_in_cache, h, sl)
+                time.sleep(0.05)
+            return {"order_id": 100 + h.rust.place_order.call_count}
+
+        h.rust.place_order.side_effect = place
+        _submit_list(h, _order_factory(h).create_list([tp, sl]))
+        args = h.rust.modify_order.call_args.args
+        assert args[3] == 102 and args[4] == FUTU_MODIFY_ORDER_OP_CANCEL
+        assert sl.status == OrderStatus.REJECTED
+
+
+class TestProvisionalPremodifyAccept:
+    def test_failed_push_after_premodify_placement_is_rejected(self, h):
+        tp, sl = _oco_pair()
+
+        def place(*args):
+            if h.rust.place_order.call_count == 1:
+                h.loop.call_soon_threadsafe(h.pending_update, sl)
+                asyncio.run_coroutine_threadsafe(
+                    h.client._modify_order(_modify_cmd(sl, price=Price.from_str("285.000"))), h.loop,
+                ).result(timeout=5)
+            return {"order_id": 100 + h.rust.place_order.call_count}
+
+        h.rust.place_order.side_effect = place
+        _submit_list(h, _order_factory(h).create_list([tp, sl]))
+        assert sl.status == OrderStatus.ACCEPTED
+        h.client._handle_push_order(h.order_push(order_id=102, status=FUTU_ORDER_STATUS_SUBMIT_FAILED, last_err_msg="bad price"))
+        assert sl.status == OrderStatus.REJECTED
+
+
+class TestReportAcceptance:
+    def test_waiting_submit_report_does_not_block_acceptance(self, h, fast_resolver):
+        order = h.add_limit_order(submitted=False)
+        h.rust.place_order.side_effect = TIMEOUT_ERROR
+        h.rust.get_order_list.side_effect = RuntimeError("link down")
+        _submit_single(h, order)
+        h.pending_update(order)
+        h.run(h.client._modify_order(_modify_cmd(order, price=Price.from_str("301.000"))))  # deferred
+        # found WAITING_SUBMIT (e.g. placed during the lunch break): the engine will not accept it
+        h.rust.get_order_list.side_effect = None
+        h.rust.get_order_list.return_value = [_order_dict(777, status=1, remark="O-1")]
+        h.run(h.client.generate_order_status_report(GenerateOrderStatusReport(
+            instrument_id=HK_INSTRUMENT.id, client_order_id=order.client_order_id, venue_order_id=None,
+            command_id=UUID4(), ts_init=0,
+        )))
+        _settle(h)
+        assert h.rust.modify_order.call_args.args[6] == 301.0
+        assert order.status == OrderStatus.ACCEPTED  # not stuck in PENDING_UPDATE
+        assert order.price == Price.from_str("301.000")
+
+
+class TestEarlyPushAppliesQueuedRequests:
+    def test_cancel_sent_as_soon_as_a_push_identifies_the_order(self, h):
+        order = h.add_limit_order(submitted=False)
+        calls_during_request = []
+
+        def place(*args):
+            asyncio.run_coroutine_threadsafe(h.client._cancel_order(_cancel_cmd(order)), h.loop).result(timeout=5)
+            h.loop.call_soon_threadsafe(h.client._handle_push_order, h.order_push(order_id=777, remark="O-1"))
+            time.sleep(0.1)
+            calls_during_request.append(h.rust.modify_order.call_count)
+            return {"order_id": 777}
+
+        h.rust.place_order.side_effect = place
+        _submit_single(h, order)
+        assert calls_during_request == [1]  # sent while place_order was still waiting
+        assert h.rust.modify_order.call_count == 1  # and not again afterwards
+
+    def test_direct_modify_absorbs_older_queued_modify(self, h):
+        order = h.add_limit_order()
+        h.accept(order)
+        h.client._deferred_modifies[order.client_order_id] = {"quantity": Quantity.from_int(60)}
+        h.pending_update(order)
+        h.run(h.client._modify_order(_modify_cmd(order, price=Price.from_str("305.000"))))
+        args = h.rust.modify_order.call_args.args
+        assert (args[5], args[6]) == (60.0, 305.0)
+        assert order.client_order_id not in h.client._deferred_modifies
+
+
+class TestPlacedValuesOnTerminalPush:
+    def test_premodify_quantity_reported_before_fills(self, h, fast_resolver):
+        tp, sl = _oco_pair()
+
+        def place(*args):
+            if h.rust.place_order.call_count == 1:
+                h.loop.call_soon_threadsafe(h.pending_update, sl)
+                asyncio.run_coroutine_threadsafe(
+                    h.client._modify_order(_modify_cmd(sl, quantity=Quantity.from_int(200))), h.loop,
+                ).result(timeout=5)
+                return {"order_id": 101}
+            raise RuntimeError("Place order failed: connection error: connection disconnected")
+
+        h.rust.place_order.side_effect = place
+        h.rust.get_order_list.side_effect = RuntimeError("link down")
+        _submit_list(h, _order_factory(h).create_list([tp, sl]))
+        assert sl.client_order_id in h.client._uncertain
+
+        h.client._handle_push_order(h.order_push(order_id=102, remark="O-SL", status=FUTU_ORDER_STATUS_FILLED_ALL, qty=200.0))
+        fill = h.fill_push(order_id=102, qty=200.0)
+        fill["fill"]["trd_side"] = 2  # SELL
+        h.client._handle_push_fill(fill)
+        assert sl.quantity == Quantity.from_int(200)
+        assert sl.status == OrderStatus.FILLED
